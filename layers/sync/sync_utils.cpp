@@ -293,4 +293,155 @@ ShaderStageAccesses GetShaderStageAccesses(VkShaderStageFlagBits shader_stage) {
     return it->second;
 }
 
+// With this flag on, use memcpy to copy fixed-size regions.
+// Most compilers generate wide move instructions and treat memcpy as intrinsic (no function call).
+// On x64 without any special compiler settings it's approximately 2x faster comparing to per-field
+// assignment (16-byte moves vs 4/8-byte moves).
+constexpr bool fast_barrier_init = true;
+
+// Sanity check validation of C++ alignment/padding rules
+constexpr size_t barrier_fields_size = 4 * sizeof(VkFlags64);  // 32 bytes
+static_assert(sizeof(MemoryBarrier) == 32);
+static_assert(barrier_fields_size == sizeof(MemoryBarrier));
+
+constexpr size_t queue_family_fields_size = 2 * sizeof(uint32_t);  // 8 bytes
+static_assert(sizeof(QueueFamilyBarrier) == 40);
+static_assert(sizeof(MemoryBarrier) + queue_family_fields_size == sizeof(QueueFamilyBarrier));
+
+constexpr size_t buffer_fields_size = sizeof(VkBuffer) + 2 * sizeof(VkDeviceSize);  // 24 bytes
+static_assert(sizeof(BufferBarrier) == 64);
+static_assert(sizeof(QueueFamilyBarrier) + buffer_fields_size == sizeof(BufferBarrier));
+
+constexpr size_t image_fields_size = 2 * sizeof(VkImageLayout) + sizeof(VkImage) + sizeof(VkImageSubresourceRange);  // 36 bytes
+static_assert(sizeof(ImageBarrier) == 80);
+static_assert(sizeof(QueueFamilyBarrier) + image_fields_size + sizeof(uint32_t) /*padding*/ == sizeof(ImageBarrier));
+
+template <typename VkBarrier>
+static inline void CopyBarrier2Fields(MemoryBarrier &barrier, const VkBarrier &vk_barrier) {
+    if constexpr (fast_barrier_init) {
+        // two 16-byte moves on x64
+        memcpy(&barrier.srcStageMask, &vk_barrier.srcStageMask, barrier_fields_size);
+    } else {
+        barrier.srcStageMask = vk_barrier.srcStageMask;
+        barrier.srcAccessMask = vk_barrier.srcAccessMask;
+        barrier.dstStageMask = vk_barrier.dstStageMask;
+        barrier.dstAccessMask = vk_barrier.dstAccessMask;
+    }
+}
+
+template <typename VkBarrier>
+static inline void CopyBarrierFields(MemoryBarrier &barrier, const VkBarrier &vk_barrier, VkPipelineStageFlags src_stage_mask,
+                                     VkPipelineStageFlags dst_stage_mask) {
+    barrier.srcStageMask = src_stage_mask;
+    barrier.srcAccessMask = vk_barrier.srcAccessMask;
+    barrier.dstStageMask = dst_stage_mask;
+    barrier.dstAccessMask = vk_barrier.dstAccessMask;
+}
+
+template <typename VkBarrier>
+static inline void CopyQueueFamilyFields(QueueFamilyBarrier &barrier, const VkBarrier &vk_barrier) {
+    if constexpr (fast_barrier_init) {
+        // one 8-byte move on x64
+        memcpy(&barrier.srcQueueFamilyIndex, &vk_barrier.srcQueueFamilyIndex, queue_family_fields_size);
+    } else {
+        barrier.srcQueueFamilyIndex = vk_barrier.srcQueueFamilyIndex;
+        barrier.dstQueueFamilyIndex = vk_barrier.dstQueueFamilyIndex;
+    }
+}
+
+template <typename VkBarrier>
+static inline void CopyBufferFields(BufferBarrier &barrier, const VkBarrier &vk_barrier) {
+    if constexpr (fast_barrier_init) {
+        // one 16-byte move + one 8-byte move on x64
+        memcpy(&barrier.buffer, &vk_barrier.buffer, buffer_fields_size);
+    } else {
+        barrier.buffer = vk_barrier.buffer;
+        barrier.offset = vk_barrier.offset;
+        barrier.size = vk_barrier.size;
+    }
+}
+
+template <typename VkBarrier>
+static inline void CopyImageFields(ImageBarrier &barrier, const VkBarrier &vk_barrier) {
+    if constexpr (fast_barrier_init) {
+        // image specific data is separated by the queue family fieds, that's why two regions
+        constexpr size_t layout_fields_size = 2 * sizeof(VkImageLayout);                                 // 8 bytes
+        constexpr size_t other_fields_size = image_fields_size + sizeof(uint32_t) - layout_fields_size;  // 32 bytes with padding
+        memcpy(&barrier.oldLayout, &vk_barrier.oldLayout, layout_fields_size);                           // one 8-byte move
+        memcpy(&barrier.image, &vk_barrier.image, other_fields_size);                                    // two 16-byte moves
+    } else {
+        barrier.oldLayout = vk_barrier.oldLayout;
+        barrier.newLayout = vk_barrier.newLayout;
+        barrier.image = vk_barrier.image;
+        barrier.subresourceRange = vk_barrier.subresourceRange;
+    }
+}
+
+MemoryBarrier::MemoryBarrier(const VkMemoryBarrier2 &barrier) { CopyBarrier2Fields(*this, barrier); }
+MemoryBarrier::MemoryBarrier(const VkBufferMemoryBarrier2 &barrier) { CopyBarrier2Fields(*this, barrier); }
+MemoryBarrier::MemoryBarrier(const VkImageMemoryBarrier2 &barrier) { CopyBarrier2Fields(*this, barrier); }
+
+MemoryBarrier::MemoryBarrier(const VkMemoryBarrier &barrier, VkPipelineStageFlags src_stage_mask,
+                             VkPipelineStageFlags dst_stage_mask) {
+    CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+}
+MemoryBarrier::MemoryBarrier(const VkBufferMemoryBarrier &barrier, VkPipelineStageFlags src_stage_mask,
+                             VkPipelineStageFlags dst_stage_mask) {
+    CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+}
+MemoryBarrier::MemoryBarrier(const VkImageMemoryBarrier &barrier, VkPipelineStageFlags src_stage_mask,
+                             VkPipelineStageFlags dst_stage_mask) {
+    CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+}
+
+BufferBarrier::BufferBarrier(const VkBufferMemoryBarrier2 &barrier) {
+    if constexpr (fast_barrier_init) {
+        // BufferBarrier repeats structure of VkBufferMemoryBarrier2 (four 16-byte moves on x64)
+        memcpy(&srcStageMask, &barrier.srcStageMask, sizeof(BufferBarrier));
+    } else {
+        CopyBarrier2Fields(*this, barrier);
+        CopyQueueFamilyFields(*this, barrier);
+        CopyBufferFields(*this, barrier);
+    }
+}
+
+BufferBarrier::BufferBarrier(const VkBufferMemoryBarrier &barrier, VkPipelineStageFlags src_stage_mask,
+                             VkPipelineStageFlags dst_stage_mask) {
+    if constexpr (fast_barrier_init) {
+        CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+        // queue family fields + buffer fields (two 16-byte moves on x64)
+        constexpr size_t queue_family_and_buffer_fields_size = queue_family_fields_size + buffer_fields_size;  // 32 bytes
+        memcpy(&srcQueueFamilyIndex, &barrier.srcQueueFamilyIndex, queue_family_and_buffer_fields_size);
+    } else {
+        CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+        CopyQueueFamilyFields(*this, barrier);
+        CopyBufferFields(*this, barrier);
+    }
+}
+
+VulkanTypedHandle BufferBarrier::GetTypedHandle() const { return VulkanTypedHandle(buffer, kVulkanObjectTypeBuffer); }
+
+const std::shared_ptr<const BUFFER_STATE> BufferBarrier::GetResourceState(const ValidationStateTracker &state_tracker) const {
+    return state_tracker.Get<BUFFER_STATE>(buffer);
+}
+
+ImageBarrier::ImageBarrier(const VkImageMemoryBarrier2 &barrier) {
+    CopyBarrier2Fields(*this, barrier);
+    CopyQueueFamilyFields(*this, barrier);
+    CopyImageFields(*this, barrier);
+}
+
+ImageBarrier::ImageBarrier(const VkImageMemoryBarrier &barrier, VkPipelineStageFlags src_stage_mask,
+                           VkPipelineStageFlags dst_stage_mask) {
+    CopyBarrierFields(*this, barrier, src_stage_mask, dst_stage_mask);
+    CopyQueueFamilyFields(*this, barrier);
+    CopyImageFields(*this, barrier);
+}
+
+VulkanTypedHandle ImageBarrier::GetTypedHandle() const { return VulkanTypedHandle(image, kVulkanObjectTypeImage); }
+
+const std::shared_ptr<const IMAGE_STATE> ImageBarrier::GetResourceState(const ValidationStateTracker &state_tracker) const {
+    return state_tracker.Get<IMAGE_STATE>(image);
+}
+
 }  // namespace sync_utils

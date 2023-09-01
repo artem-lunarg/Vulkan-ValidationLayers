@@ -17,10 +17,20 @@
 
 #pragma once
 #include "generated/sync_validation_types.h"
+#include "generated/vk_object_types.h"
 #include <vulkan/vulkan.h>
 #include <string>
 
+// Remove Windows trojan macro that prevents usage of this name in any scope of the program.
+// For example, nested namespace type sync_utils::MemoryBarrier won't compile because of this.
+#if defined(VK_USE_PLATFORM_WIN32_KHR) && defined(MemoryBarrier)
+#undef MemoryBarrier
+#endif
+
 struct DeviceFeatures;
+class ValidationStateTracker;
+class BUFFER_STATE;
+class IMAGE_STATE;
 
 namespace sync_utils {
 
@@ -58,5 +68,56 @@ struct ShaderStageAccesses {
     SyncStageAccessIndex uniform_read;
 };
 ShaderStageAccesses GetShaderStageAccesses(VkShaderStageFlagBits shader_stage);
+
+struct MemoryBarrier {
+    MemoryBarrier() = default;
+    explicit MemoryBarrier(const VkMemoryBarrier2& barrier);
+    explicit MemoryBarrier(const VkBufferMemoryBarrier2& barrier);
+    explicit MemoryBarrier(const VkImageMemoryBarrier2& barrier);
+    MemoryBarrier(const VkMemoryBarrier& barrier, VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask);
+    MemoryBarrier(const VkBufferMemoryBarrier& barrier, VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask);
+    MemoryBarrier(const VkImageMemoryBarrier& barrier, VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask);
+
+    VkPipelineStageFlags2 srcStageMask;
+    VkAccessFlags2 srcAccessMask;
+    VkPipelineStageFlags2 dstStageMask;
+    VkAccessFlags2 dstAccessMask;
+};
+
+// Objects of this type are not created directly (there are no queue family barriers).
+// If queue family information is needed, but not the buffer/image part of the barrier
+// structure, then resouce barriers can be downcasted to this type. This allows to
+// declare queue family related api that works both with buffer and image barriers.
+struct QueueFamilyBarrier : MemoryBarrier {
+    uint32_t srcQueueFamilyIndex;
+    uint32_t dstQueueFamilyIndex;
+};
+
+struct BufferBarrier : QueueFamilyBarrier {
+    explicit BufferBarrier(const VkBufferMemoryBarrier2& barrier);
+    BufferBarrier(const VkBufferMemoryBarrier& barrier, VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask);
+
+    VulkanTypedHandle GetTypedHandle() const;
+    const std::shared_ptr<const BUFFER_STATE> GetResourceState(const ValidationStateTracker& state_tracker) const;
+
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+};
+
+struct ImageBarrier : QueueFamilyBarrier {
+    explicit ImageBarrier(const VkImageMemoryBarrier2& barrier);
+    ImageBarrier(const VkImageMemoryBarrier& barrier, VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask);
+
+    VulkanTypedHandle GetTypedHandle() const;
+    const std::shared_ptr<const IMAGE_STATE> GetResourceState(const ValidationStateTracker& state_tracker) const;
+
+    VkImageLayout oldLayout;
+    VkImageLayout newLayout;
+    VkImage image;
+    VkImageSubresourceRange subresourceRange;
+    // show 4-byte padding (compilers have to add this because of 8-byte image field)
+    uint32_t padding;
+};
 
 }  // namespace sync_utils
