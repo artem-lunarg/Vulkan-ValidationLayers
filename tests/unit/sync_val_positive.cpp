@@ -882,3 +882,121 @@ TEST_F(PositiveSyncVal, TexelBufferArrayConstantIndexing) {
     vk::QueueSubmit(m_default_queue, 1, &submit_info, VK_NULL_HANDLE);
     vk::QueueWaitIdle(m_default_queue);
 }
+
+TEST_F(PositiveSyncVal, Issue7024_QueueFamilyOwnershipTransfer) {
+    TEST_DESCRIPTION("Ownership transfer from transfer to graphics queue");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    RETURN_IF_SKIP(InitSyncValFramework(true));
+    VkPhysicalDeviceSynchronization2Features sync2_features = vku::InitStructHelper();
+    sync2_features.synchronization2 = VK_TRUE;
+    RETURN_IF_SKIP(InitState(nullptr, &sync2_features));
+
+    const std::optional<uint32_t> transfer_queue_family =
+        m_device->QueueFamilyMatching(VK_QUEUE_TRANSFER_BIT, VK_QUEUE_GRAPHICS_BIT, false);
+    if (!transfer_queue_family) {
+        GTEST_SKIP() << "Required queue families not present (transfer without graphics)";
+    }
+    vkt::Queue *transfer_queue = m_device->queue_family_queues(transfer_queue_family.value())[0].get();
+    vkt::CommandPool transfer_cmd_pool(*m_device, transfer_queue_family.value());
+    vkt::CommandBuffer transfer_command_buffer(m_device, &transfer_cmd_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue);
+
+    vkt::Buffer buffer(*m_device, 64 * 64 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImageObj image(m_device);
+    image.Init(64, 64, 1, VK_FORMAT_R8G8B8A8_UNORM, usage, VK_IMAGE_TILING_OPTIMAL);
+    image.SetLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    vkt::Semaphore semaphore(*m_device);  // binary semaphore
+
+    // Tranfer queue: copy to image and issue release operation
+    {
+        VkBufferImageCopy2 region = vku::InitStructHelper();
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {64, 64, 1};
+
+        VkCopyBufferToImageInfo2 copy_info = vku::InitStructHelper();
+        copy_info.srcBuffer = buffer;
+        copy_info.dstImage = image;
+        copy_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        copy_info.regionCount = 1;
+        copy_info.pRegions = &region;
+
+        VkImageMemoryBarrier2 release_barrier = vku::InitStructHelper();
+        release_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        release_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        // Not needed, use semaphore to estabish execution dependency
+        release_barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        // Visibility operation is not performed for release operation
+        release_barrier.dstAccessMask = VK_ACCESS_2_NONE;
+        release_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        release_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        release_barrier.srcQueueFamilyIndex = transfer_queue_family.value();
+        release_barrier.dstQueueFamilyIndex = m_device->graphics_queues()[0]->get_family_index();
+        release_barrier.image = image;
+        release_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+        VkDependencyInfo release_dependency = vku::InitStructHelper();
+        release_dependency.imageMemoryBarrierCount = 1;
+        release_dependency.pImageMemoryBarriers = &release_barrier;
+
+        transfer_command_buffer.begin();
+        vk::CmdCopyBufferToImage2(transfer_command_buffer, &copy_info);
+        vk::CmdPipelineBarrier2(transfer_command_buffer, &release_dependency);
+        transfer_command_buffer.end();
+
+        VkCommandBufferSubmitInfo command_buffer_info = vku::InitStructHelper();
+        command_buffer_info.commandBuffer = transfer_command_buffer;
+
+        VkSemaphoreSubmitInfo semaphore_signal_info = vku::InitStructHelper();
+        semaphore_signal_info.semaphore = semaphore;
+        semaphore_signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+        VkSubmitInfo2 submit_info = vku::InitStructHelper();
+        submit_info.commandBufferInfoCount = 1;
+        submit_info.pCommandBufferInfos = &command_buffer_info;
+        submit_info.signalSemaphoreInfoCount = 1;
+        submit_info.pSignalSemaphoreInfos = &semaphore_signal_info;
+        vk::QueueSubmit2(transfer_queue->handle(), 1, &submit_info, VK_NULL_HANDLE);
+    }
+
+    // Graphics queue: wait for transfer queue and issue acquire operation
+    {
+        VkImageMemoryBarrier2 acquire_barrier = vku::InitStructHelper();
+        // Not needed, use semaphore to estabish execution dependency
+        acquire_barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        // Availability operation is not performed for release operation
+        acquire_barrier.srcAccessMask = VK_ACCESS_2_NONE;
+        acquire_barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        acquire_barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        acquire_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        acquire_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        acquire_barrier.srcQueueFamilyIndex = transfer_queue_family.value();
+        acquire_barrier.dstQueueFamilyIndex = m_device->graphics_queues()[0]->get_family_index();
+        acquire_barrier.image = image;
+        acquire_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+        VkDependencyInfo acquire_dependency = vku::InitStructHelper();
+        acquire_dependency.imageMemoryBarrierCount = 1;
+        acquire_dependency.pImageMemoryBarriers = &acquire_barrier;
+
+        m_commandBuffer->begin();
+        vk::CmdPipelineBarrier2(*m_commandBuffer, &acquire_dependency);
+        m_commandBuffer->end();
+
+        VkCommandBufferSubmitInfo command_buffer_info = vku::InitStructHelper();
+        command_buffer_info.commandBuffer = m_commandBuffer->handle();
+
+        VkSemaphoreSubmitInfo semaphore_wait_info = vku::InitStructHelper();
+        semaphore_wait_info.semaphore = semaphore;
+        semaphore_wait_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+        VkSubmitInfo2 submit_info = vku::InitStructHelper();
+        submit_info.waitSemaphoreInfoCount = 1;
+        submit_info.pWaitSemaphoreInfos = &semaphore_wait_info;
+        submit_info.commandBufferInfoCount = 1;
+        submit_info.pCommandBufferInfos = &command_buffer_info;
+        vk::QueueSubmit2(m_default_queue, 1, &submit_info, VK_NULL_HANDLE);
+    }
+    vk::DeviceWaitIdle(*m_device);
+}
