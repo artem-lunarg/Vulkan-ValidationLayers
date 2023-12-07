@@ -173,12 +173,23 @@ class SyncOpBase {
 
 class SyncOpBarriers : public SyncOpBase {
   protected:
-    template <typename Barriers, typename FunctorFactory>
-    static void ApplyBarriers(const Barriers &barriers, const FunctorFactory &factory, QueueId queue_id, ResourceUsageTag tag,
-                              AccessContext *context);
-    template <typename Barriers, typename FunctorFactory>
-    static void ApplyGlobalBarriers(const Barriers &barriers, const FunctorFactory &factory, QueueId queue_id, ResourceUsageTag tag,
+    static void ApplyPipelineBarriers(const std::vector<SyncBufferMemoryBarrier> &buffer_barriers, QueueId queue_id,
+                                      AccessContext *context);
+    static void ApplyPipelineBarriers(const std::vector<SyncImageMemoryBarrier> &image_barriers, QueueId queue_id,
+                                      AccessContext *context);
+
+    static void ApplyEventBarriers(const SyncEventState &sync_event, const std::vector<SyncBufferMemoryBarrier> &buffer_barriers,
+                                   QueueId queue_id, AccessContext *context);
+    static void ApplyEventBarriers(const SyncEventState &sync_event, const std::vector<SyncImageMemoryBarrier> &image_barriers,
+                                   QueueId queue_id, AccessContext *context);
+
+    static void ApplyGlobalBarriers(const std::vector<SyncMemoryBarrier> &barriers, QueueId queue_id, ResourceUsageTag tag,
                                     AccessContext *access_context);
+
+    static void ApplyGlobalEventBarriers(const SyncEventState &sync_event, const std::vector<SyncMemoryBarrier> &barriers,
+                                         QueueId queue_id,
+                                         ResourceUsageTag tag,
+                                         AccessContext *access_context);
 
     SyncOpBarriers(vvl::Func command, const SyncValidator &sync_state, VkQueueFlags queue_flags, VkPipelineStageFlags srcStageMask,
                    VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount,
