@@ -115,7 +115,7 @@ struct ResourceCmdUsageRecord {
 
     ResourceCmdUsageRecord() = default;
     ResourceCmdUsageRecord(vvl::Func command_, Count seq_num_, SubcommandType sub_type_, Count sub_command_,
-                           const vvl::CommandBuffer *cb_state_, Count reset_count_)
+                           const syncval_state::CommandBuffer *cb_state_, Count reset_count_)
         : command(command_),
           seq_num(seq_num_),
           sub_command_type(sub_type_),
@@ -137,7 +137,7 @@ struct ResourceCmdUsageRecord {
     // This is somewhat repetitive, but it prevents the need for Exec/Submit time touchup, after which usage records can be
     // from different command buffers and resets.
     // plain pointer as a shared pointer is held by the context storing this record
-    const vvl::CommandBuffer *cb_state = nullptr;
+    const syncval_state::CommandBuffer *cb_state = nullptr;
     Count reset_count;
     NamedHandleVector handles;
 
@@ -163,7 +163,7 @@ struct ResourceUsageRecord : public ResourceCmdUsageRecord {
 
     ResourceUsageRecord() = default;
     ResourceUsageRecord(vvl::Func command_, Count seq_num_, SubcommandType sub_type_, Count sub_command_,
-                        const vvl::CommandBuffer *cb_state_, Count reset_count_)
+                        const syncval_state::CommandBuffer *cb_state_, Count reset_count_)
         : ResourceCmdUsageRecord(command_, seq_num_, sub_type_, sub_command_, cb_state_, reset_count_) {}
 
     ResourceUsageRecord(const AlternateResourceUsage &other) : ResourceCmdUsageRecord(), alt_usage(other) {}
@@ -247,7 +247,7 @@ class CommandBufferAccessContext : public CommandExecutionContext {
     };
 
     CommandBufferAccessContext(const SyncValidator *sync_validator = nullptr);
-    CommandBufferAccessContext(SyncValidator &sync_validator, vvl::CommandBuffer *cb_state)
+    CommandBufferAccessContext(SyncValidator &sync_validator, syncval_state::CommandBuffer *cb_state)
         : CommandBufferAccessContext(&sync_validator) {
         cb_state_ = cb_state;
     }
@@ -257,7 +257,7 @@ class CommandBufferAccessContext : public CommandExecutionContext {
 
     // NOTE: because this class is encapsulated in syncval_state::CommandBuffer, it isn't safe
     // to use shared_from_this from the constructor.
-    void SetSelfReference() { cbs_referenced_->insert(cb_state_->shared_from_this()); }
+    void SetSelfReference();
 
     ~CommandBufferAccessContext() override = default;
     const CommandExecutionContext &GetExecutionContext() const { return *this; }
@@ -309,19 +309,14 @@ class CommandBufferAccessContext : public CommandExecutionContext {
     void RecordExecutedCommandBuffer(const CommandBufferAccessContext &recorded_context);
     void ResolveExecutedCommandBuffer(const AccessContext &recorded_context, ResourceUsageTag offset);
 
-    VkQueueFlags GetQueueFlags() const { return cb_state_ ? cb_state_->GetQueueFlags() : 0; }
+    VkQueueFlags GetQueueFlags() const;
 
     ResourceUsageTag NextSubcommandTag(vvl::Func command, ResourceUsageRecord::SubcommandType subcommand);
     ResourceUsageTag NextSubcommandTag(vvl::Func command, NamedHandle &&handle, ResourceUsageRecord::SubcommandType subcommand);
 
     ExecutionType Type() const override { return kExecuted; }
     ResourceUsageTag GetTagLimit() const override { return access_log_->size(); }
-    VulkanTypedHandle Handle() const override {
-        if (cb_state_) {
-            return cb_state_->Handle();
-        }
-        return VulkanTypedHandle(static_cast<VkCommandBuffer>(VK_NULL_HANDLE), kVulkanObjectTypeCommandBuffer);
-    }
+    VulkanTypedHandle Handle() const override;
 
     ResourceUsageTag NextCommandTag(vvl::Func command, NamedHandle &&handle,
                                     ResourceUsageRecord::SubcommandType subcommand = ResourceUsageRecord::SubcommandType::kNone);
@@ -339,12 +334,8 @@ class CommandBufferAccessContext : public CommandExecutionContext {
         }
     }
 
-    std::shared_ptr<const vvl::CommandBuffer> GetCBStateShared() const { return cb_state_->shared_from_this(); }
-
-    const vvl::CommandBuffer &GetCBState() const {
-        assert(cb_state_);
-        return *cb_state_;
-    }
+    std::shared_ptr<const vvl::CommandBuffer> GetCBStateShared() const;
+    const vvl::CommandBuffer &GetCBState() const;
 
     template <class T, class... Args>
     void RecordSyncOp(Args &&...args) {
@@ -372,7 +363,7 @@ class CommandBufferAccessContext : public CommandExecutionContext {
 
     // Note: since every CommandBufferAccessContext is encapsulated in its CommandBuffer object,
     // a reference count is not needed here.
-    vvl::CommandBuffer *cb_state_;
+    syncval_state::CommandBuffer *cb_state_;
 
     std::shared_ptr<AccessLog> access_log_;
     std::shared_ptr<CommandBufferSet> cbs_referenced_;

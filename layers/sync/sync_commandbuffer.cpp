@@ -107,6 +107,8 @@ CommandBufferAccessContext::CommandBufferAccessContext(const CommandBufferAccess
     // We don't want to copy the full render_pass_context_ history just for the proxy.
 }
 
+void CommandBufferAccessContext::SetSelfReference() { cbs_referenced_->insert(cb_state_->shared_from_this()); }
+
 void CommandBufferAccessContext::Reset() {
     access_log_ = std::make_shared<AccessLog>();
     cbs_referenced_ = std::make_shared<CommandBufferSet>();
@@ -841,6 +843,8 @@ void CommandBufferAccessContext::ResolveExecutedCommandBuffer(const AccessContex
     GetCurrentAccessContext()->ResolveFromContext(tag_offset, recorded_context);
 }
 
+VkQueueFlags CommandBufferAccessContext::GetQueueFlags() const { return cb_state_ ? cb_state_->GetQueueFlags() : 0; }
+
 void CommandBufferAccessContext::InsertRecordedAccessLogEntries(const CommandBufferAccessContext &recorded_context) {
     cbs_referenced_->emplace(recorded_context.GetCBStateShared());
     access_log_->insert(access_log_->end(), recorded_context.access_log_->cbegin(), recorded_context.access_log_->cend());
@@ -864,6 +868,13 @@ ResourceUsageTag CommandBufferAccessContext::NextSubcommandTag(vvl::Func command
         access_log_->back().debug_region_command_index = static_cast<uint32_t>(debug_regions_.commands.size() - 1);
     }
     return next;
+}
+
+VulkanTypedHandle CommandBufferAccessContext::Handle() const {
+    if (cb_state_) {
+        return cb_state_->Handle();
+    }
+    return VulkanTypedHandle(static_cast<VkCommandBuffer>(VK_NULL_HANDLE), kVulkanObjectTypeCommandBuffer);
 }
 
 ResourceUsageTag CommandBufferAccessContext::NextCommandTag(vvl::Func command, ResourceUsageRecord::SubcommandType subcommand) {
@@ -893,6 +904,15 @@ ResourceUsageTag CommandBufferAccessContext::NextIndexedCommandTag(vvl::Func com
         return NextCommandTag(command, ResourceUsageRecord::SubcommandType::kIndex);
     }
     return NextSubcommandTag(command, ResourceUsageRecord::SubcommandType::kIndex);
+}
+
+std::shared_ptr<const vvl::CommandBuffer> CommandBufferAccessContext::GetCBStateShared() const {
+    return cb_state_->shared_from_this();
+}
+
+const vvl::CommandBuffer &CommandBufferAccessContext::GetCBState() const {
+    assert(cb_state_);
+    return *cb_state_;
 }
 
 void CommandBufferAccessContext::PushDebugRegion(const char *region_name) {
@@ -1148,7 +1168,7 @@ std::ostream &operator<<(std::ostream &out, const ResourceUsageRecord::Formatter
         out << ", reset_no: " << std::to_string(record.reset_count);
 
         if (record.debug_region_command_index != vvl::kU32Max) {
-            const auto &access_context = static_cast<const syncval_state::CommandBuffer *>(record.cb_state)->access_context;
+            const auto &access_context = record.cb_state->access_context;
             const std::string region_name = access_context.GetDebugRegionFullyQualifiedName(record.debug_region_command_index);
             // Empty region name means that we are not inside any debug region.
             // If we are inside debug region with an empty name then it will reported as "(unnamed debug region)".
