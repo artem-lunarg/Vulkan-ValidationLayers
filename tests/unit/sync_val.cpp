@@ -5314,6 +5314,51 @@ TEST_F(NegativeSyncVal, PresentDoesNotWaitForSubmit) {
     m_device->wait();
 }
 
+TEST_F(NegativeSyncVal, SubmitDoesNotWaitForAcquire) {
+    TEST_DESCRIPTION("Submit does not wait for the swapchain acquire semaphore");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddSurfaceExtension();
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    RETURN_IF_SKIP(InitSyncValFramework());
+    RETURN_IF_SKIP(InitState());
+    RETURN_IF_SKIP(InitSwapchain());
+    const vkt::Semaphore acquire_semaphore(*m_device);
+    const auto swapchain_images = GetSwapchainImages(m_swapchain);
+
+    uint32_t image_index = 0;
+    vk::AcquireNextImageKHR(device(), m_swapchain, kWaitTimeout, acquire_semaphore, VK_NULL_HANDLE, &image_index);
+
+    VkImageMemoryBarrier2 layout_transition = vku::InitStructHelper();
+    layout_transition.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    layout_transition.srcAccessMask = 0;
+    layout_transition.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    layout_transition.dstAccessMask = 0;
+    layout_transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    layout_transition.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    layout_transition.image = swapchain_images[image_index];
+    layout_transition.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfoKHR dep_info = vku::InitStructHelper();
+    dep_info.imageMemoryBarrierCount = 1;
+    dep_info.pImageMemoryBarriers = &layout_transition;
+
+    m_commandBuffer->begin();
+    vk::CmdPipelineBarrier2(*m_commandBuffer, &dep_info);
+    m_commandBuffer->end();
+
+    VkCommandBufferSubmitInfo command_buffer_info = vku::InitStructHelper();
+    command_buffer_info.commandBuffer = *m_commandBuffer;
+
+    VkSubmitInfo2 submit = vku::InitStructHelper();
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &command_buffer_info;
+    // TODO: current implementation does not report that the image is still being read by the acquire
+    // and at the same time it is being transitioned (there is no wait on the acquire semaphore).
+    // Fix this and ensure the following submit triggers validation error.
+    vk::QueueSubmit2(m_default_queue->handle(), 1, &submit, VK_NULL_HANDLE);
+    m_device->wait();
+}
+
 TEST_F(NegativeSyncVal, AvailabilityWithoutVisibilityForBuffer) {
     TEST_DESCRIPTION("Buffer barrier makes writes available but not visible. The second write generates WAW harard.");
     RETURN_IF_SKIP(InitSyncValFramework());
