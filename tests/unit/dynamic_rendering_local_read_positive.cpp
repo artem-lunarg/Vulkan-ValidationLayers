@@ -180,3 +180,60 @@ TEST_F(PositiveDynamicRenderingLocalRead, CmdClearAttachments) {
 
     vk::CmdClearAttachments(m_commandBuffer->handle(), 1, &clear_attachment, 1, &clear_rect);
 }
+
+TEST_F(PositiveDynamicRenderingLocalRead, ImageBarriers) {
+    TEST_DESCRIPTION("Test using image barriers inside of a render pass instance");
+    AddRequiredExtensions(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    RETURN_IF_SKIP(InitBasicDynamicRenderingLocalRead());
+
+    vkt::Image image(*m_device, 32, 32, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+    vkt::ImageView imageView = image.CreateView();
+
+    VkRenderingAttachmentInfoKHR color_attachment = vku::InitStructHelper();
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+    color_attachment.imageView = imageView;
+
+    VkRenderingInfoKHR begin_rendering_info = vku::InitStructHelper();
+    begin_rendering_info.colorAttachmentCount = 1;
+    begin_rendering_info.pColorAttachments = &color_attachment;
+    begin_rendering_info.layerCount = 1;
+    begin_rendering_info.renderArea = {{0, 0}, {32, 32}};
+
+    VkImageMemoryBarrier2KHR pre_barrier = vku::InitStructHelper();
+    pre_barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    pre_barrier.srcAccessMask = VK_ACCESS_2_NONE;
+    pre_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    pre_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    pre_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    pre_barrier.newLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+    pre_barrier.image = image.handle();
+    pre_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+
+    VkDependencyInfoKHR pre_dep = vku::InitStructHelper();
+    pre_dep.imageMemoryBarrierCount = 1;
+    pre_dep.pImageMemoryBarriers = &pre_barrier;
+
+    VkImageMemoryBarrier2KHR post_barrier = vku::InitStructHelper();
+    post_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    post_barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    post_barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    post_barrier.dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT;
+    post_barrier.oldLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+    post_barrier.newLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+    post_barrier.image = image.handle();
+    post_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+
+    VkDependencyInfoKHR post_dep = vku::InitStructHelper();
+    post_dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    post_dep.imageMemoryBarrierCount = 1;
+    post_dep.pImageMemoryBarriers = &post_barrier;
+
+    m_commandBuffer->begin();
+    vk::CmdPipelineBarrier2KHR(*m_commandBuffer, &pre_dep);
+    m_commandBuffer->BeginRendering(begin_rendering_info);
+    vk::CmdPipelineBarrier2KHR(*m_commandBuffer, &post_dep);
+    m_commandBuffer->EndRendering();
+    m_commandBuffer->end();
+}
