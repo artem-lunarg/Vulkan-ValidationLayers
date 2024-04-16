@@ -53,7 +53,8 @@ class SyncValidator : public ValidationStateTracker, public SyncStageAccess {
     vvl::unordered_map<VkQueue, std::shared_ptr<QueueSyncState>> queue_sync_states_;
     QueueId queue_id_limit_ = kQueueIdBase;
 
-    SignaledSemaphores signaled_semaphores_;
+    BinarySignals binary_signals_;
+    TimelineSignals timeline_signals_;
 
     using SignaledFences = vvl::unordered_map<VkFence, FenceSyncState>;
     SignaledFences waitable_fences_;
@@ -64,7 +65,7 @@ class SyncValidator : public ValidationStateTracker, public SyncStageAccess {
     uint32_t debug_reset_count = 1;
     std::string debug_cmdbuf_pattern;
 
-    // Applies information from update object to signaled_semaphores_.
+    // Applies information from update object to binary_signals_/timeline_signals_.
     // The update object is mutable to be able to std::move SignalInfo from it.
     void UpdateSignaledSemaphores(SignaledSemaphoresUpdate &update, const QueueBatchContext::Ptr &last_batch);
 
@@ -109,6 +110,12 @@ class SyncValidator : public ValidationStateTracker, public SyncStageAccess {
     bool SupressedBoundDescriptorWAW(const HazardResult &hazard) const;
 
     void PostCreateDevice(const VkDeviceCreateInfo *pCreateInfo, const Location &loc) override;
+
+    void PostCallRecordCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo *pCreateInfo,
+                                       const VkAllocationCallbacks *pAllocator, VkSemaphore *pSemaphore,
+                                       const RecordObject &record_obj) override;
+    void PreCallRecordDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks *pAllocator,
+                                       const RecordObject &record_obj) override;
 
     bool ValidateBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
                                  const VkSubpassBeginInfo *pSubpassBeginInfo, const ErrorObject &error_obj) const;

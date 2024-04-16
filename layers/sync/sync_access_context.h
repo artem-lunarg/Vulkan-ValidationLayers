@@ -341,6 +341,7 @@ class AccessContext {
 
     AccessContext() { Reset(); }
     AccessContext(const AccessContext &copy_from) = default;
+    AccessContext &operator=(AccessContext &&other) = default;
     void Trim();
     void TrimAndClearFirstAccess();
     void AddReferencedTags(ResourceUsageTagSet &referenced) const;

@@ -24,48 +24,59 @@ AcquiredImage::AcquiredImage(const PresentedImage& presented, ResourceUsageTag a
 
 bool AcquiredImage::Invalid() const { return vvl::StateObject::Invalid(image); }
 
-SignalInfo::SignalInfo(const QueueBatchContext::Ptr& batch, const SyncExecScope& exec_scope)
-    : batch(batch), first_scope({batch->GetQueueId(), exec_scope}) {}
+SignalInfo::SignalInfo(const QueueBatchContext::Ptr& batch, const SyncExecScope& exec_scope, uint64_t timeline_value)
+    : batch(batch), first_scope({batch->GetQueueId(), exec_scope}), timeline_value(timeline_value) {}
 
 SignalInfo::SignalInfo(const PresentedImage& presented, ResourceUsageTag acquire_tag)
     : batch(presented.batch), first_scope(), acquired_image(std::make_shared<AcquiredImage>(presented, acquire_tag)) {}
 
-void SignaledSemaphoresUpdate::OnSignal(const QueueBatchContext::Ptr& batch, const VkSemaphoreSubmitInfo& signal_info) {
-    auto sem_state = sync_validator_.Get<vvl::Semaphore>(signal_info.semaphore);
-    if (!sem_state) {
-        return;
-    }
-    const VkSemaphore semaphore = sem_state->VkHandle();
-    // Signal can't be registered in both lists at the same time.
-    assert(!vvl::Contains(signals_to_add, semaphore) || !vvl::Contains(signals_to_remove, semaphore));
+SignalInfo::SignalInfo(uint64_t initial_value) : timeline_value(initial_value) {}
 
-    const bool emplace_signal =
-        // Add signal if it was previously in the remove list. It's a scenario when the semaphore
-        // is unsignaled and then signaled by the same queue submit command.
-        (signals_to_remove.erase(semaphore) == 1) ||
-        // Or if the semaphore is not in the removal list, then add it only if it is not registered in
-        // the global signaling list, because duplicated signal is an error (reported by core validation)
-        // and the state should not be updated in this case.
-        !vvl::Contains(sync_validator_.signaled_semaphores_, semaphore);
+void SignaledSemaphoresUpdate::OnSignal(const vvl::Semaphore& semaphore_state, const QueueBatchContext::Ptr& batch,
+                                        const VkSemaphoreSubmitInfo& signal_info) {
+    const VkSemaphore semaphore = semaphore_state.VkHandle();
+    if (semaphore_state.type == VK_SEMAPHORE_TYPE_BINARY) {
+        // Signal can't be registered in both lists at the same time.
+        assert(!vvl::Contains(signals_to_add, semaphore) || !vvl::Contains(signals_to_remove, semaphore));
 
-    if (emplace_signal) {
+        const bool emplace_signal =
+            // Add signal if it was previously in the remove list. It's a scenario when the semaphore
+            // is unsignaled and then signaled by the same queue submit command.
+            (signals_to_remove.erase(semaphore) == 1) ||
+            // Or if the semaphore is not in the removal list, then add it only if it is not registered in
+            // the global signaling list, because duplicated signal is an error (reported by core validation)
+            // and the state should not be updated in this case.
+            !vvl::Contains(sync_validator_.binary_signals_, semaphore);
+
+        if (emplace_signal) {
+            const VkQueueFlags queue_flags = batch->GetQueueFlags();
+            const SyncExecScope exec_scope =
+                SyncExecScope::MakeSrc(queue_flags, signal_info.stageMask, VK_PIPELINE_STAGE_2_HOST_BIT);
+            // If the semaphore is already in this list (duplicated binary signal error)
+            // then emplace does not update the map, and this is the behavior we need.
+            signals_to_add.emplace(semaphore, SignalInfo(batch, exec_scope, signal_info.value));
+        }
+    } else {
         const VkQueueFlags queue_flags = batch->GetQueueFlags();
+        // TODO: check the meaning of HOST_BIT (copied for binary signal case)
         const SyncExecScope exec_scope = SyncExecScope::MakeSrc(queue_flags, signal_info.stageMask, VK_PIPELINE_STAGE_2_HOST_BIT);
-        // If the semaphore is already in this list (duplicated binary signal error)
-        // then emplace does not update the map, and this is the behavior we need.
-        signals_to_add.emplace(semaphore, SignalInfo(batch, exec_scope));
+        // TODO: add basic validation to ignore signals that are smaller then the last one (checked by core validation?)
+        timeline_signals[semaphore].emplace_back(SignalInfo(batch, exec_scope, signal_info.value));
+
+        // Try to resolve pending batches with this signal on different queues
+        // (signal on this queue can't resolve previous wait on this queue)
     }
 }
 
-std::optional<SignalInfo> SignaledSemaphoresUpdate::OnUnsignal(VkSemaphore semaphore) {
+std::optional<SignalInfo> SignaledSemaphoresUpdate::OnBinaryWait(VkSemaphore semaphore) {
     // Signal can't be registered in both lists at the same time.
     assert(!vvl::Contains(signals_to_add, semaphore) || !vvl::Contains(signals_to_remove, semaphore));
-    std::optional<SignalInfo> unsignaled;
 
+    std::optional<SignalInfo> unsignaled;
     if (auto add_it = signals_to_add.find(semaphore); add_it != signals_to_add.end()) {
         unsignaled.emplace(std::move(add_it->second));
         signals_to_add.erase(add_it);
-    } else if (auto* p_global_info = vvl::Find(sync_validator_.signaled_semaphores_, semaphore)) {
+    } else if (auto* p_global_info = vvl::Find(sync_validator_.binary_signals_, semaphore)) {
         unsignaled.emplace(*p_global_info);
     }
     signals_to_remove.emplace(semaphore);
@@ -73,6 +84,34 @@ std::optional<SignalInfo> SignaledSemaphoresUpdate::OnUnsignal(VkSemaphore semap
     // If unsignaled is null, there was a missing pending semaphore.
     // The caller returns early in this case. Error is reported by core validation.
     return unsignaled;
+}
+
+std::optional<SignalInfo> SignaledSemaphoresUpdate::OnTimelineWait(VkSemaphore semaphore, uint64_t wait_value) {
+    // Check timeline signal registry
+    const std::vector<SignalInfo>* signals = vvl::Find(sync_validator_.timeline_signals_, semaphore);
+    if (signals) {
+        if (wait_value <= (*signals)[0].timeline_value) {
+            return {};
+        }
+        for (auto& info : *signals) {
+            if (wait_value <= info.timeline_value) {
+                return info;
+            }
+        }
+    }
+
+    // Check if there is a matching signal from the current submission
+    const std::vector<SignalInfo>* pending_signals = vvl::Find(timeline_signals, semaphore);
+    if (pending_signals) {
+        for (auto& info : *pending_signals) {
+            if (wait_value <= info.timeline_value) {
+                return info;
+            }
+        }
+    }
+
+    // There is no matching signal. It's a wait-before-signal scenario.
+    return {};
 }
 
 FenceSyncState::FenceSyncState() : fence(), tag(kInvalidTag), queue_id(kQueueIdInvalid) {}
@@ -164,11 +203,23 @@ QueueBatchContext::QueueBatchContext(const SyncValidator& sync_state, const Queu
 
 QueueBatchContext::QueueBatchContext(const SyncValidator& sync_state)
     : CommandExecutionContext(&sync_state),
-      queue_state_(),
+      queue_state_(nullptr),
       tag_range_(0, 0),
       current_access_context_(&access_context_),
       batch_log_(),
       queue_sync_tag_(sync_state.GetQueueIdLimit(), ResourceUsageTag(0)) {}
+
+QueueBatchContext& QueueBatchContext::operator=(QueueBatchContext&& other) { 
+    CommandExecutionContext::operator=(other);
+    queue_state_ = other.queue_state_;
+    tag_range_ = other.tag_range_;
+    access_context_ = std::move(other.access_context_);
+    current_access_context_ = &access_context_;
+    batch_log_ = std::move(other.batch_log_);
+    queue_sync_tag_ = std::move(other.queue_sync_tag_);
+    events_context_ = std::move(other.events_context_);
+    return *this;
+}
 
 void QueueBatchContext::Trim() {
     // Clean up unneeded access context contents and log information
@@ -274,7 +325,7 @@ void QueueBatchContext::ResolvePresentSemaphoreWait(const SignalInfo& signal_inf
     }
 }
 
-void QueueBatchContext::ResolveSubmitSemaphoreWait(const SignalInfo& signal_info, VkPipelineStageFlags2 wait_mask) {
+void QueueBatchContext::ResolveSubmitSemaphoreWait(const SignalInfo& signal_info, uint64_t timeline_wait_value, VkPipelineStageFlags2 wait_mask) {
     assert(signal_info.batch);
 
     const SemaphoreScope& signal_scope = signal_info.first_scope;
@@ -306,6 +357,15 @@ void QueueBatchContext::ResolveSubmitSemaphoreWait(const SignalInfo& signal_info
     }
 }
 
+void QueueBatchContext::ResolveLastBatch(const QueueBatchContext::ConstPtr& last_batch) {
+    // Copy in the event state from the previous batch (on this queue)
+    events_context_.DeepCopy(last_batch->events_context_);
+
+    // If there are no semaphores to the previous batch, make sure a "submit order" non-barriered import is done
+    access_context_.ResolveFromContext(last_batch->access_context_);
+    ImportTags(*last_batch);
+}
+
 void QueueBatchContext::ImportTags(const QueueBatchContext& from) {
     batch_log_.Import(from.batch_log_);
 
@@ -317,29 +377,18 @@ void QueueBatchContext::ImportTags(const QueueBatchContext& from) {
     }
 }
 
-std::vector<QueueBatchContext::ConstPtr> QueueBatchContext::ResolvePresentDependencies(
-    vvl::span<const VkSemaphore> wait_semaphores, const ConstPtr& last_batch, const PresentedImages& presented_images,
+std::vector<QueueBatchContext::ConstPtr> QueueBatchContext::ResolvePresentWaits(
+    vvl::span<const VkSemaphore> wait_semaphores, const PresentedImages& presented_images,
     SignaledSemaphoresUpdate& signaled_semaphores_update) {
     std::vector<ConstPtr> batches_resolved;
     for (VkSemaphore semaphore : wait_semaphores) {
-        auto signal_info = signaled_semaphores_update.OnUnsignal(semaphore);
+        auto signal_info = signaled_semaphores_update.OnBinaryWait(semaphore);
         if (!signal_info) {
-            continue;  // Binary signal not found. This is handled be the core validation if enabled.
+            continue;  // Binary signal not found [core validation check]
         }
         ResolvePresentSemaphoreWait(*signal_info, presented_images);
         ImportTags(*signal_info->batch);
         batches_resolved.emplace_back(std::move(signal_info->batch));
-    }
-    // Import the previous batch information
-    if (last_batch) {
-        // Copy in the event state from the previous batch (on this queue)
-        events_context_.DeepCopy(last_batch->events_context_);
-        if (!vvl::Contains(batches_resolved, last_batch)) {
-            // If there are no semaphores to the previous batch, make sure a "submit order" non-barriered import is done
-            access_context_.ResolveFromContext(last_batch->access_context_);
-            ImportTags(*last_batch);
-            batches_resolved.emplace_back(last_batch);
-        }
     }
     return batches_resolved;
 }
@@ -434,7 +483,7 @@ std::vector<QueueBatchContext::ConstPtr> QueueBatchContext::RegisterAsyncContext
     return async_batches;
 }
 
-std::vector<QueueBatchContext::CommandBufferInfo> QueueBatchContext::GetCommandBuffers(const VkSubmitInfo2& submit_info) {
+std::vector<CommandBufferInfo> QueueBatchContext::GetCommandBuffers(const VkSubmitInfo2& submit_info) {
     std::vector<CommandBufferInfo> command_buffers;
     command_buffers.reserve(submit_info.commandBufferInfoCount);
     for (uint32_t i = 0; i < submit_info.commandBufferInfoCount; i++) {
@@ -486,38 +535,45 @@ ResourceUsageTag QueueBatchContext::SetupBatchTags(uint32_t tag_count) {
     return tag_range_.begin;
 }
 
-std::vector<QueueBatchContext::ConstPtr> QueueBatchContext::ResolveSubmitDependencies(
-    vvl::span<const VkSemaphoreSubmitInfo> wait_infos, const QueueBatchContext::ConstPtr& last_batch,
-    SignaledSemaphoresUpdate& signaled_semaphores_update) {
-    // Import (resolve) the batches that are waited on, with the semaphore's effective barriers applied
-    std::vector<ConstPtr> batches_resolved;
+QueueBatchContext::ResolveWaitsResult QueueBatchContext::ResolveSubmitWaits(vvl::span<const VkSemaphoreSubmitInfo> wait_infos,
+                                                                            SignaledSemaphoresUpdate& signaled_semaphores_update) {
+    ResolveWaitsResult result;
     for (const auto& wait_info : wait_infos) {
-        auto signal_info = signaled_semaphores_update.OnUnsignal(wait_info.semaphore);
-        if (!signal_info) {
-            continue;  // Binary signal not found. This is handled be the core validation if enabled.
+        auto semaphore_state = sync_state_->Get<vvl::Semaphore>(wait_info.semaphore);
+        if (!semaphore_state) {
+            continue;  // [core validation check]
         }
-        ResolveSubmitSemaphoreWait(*signal_info, wait_info.stageMask);
+        std::optional<SignalInfo> signal_info;
+        if (semaphore_state->type == VK_SEMAPHORE_TYPE_BINARY) {
+            signal_info = signaled_semaphores_update.OnBinaryWait(wait_info.semaphore);
+            if (!signal_info) {
+                continue;  // Binary signal not found [core validation check]
+            }
+        } else {
+            signal_info = signaled_semaphores_update.OnTimelineWait(wait_info.semaphore, wait_info.value);
+            if (!signal_info) {
+                if (wait_info.value <= semaphore_state->initial_value) {
+                    // Semaphore initial value satisfies the wait.
+                    // There is no explicit signal, so no need to resolve signal's batch.
+                    continue;
+                } else {
+                    // Register wait before signal
+                    result.unresolved_waits.emplace_back(wait_info);
+                    continue;
+                }
+            }
+        }
+        ResolveSubmitSemaphoreWait(*signal_info, wait_info.value, wait_info.stageMask);
         ImportTags(*signal_info->batch);
-        batches_resolved.emplace_back(std::move(signal_info->batch));
+        result.resolved_batches.emplace_back(std::move(signal_info->batch));
     }
-    // Import the previous batch information
-    if (last_batch) {
-        // Copy in the event state from the previous batch (on this queue)
-        events_context_.DeepCopy(last_batch->events_context_);
-        if (!vvl::Contains(batches_resolved, last_batch)) {
-            // If there are no semaphores to the previous batch, make sure a "submit order" non-barriered import is done
-            access_context_.ResolveFromContext(last_batch->access_context_);
-            ImportTags(*last_batch);
-            batches_resolved.emplace_back(last_batch);
-        }
-    }
-    return batches_resolved;
+    return result;
 }
 
-bool QueueBatchContext::ValidateSubmit(const VkSubmitInfo2& submit, uint64_t submit_index, uint32_t batch_index,
-                                       std::vector<std::string>& current_label_stack, const ErrorObject& error_obj) {
+bool QueueBatchContext::ValidateSubmit(const std::vector<CommandBufferInfo>& command_buffers, uint64_t submit_index,
+                                       uint32_t batch_index, std::vector<std::string>& current_label_stack,
+                                       const ErrorObject& error_obj) {
     bool skip = false;
-    const std::vector<CommandBufferInfo> command_buffers = GetCommandBuffers(submit);
 
     BatchAccessLog::BatchRecord batch{queue_state_, submit_index, batch_index};
     uint32_t tag_count = 0;
@@ -586,6 +642,14 @@ void QueueSyncState::UpdateLastBatch() {
         }
         pending_last_batch_->Trim();
         last_batch_ = std::move(pending_last_batch_);
+    }
+}
+
+void QueueSyncState::UpdateUnresolvedBatches() {
+    if (apply_pending_unresolved_batches_) {
+        unresolved_batches_ = std::move(pending_unresolved_batches_);
+        pending_unresolved_batches_.clear();
+        apply_pending_unresolved_batches_ = false;
     }
 }
 

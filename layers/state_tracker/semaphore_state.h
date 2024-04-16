@@ -115,6 +115,7 @@ class Semaphore : public RefcountedStateObject {
     const VkSemaphoreType type;
     const VkSemaphoreCreateFlags flags;
     const VkExternalSemaphoreHandleTypeFlags exportHandleTypes;
+    const uint64_t initial_value;  // for timelines
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
     static bool GetMetalExport(const VkSemaphoreCreateInfo *info);

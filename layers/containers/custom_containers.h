@@ -1050,8 +1050,8 @@ bool Contains(const Container &container, const Key &key) {
 //
 // if (vvl::Contains(objects_vector, candidate)) { candidate->jump(); }
 //
-template <typename T>
-bool Contains(const std::vector<T> &v, const T &value) {
+template <typename T, typename T2>
+bool Contains(const std::vector<T> &v, const T2 &value) {
     return std::find(v.cbegin(), v.cend(), value) != v.cend();
 }
 
@@ -1067,6 +1067,11 @@ template <typename Container, typename Key = typename Container::key_type, typen
 const Value *Find(const Container &container, const Key &key) {
     auto it = container.find(key);
     return (it != container.cend()) ? &it->second : nullptr;
+}
+
+template <typename T>
+void Append(std::vector<T> &dst, const std::vector<T> &src) {
+    dst.insert(dst.end(), src.begin(), src.end());
 }
 
 // EraseIf is not implemented as std::erase(std::remove_if(...), ...) for two reasons:
