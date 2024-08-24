@@ -1431,6 +1431,71 @@ TEST_F(PositiveWsi, PresentFenceWaitsForSubmission) {
     m_default_queue->Wait();
 }
 
+TEST_F(PositiveWsi, MissingExternalSynchronizationCheckForPresentFence) {
+    TEST_DESCRIPTION(
+        "Demo C++ runtime exception that std::promise is set twice due to missing external synchronization for present fence.");
+    AddSurfaceExtension();
+    AddRequiredExtensions(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+    AddRequiredExtensions(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+    RETURN_IF_SKIP(Init());
+    RETURN_IF_SKIP(InitSwapchain());
+
+    vkt::Fence present_fence(*m_device);
+
+    std::atomic_bool exit{false};
+    std::mutex mutex;
+    auto fence_wait_thread = std::thread{[&] {
+        while (!exit.load()) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                present_fence.wait(0);
+            }
+        }
+    }};
+
+    const vkt::Semaphore acquire_semaphore(*m_device);
+    const vkt::Semaphore submit_semaphore(*m_device);
+    const auto swapchain_images = GetSwapchainImages(m_swapchain);
+
+    int N = 100;
+    for (int i = 0; i < N; i++) {
+        uint32_t image_index = 0;
+        vk::AcquireNextImageKHR(device(), m_swapchain, kWaitTimeout, acquire_semaphore, VK_NULL_HANDLE, &image_index);
+        const VkImageMemoryBarrier present_transition =
+            TransitionToPresent(swapchain_images[image_index], VK_IMAGE_LAYOUT_UNDEFINED, 0);
+
+        m_command_buffer.begin();
+        vk::CmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                               nullptr, 0, nullptr, 1, &present_transition);
+        m_command_buffer.end();
+        m_default_queue->Submit(m_command_buffer, acquire_semaphore, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, submit_semaphore);
+
+        VkSwapchainPresentFenceInfoEXT present_fence_info = vku::InitStructHelper();
+        present_fence_info.swapchainCount = 1;
+        present_fence_info.pFences = &present_fence.handle();
+
+        VkPresentInfoKHR present = vku::InitStructHelper(&present_fence_info);
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &submit_semaphore.handle();
+        present.swapchainCount = 1;
+        present.pSwapchains = &m_swapchain;
+        present.pImageIndices = &image_index;
+        vk::QueuePresentKHR(*m_default_queue, &present);
+        present_fence.wait(kWaitTimeout);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            vk::ResetFences(device(), 1, &present_fence.handle());
+        }
+        m_commandBuffer->reset();
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        exit.store(true);
+    }
+    fence_wait_thread.join();
+    m_default_queue->Wait();
+}
+
 TEST_F(PositiveWsi, PresentFenceRetiresPresentQueueOperation) {
     // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/8047
     // The regression will cause occasional failures of this test. The reproducibility
