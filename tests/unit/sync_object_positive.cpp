@@ -2124,18 +2124,18 @@ TEST_F(PositiveSyncObject, TimelineHostSignalWait) {
     semaphore.Signal(1);
     semaphore.Wait(1, vvl::kU64Max);
 }
-//
-//TEST_F(PositiveSyncObject, TimelineWaitSmallerValueOnHost) {
-//    TEST_DESCRIPTION("WaitSemaphores waits on smaller value than was signaled by QueueSubmit");
-//    SetTargetApiVersion(VK_API_VERSION_1_2);
-//    AddRequiredFeature(vkt::Feature::timelineSemaphore);
-//    RETURN_IF_SKIP(Init());
-//
-//    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
-//    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
-//    semaphore.Wait(1, vvl::kU64Max);
-//}
-//
+
+TEST_F(PositiveSyncObject, TimelineWaitSmallerValueOnHost) {
+    TEST_DESCRIPTION("WaitSemaphores waits on smaller value than was signaled by QueueSubmit");
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+    semaphore.Wait(1, vvl::kU64Max);
+}
+
 //TEST_F(PositiveSyncObject, TimelineWaitSmallerValueBeforeSignal) {
 //    AddRequiredExtensions(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
 //    AddRequiredFeature(vkt::Feature::timelineSemaphore);

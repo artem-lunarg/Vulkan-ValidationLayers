@@ -291,9 +291,18 @@ void vvl::Semaphore::NotifyAndWait(const Location &loc, uint64_t payload) {
         // Signal queue(s) that need to retire because a wait on this payload has finished
         {
             auto guard = ReadLock();
-            auto pos = timeline_.find(payload);
-            if (pos != timeline_.end()) {
-                pos->second.Notify();
+            if (type == VK_SEMAPHORE_TYPE_BINARY) {
+                auto pos = timeline_.find(payload);
+                if (pos != timeline_.end()) {
+                    pos->second.Notify();
+                }
+            } else {
+                for (const auto &[timepoint_payload, timepoint] : timeline_) {
+                    if (timepoint_payload >= payload && timepoint.signal_submit.has_value()) {
+                        timepoint.Notify();
+                        break;
+                    }
+                }
             }
         }
 
