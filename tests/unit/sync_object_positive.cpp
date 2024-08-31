@@ -298,32 +298,21 @@ TEST_F(PositiveSyncObject, TwoQueueSubmitsSeparateQueuesWithSemaphoreAndOneFence
     if ((m_second_queue_caps & VK_QUEUE_GRAPHICS_BIT) == 0) {
         GTEST_SKIP() << "2 graphics queues are needed";
     }
+    VkViewport viewport{0, 0, 512, 512, 0.f, 1.f};
+
+    m_second_command_buffer.begin();
+    vk::CmdPipelineBarrier(m_second_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                           nullptr, 0, nullptr, 0, nullptr);
+    vk::CmdSetViewport(m_second_command_buffer, 0, 1, &viewport);
+    m_second_command_buffer.end();
+
+    m_command_buffer.begin();
+    vk::CmdSetViewport(m_command_buffer, 0, 1, &viewport);
+    m_command_buffer.end();
 
     vkt::Semaphore semaphore(*m_device);
-    vkt::CommandPool pool0(*m_device, m_second_queue->family_index);
-    vkt::CommandBuffer cb0(*m_device, pool0);
-    vkt::CommandBuffer cb1(*m_device, m_command_pool);
-
-    VkViewport viewport{};
-    viewport.maxDepth = 1.0f;
-    viewport.minDepth = 0.0f;
-    viewport.width = 512;
-    viewport.height = 512;
-    viewport.x = 0;
-    viewport.y = 0;
-
-    cb0.begin();
-    vk::CmdPipelineBarrier(cb0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
-                           0, nullptr);
-    vk::CmdSetViewport(cb0, 0, 1, &viewport);
-    cb0.end();
-
-    cb1.begin();
-    vk::CmdSetViewport(cb1, 0, 1, &viewport);
-    cb1.end();
-
-    m_second_queue->Submit(cb0, vkt::signal, semaphore);
-    m_default_queue->Submit(cb1, vkt::wait, semaphore);
+    m_second_queue->Submit(m_second_command_buffer, vkt::signal, semaphore);
+    m_default_queue->Submit(m_command_buffer, vkt::wait, semaphore);
     m_default_queue->Wait();
 }
 
@@ -2086,3 +2075,65 @@ TEST_F(PositiveSyncObject, GetCounterValueOfExportedSemaphore2) {
     semaphore.Signal(2);
 }
 #endif  // VK_USE_PLATFORM_WIN32_KHR
+
+TEST_F(PositiveSyncObject, TimelineHostWaitBeforeSubmitSignal) {
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    auto thread = [&semaphore]() { semaphore.Wait(1, vvl::kU64Max); };
+    std::thread t(thread);
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 1);
+    t.join();
+}
+
+TEST_F(PositiveSyncObject, TimelineHostWaitBeforeHostSignal) {
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    auto thread = [&semaphore]() { semaphore.Wait(1, vvl::kU64Max); };
+    std::thread t(thread);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1000});
+    semaphore.Signal(1);
+    t.join();
+}
+
+TEST_F(PositiveSyncObject, TimelineHostSignalWait) {
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    semaphore.Signal(1);
+    semaphore.Wait(1, vvl::kU64Max);
+}
+//
+//TEST_F(PositiveSyncObject, TimelineWaitSmallerValueOnHost) {
+//    TEST_DESCRIPTION("WaitSemaphores waits on smaller value than was signaled by QueueSubmit");
+//    SetTargetApiVersion(VK_API_VERSION_1_2);
+//    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+//    RETURN_IF_SKIP(Init());
+//
+//    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+//    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+//    semaphore.Wait(1, vvl::kU64Max);
+//}
+//
+//TEST_F(PositiveSyncObject, TimelineWaitSmallerValueBeforeSignal) {
+//    AddRequiredExtensions(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+//    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+//    all_queue_count_ = true;
+//    RETURN_IF_SKIP(Init());
+//
+//    if (!m_second_queue) {
+//        GTEST_SKIP() << "2 queues are needed";
+//    }
+//    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+//    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
+//    m_second_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+//    m_default_queue->Wait();
+//}

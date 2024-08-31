@@ -73,7 +73,7 @@ struct QueueSubmission {
 // (via being in a PostRecord call) that a fence, semaphore or wait for idle has
 // completed. Hitting it is almost a certainly a bug in this code.
 static inline std::chrono::time_point<std::chrono::steady_clock> GetCondWaitTimeout() {
-    return std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    return std::chrono::steady_clock::now() + std::chrono::seconds(10000);
 }
 
 struct SubmitResult {

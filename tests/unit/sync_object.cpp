@@ -3674,3 +3674,21 @@ TEST_F(NegativeSyncObject, ImageBarrierStageNotSupportedByQueue) {
     m_errorMonitor->VerifyFound();
     compute_cb.end();
 }
+//
+//TEST_F(NegativeSyncObject, NotVeryReliableTestButDemonstratesIssue) {
+//    TEST_DESCRIPTION("This test should fail we in-use error: Signal should not start forward progresss");
+//    SetTargetApiVersion(VK_API_VERSION_1_2);
+//    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+//    RETURN_IF_SKIP(Init());
+//
+//    vkt::Buffer buffer_a(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+//    vkt::Buffer buffer_b(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+//    m_command_buffer.begin();
+//    m_command_buffer.Copy(buffer_a, buffer_b);
+//    m_command_buffer.end();
+//
+//    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+//    m_default_queue->SubmitWithTimelineSemaphore(m_command_buffer, vkt::wait, semaphore, 1);
+//    semaphore.Signal(1);
+//    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+//}

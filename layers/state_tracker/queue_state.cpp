@@ -75,8 +75,9 @@ vvl::SubmitResult vvl::Queue::PostSubmit(std::vector<vvl::QueueSubmission> &&sub
             wait.semaphore->EnqueueWait(SubmissionReference(this, submission.seq), wait.payload);
         }
 
+        bool has_host_wait = false;
         for (auto &signal : submission.signal_semaphores) {
-            signal.semaphore->EnqueueSignal(SubmissionReference(this, submission.seq), signal.payload);
+            has_host_wait |= signal.semaphore->EnqueueSignal(SubmissionReference(this, submission.seq), signal.payload);
         }
 
         if (submission.fence) {
@@ -84,6 +85,9 @@ vvl::SubmitResult vvl::Queue::PostSubmit(std::vector<vvl::QueueSubmission> &&sub
                 result.has_external_fence = true;
                 result.submission_with_external_fence_seq = submission.seq;
             }
+        }
+        if (has_host_wait) {
+            Notify(submission.seq);
         }
         {
             auto guard = Lock();

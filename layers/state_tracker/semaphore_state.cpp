@@ -29,11 +29,11 @@ void vvl::Semaphore::TimePoint::Notify() const {
     if (signal_submit && signal_submit->queue) {
         signal_submit->queue->Notify(signal_submit->seq);
     }
-    for (auto &wait : wait_submits) {
+    /*for (auto &wait : wait_submits) {
         if (wait.queue) {
             wait.queue->Notify(wait.seq);
         }
-    }
+    }*/
 }
 
 vvl::Semaphore::Semaphore(ValidationStateTracker &dev, VkSemaphore handle, const VkSemaphoreTypeCreateInfo *type_create_info,
@@ -56,7 +56,7 @@ enum vvl::Semaphore::Scope vvl::Semaphore::Scope() const {
     return scope_;
 }
 
-void vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload) {
+bool vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload) {
     auto guard = WriteLock();
     if (type == VK_SEMAPHORE_TYPE_BINARY) {
         payload = next_payload_++;
@@ -65,6 +65,13 @@ void vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uin
     assert(timeline_.find(payload) == timeline_.end() || !timeline_.find(payload)->second.signal_submit.has_value());
 
     timeline_[payload].signal_submit.emplace(signal_submit);
+
+    for (const auto &wait_submit : timeline_[payload].wait_submits) {
+        if (wait_submit.queue == nullptr) {
+            return true; // there is host wait, we can notify the calling queue to start forward progress that will resolve host wait
+        }
+    }
+    return false;
 }
 
 void vvl::Semaphore::EnqueueWait(const SubmissionReference &wait_submit, uint64_t &payload) {
@@ -190,14 +197,6 @@ bool vvl::Semaphore::CanBinaryBeWaited() const {
     return !timeline_.rbegin()->second.HasWaiters();
 }
 
-void vvl::Semaphore::Notify(uint64_t payload) {
-    auto guard = ReadLock();
-    auto pos = timeline_.find(payload);
-    if (pos != timeline_.end()) {
-        pos->second.Notify();
-    }
-}
-
 void vvl::Semaphore::Retire(vvl::Queue *current_queue, const Location &loc, uint64_t payload) {
     auto guard = WriteLock();
     if (payload <= completed_.payload) {
@@ -280,7 +279,15 @@ std::shared_future<void> vvl::Semaphore::Wait(uint64_t payload) {
 
 void vvl::Semaphore::NotifyAndWait(const Location &loc, uint64_t payload) {
     if (scope_ == kInternal) {
-        Notify(payload);
+        // Signal queue(s) that need to retire because a wait on this payload has finished
+        {
+            auto guard = ReadLock();
+            auto pos = timeline_.find(payload);
+            if (pos != timeline_.end()) {
+                pos->second.Notify();
+            }
+        }
+
         auto waiter = Wait(payload);
         dev_data_.BeginBlockingOperation();
         auto result = waiter.wait_until(GetCondWaitTimeout());

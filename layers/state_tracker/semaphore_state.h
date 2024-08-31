@@ -78,7 +78,7 @@ class Semaphore : public RefcountedStateObject {
 
     // Enqueue a semaphore operation. For binary semaphores, the payload value is generated and
     // returned, so that every semaphore operation has a unique value.
-    void EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload);
+    bool EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload);
     void EnqueueWait(const SubmissionReference &wait_submit, uint64_t &payload);
 
     // Enqueue binary semaphore signal from swapchain image acquire command
@@ -123,9 +123,6 @@ class Semaphore : public RefcountedStateObject {
   private:
     Semaphore(ValidationStateTracker &dev, VkSemaphore handle, const VkSemaphoreTypeCreateInfo *type_create_info,
               const VkSemaphoreCreateInfo *pCreateInfo);
-
-    // Signal queue(s) that need to retire because a wait on this payload has finished
-    void Notify(uint64_t payload);
 
     std::shared_future<void> Wait(uint64_t payload);
 
