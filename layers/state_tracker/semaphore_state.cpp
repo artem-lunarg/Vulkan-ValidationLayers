@@ -66,9 +66,17 @@ bool vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uin
 
     timeline_[payload].signal_submit.emplace(signal_submit);
 
-    for (const auto &wait_submit : timeline_[payload].wait_submits) {
-        if (wait_submit.queue == nullptr) {
-            return true; // there is host wait, we can notify the calling queue to start forward progress that will resolve host wait
+    if (type == VK_SEMAPHORE_TYPE_TIMELINE) {
+        for (const auto &[timepoint_payload, timepoint] : timeline_) {
+            if (timepoint_payload > payload) {
+                break;
+            }
+            for (const auto &wait_submit : timeline_[timepoint_payload].wait_submits) {
+                if (wait_submit.queue == nullptr) {
+                    return true;  // there is host wait, we can notify the calling queue to start forward progress that will resolve
+                                  // host wait
+                }
+            }
         }
     }
     return false;
@@ -236,7 +244,8 @@ void vvl::Semaphore::Retire(vvl::Queue *current_queue, const Location &loc, uint
             completed_ = SemOp(kWait, wait_submit, payload);
         }
         timepoint.completed.set_value();
-        timeline_.erase(timeline_.begin());
+        //timeline_.erase(timeline_.begin());
+        timeline_.erase(timeline_.begin(), ++pos);
         if (scope_ == kExternalTemporary) {
             scope_ = kInternal;
             imported_handle_type_.reset();

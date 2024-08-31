@@ -2089,6 +2089,19 @@ TEST_F(PositiveSyncObject, TimelineHostWaitBeforeSubmitSignal) {
     t.join();
 }
 
+TEST_F(PositiveSyncObject, TimelineHostWaitBeforeSubmitLargerSignal) {
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    auto thread = [&semaphore]() { semaphore.Wait(1, vvl::kU64Max); };
+    std::thread t(thread);
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+    t.join();
+}
+
 TEST_F(PositiveSyncObject, TimelineHostWaitBeforeHostSignal) {
     SetTargetApiVersion(VK_API_VERSION_1_2);
     AddRequiredFeature(vkt::Feature::timelineSemaphore);
