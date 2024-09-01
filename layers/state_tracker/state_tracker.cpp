@@ -1418,7 +1418,7 @@ void ValidationStateTracker::PostCallRecordSignalSemaphore(VkDevice device, cons
 
     auto semaphore_state = Get<vvl::Semaphore>(pSignalInfo->semaphore);
     if (semaphore_state) {
-        semaphore_state->Retire(nullptr, record_obj.location, pSignalInfo->value);
+        //semaphore_state->Retire(nullptr, record_obj.location, pSignalInfo->value);
     }
 }
 

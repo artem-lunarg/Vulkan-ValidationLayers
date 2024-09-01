@@ -123,9 +123,14 @@ std::optional<vvl::Semaphore::SemOp> vvl::Semaphore::LastOp(const std::function<
                 break;
             }
         }
-        if (!result && timepoint.signal_submit && (!filter || filter(kSignal, payload, true))) {
-            result.emplace(SemOp(kSignal, *timepoint.signal_submit, payload));
-            break;
+        if (!result && timepoint.signal_submit) {
+            // vkSemaphoreSignal can't be a pending operation, it signals immediately
+            const bool pending = timepoint.signal_submit->queue != nullptr;
+
+            if (!filter || filter(kSignal, payload, pending)) {
+                result.emplace(SemOp(kSignal, *timepoint.signal_submit, payload));
+                break;
+            }
         }
         if (!result && timepoint.acquire_command && (!filter || filter(kBinaryAcquire, payload, true))) {
             result.emplace(SemOp(*timepoint.acquire_command, payload));
