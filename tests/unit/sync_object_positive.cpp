@@ -1390,15 +1390,14 @@ struct SemBufferRaceData {
 
     vkt::Device &dev;
     vkt::Semaphore sem;
-    uint64_t start_wait_value{0};
-    uint64_t timeout_ns{kWaitTimeout};
-    uint32_t iterations{10000};
+    uint64_t timeout_ns{kWaitTimeout * 1000};
+    uint32_t iterations{100};
     std::atomic<bool> bailout{false};
 
     std::unique_ptr<vkt::Buffer> thread_buffer;
 
     void ThreadFunc() {
-        auto wait_value = start_wait_value;
+        auto wait_value = 2;
 
         while (!bailout) {
             auto err = sem.WaitKHR(wait_value, timeout_ns);
@@ -1420,7 +1419,6 @@ struct SemBufferRaceData {
     void Run(vkt::CommandPool &command_pool, ErrorMonitor &error_mon) {
         uint64_t gpu_wait_value, gpu_signal_value;
         VkResult err;
-        start_wait_value = 2;
         error_mon.SetBailout(&bailout);
         std::thread thread(&SemBufferRaceData::ThreadFunc, this);
         auto queue = dev.QueuesWithGraphicsCapability()[0];
@@ -1439,6 +1437,16 @@ struct SemBufferRaceData {
             // sub thread frees buffer
             // sub thread signals 3
             // main thread waits for 3
+            // 
+            // main thread sets up buffer
+            // main thread signals 4
+            // gpu queue waits for 4
+            // gpu queue signals 5
+            // sub thread waits for 5
+            // sub thread frees buffer
+            // sub thread signals 6
+            // main thread waits for 6
+
             uint64_t host_signal_value = (i * 3) + 1;
             gpu_wait_value = host_signal_value;
             gpu_signal_value = (i * 3) + 2;
@@ -2150,3 +2158,28 @@ TEST_F(PositiveSyncObject, TimelineWaitSmallerValueOnHost) {
 //    m_second_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
 //    m_default_queue->Wait();
 //}
+
+TEST_F(PositiveSyncObject, TimelineSubmitThenHostSignalThenQueueWait) {
+    TEST_DESCRIPTION("");
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
+    semaphore.Signal(1);
+    m_default_queue->Wait();
+}
+
+
+TEST_F(PositiveSyncObject, TimelineSubmitThenHostSignalThenQueueWait2) {
+    TEST_DESCRIPTION("");
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
+    semaphore.Signal(2);
+    m_default_queue->Wait();
+}

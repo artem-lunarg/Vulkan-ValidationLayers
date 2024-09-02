@@ -77,7 +77,7 @@ vvl::SubmitResult vvl::Queue::PostSubmit(std::vector<vvl::QueueSubmission> &&sub
 
         bool has_host_wait = false;
         for (auto &signal : submission.signal_semaphores) {
-            has_host_wait |= signal.semaphore->EnqueueSignal(SubmissionReference(this, submission.seq), signal.payload);
+            has_host_wait |= signal.semaphore->EnqueueSignal(SubmissionReference(this, submission.seq), signal.payload).has_value();
         }
 
         if (submission.fence) {

@@ -63,11 +63,12 @@ class Semaphore : public RefcountedStateObject {
         std::optional<Func> acquire_command;
         std::promise<void> completed;
         std::shared_future<void> waiter;
+        bool pending_wait = false;
 
         TimePoint() : completed(), waiter(completed.get_future()) {}
         bool HasSignaler() const { return signal_submit.has_value() || acquire_command.has_value(); }
         bool HasWaiters() const { return !wait_submits.empty(); }
-        void Notify() const;
+        void Notify();
     };
 
     Semaphore(ValidationStateTracker &dev, VkSemaphore handle, const VkSemaphoreCreateInfo *pCreateInfo)
@@ -78,7 +79,7 @@ class Semaphore : public RefcountedStateObject {
 
     // Enqueue a semaphore operation. For binary semaphores, the payload value is generated and
     // returned, so that every semaphore operation has a unique value.
-    bool EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload);
+    std::optional<uint64_t> EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload);
     void EnqueueWait(const SubmissionReference &wait_submit, uint64_t &payload);
 
     // Enqueue binary semaphore signal from swapchain image acquire command

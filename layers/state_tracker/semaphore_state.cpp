@@ -25,10 +25,11 @@ static VkExternalSemaphoreHandleTypeFlags GetExportHandleTypes(const VkSemaphore
     return export_info ? export_info->handleTypes : 0;
 }
 
-void vvl::Semaphore::TimePoint::Notify() const {
+void vvl::Semaphore::TimePoint::Notify() {
     if (signal_submit && signal_submit->queue) {
         signal_submit->queue->Notify(signal_submit->seq);
     }
+    pending_wait = true;
     /*for (auto &wait : wait_submits) {
         if (wait.queue) {
             wait.queue->Notify(wait.seq);
@@ -56,7 +57,7 @@ enum vvl::Semaphore::Scope vvl::Semaphore::Scope() const {
     return scope_;
 }
 
-bool vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload) {
+std::optional<uint64_t> vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uint64_t &payload) {
     auto guard = WriteLock();
     if (type == VK_SEMAPHORE_TYPE_BINARY) {
         payload = next_payload_++;
@@ -71,15 +72,18 @@ bool vvl::Semaphore::EnqueueSignal(const SubmissionReference &signal_submit, uin
             if (timepoint_payload > payload) {
                 break;
             }
+            if (timeline_[timepoint_payload].pending_wait) {
+                return timepoint_payload;
+            }
             for (const auto &wait_submit : timeline_[timepoint_payload].wait_submits) {
                 if (wait_submit.queue == nullptr) {
-                    return true;  // there is host wait, we can notify the calling queue to start forward progress that will resolve
+                    return timepoint_payload;  // there is host wait, we can notify the calling queue to start forward progress that will resolve
                                   // host wait
                 }
             }
         }
     }
-    return false;
+    return {};
 }
 
 void vvl::Semaphore::EnqueueWait(const SubmissionReference &wait_submit, uint64_t &payload) {
@@ -222,10 +226,23 @@ void vvl::Semaphore::Retire(vvl::Queue *current_queue, const Location &loc, uint
 
     bool retire_here = false;
 
+    bool has_host_signal = false;
+    if (type == VK_SEMAPHORE_TYPE_TIMELINE) {
+        for (const auto &[cur_payload, cur_timepoint] : timeline_) {
+            if (cur_payload >= payload && cur_timepoint.signal_submit.has_value() &&
+                cur_timepoint.signal_submit->queue == nullptr) {
+                has_host_signal = true;
+                break;
+            }
+        }
+    }
+
     // Retire the operation if it occured on the current queue. Usually this means it is a signal.
     // Note that host operations occur on the null queue. Acquire operations are a special case because
     // the happen asynchronously but there isn't a queue associated with signalling them.
-    if (timepoint.signal_submit) {
+    if (has_host_signal) {
+        retire_here = true;
+    } else if (timepoint.signal_submit) {
         if (timepoint.signal_submit->queue == current_queue) {
             retire_here = true;
         }
@@ -302,9 +319,17 @@ void vvl::Semaphore::NotifyAndWait(const Location &loc, uint64_t payload) {
                     pos->second.Notify();
                 }
             } else {
-                for (const auto &[timepoint_payload, timepoint] : timeline_) {
+                for (auto &[timepoint_payload, timepoint] : timeline_) {
                     if (timepoint_payload >= payload && timepoint.signal_submit.has_value()) {
-                        timepoint.Notify();
+                        if (timepoint.signal_submit->queue) {
+                            timepoint.Notify();
+                        } else {
+                            auto it = timeline_.find(payload);
+                            if (it == timeline_.end()) {
+                                it = timeline_.emplace(payload, TimePoint{}).first;
+                            }
+                            it->second.completed.set_value();
+                        }
                         break;
                     }
                 }

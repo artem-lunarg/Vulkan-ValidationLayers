@@ -1403,7 +1403,10 @@ void ValidationStateTracker::PreCallRecordSignalSemaphore(VkDevice device, const
     auto semaphore_state = Get<vvl::Semaphore>(pSignalInfo->semaphore);
     if (semaphore_state) {
         auto value = pSignalInfo->value;  // const workaround
-        semaphore_state->EnqueueSignal(vvl::SubmissionReference{}, value);
+        auto host_wait_payload = semaphore_state->EnqueueSignal(vvl::SubmissionReference{}, value);
+        if (host_wait_payload.has_value()) {
+            semaphore_state->Retire(nullptr, record_obj.location, host_wait_payload.value());
+        }
     }
 }
 
