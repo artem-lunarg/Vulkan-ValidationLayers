@@ -2144,20 +2144,35 @@ TEST_F(PositiveSyncObject, TimelineWaitSmallerValueOnHost) {
     semaphore.Wait(1, vvl::kU64Max);
 }
 
-//TEST_F(PositiveSyncObject, TimelineWaitSmallerValueBeforeSignal) {
-//    AddRequiredExtensions(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
-//    AddRequiredFeature(vkt::Feature::timelineSemaphore);
-//    all_queue_count_ = true;
-//    RETURN_IF_SKIP(Init());
-//
-//    if (!m_second_queue) {
-//        GTEST_SKIP() << "2 queues are needed";
-//    }
-//    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
-//    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
-//    m_second_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
-//    m_default_queue->Wait();
-//}
+TEST_F(PositiveSyncObject, TimelineWaitSmallerValueBeforeSignal) {
+    AddRequiredExtensions(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    all_queue_count_ = true;
+    RETURN_IF_SKIP(Init());
+
+    if (!m_second_queue) {
+        GTEST_SKIP() << "2 queues are needed";
+    }
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
+    m_second_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+    m_default_queue->Wait();
+}
+
+TEST_F(PositiveSyncObject, TimelineWaitSmallerValueBeforeSignalX) {
+    AddRequiredExtensions(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    all_queue_count_ = true;
+    RETURN_IF_SKIP(Init());
+
+    if (!m_second_queue) {
+        GTEST_SKIP() << "2 queues are needed";
+    }
+    vkt::Semaphore semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE_KHR);
+    m_second_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::signal, semaphore, 2);
+    m_default_queue->SubmitWithTimelineSemaphore(vkt::no_cmd, vkt::wait, semaphore, 1);
+    m_default_queue->Wait();
+}
 
 TEST_F(PositiveSyncObject, TimelineSubmitThenHostSignalThenQueueWait) {
     TEST_DESCRIPTION("");

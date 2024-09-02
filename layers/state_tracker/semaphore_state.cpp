@@ -237,6 +237,19 @@ void vvl::Semaphore::Retire(vvl::Queue *current_queue, const Location &loc, uint
         }
     }
 
+    if (!timepoint.signal_submit.has_value()) { // BAD CODE in this conditin?
+        if (type == VK_SEMAPHORE_TYPE_TIMELINE) {
+            for (auto &[cur_payload, cur_timepoint] : timeline_) {
+                if (cur_payload >= payload && cur_timepoint.signal_submit.has_value() &&
+                    cur_timepoint.signal_submit->queue != nullptr) {
+                    cur_timepoint.Notify();
+                    break;
+                }
+            }
+        }
+    }
+
+
     // Retire the operation if it occured on the current queue. Usually this means it is a signal.
     // Note that host operations occur on the null queue. Acquire operations are a special case because
     // the happen asynchronously but there isn't a queue associated with signalling them.
