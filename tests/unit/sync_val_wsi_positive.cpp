@@ -324,3 +324,56 @@ TEST_F(PositiveSyncValWsi, WaitForFencesWithPresentBatches) {
     }
     m_default_queue->Wait();
 }
+
+TEST_F(PositiveSyncValWsi, PresentBlockedByTimelineWait) {
+    TEST_DESCRIPTION("Present is blocked by the preceeding wait-before-signal submit");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddSurfaceExtension();
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    AddRequiredFeature(vkt::Feature::timelineSemaphore);
+    RETURN_IF_SKIP(InitSyncVal());
+    RETURN_IF_SKIP(InitSwapchain());
+
+    if (!m_second_queue) {
+        GTEST_SKIP() << "Two queues are needed";
+    }
+
+    vkt::Semaphore acquire_semaphore(*m_device);
+    vkt::Semaphore timeline_semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+    vkt::Semaphore submit_ready_semaphore(*m_device);
+    const auto swapchain_images = m_swapchain.GetImages();
+    const uint32_t image_index = m_swapchain.AcquireNextImage(acquire_semaphore, kWaitTimeout);
+
+    VkImageMemoryBarrier2 layout_transition = vku::InitStructHelper();
+    layout_transition.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    layout_transition.srcAccessMask = VK_ACCESS_2_NONE;
+    layout_transition.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    layout_transition.dstAccessMask = VK_ACCESS_2_NONE;
+    layout_transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    layout_transition.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    layout_transition.image = swapchain_images[image_index];
+    layout_transition.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo dep_info = vku::InitStructHelper();
+    dep_info.imageMemoryBarrierCount = 1;
+    dep_info.pImageMemoryBarriers = &layout_transition;
+
+    m_command_buffer.Begin();
+    vk::CmdPipelineBarrier2(m_command_buffer, &dep_info);
+    m_command_buffer.End();
+
+    m_default_queue->Submit2(m_command_buffer, vkt::Wait(acquire_semaphore), vkt::TimelineSignal(timeline_semaphore, 1));
+
+    // Wait-before-signal submit before present.
+    // Because present happens on the same queue it has to wait until wait-before-signal is resolved.
+    m_default_queue->Submit2(vkt::no_cmd, vkt::TimelineWait(timeline_semaphore, 2), vkt::Signal(submit_ready_semaphore));
+
+    // In the case of regression, when present does not participates in the wait-before-signal chain,
+    // the layout transition from the first submit can collide with the presentation access.
+    m_default_queue->Present(m_swapchain, image_index, submit_ready_semaphore);
+
+    // Resolve wait-before-signal on default queue
+    m_second_queue->Submit2(vkt::no_cmd, vkt::TimelineWait(timeline_semaphore, 1), vkt::TimelineSignal(timeline_semaphore, 2));
+
+    m_device->Wait();
+}
