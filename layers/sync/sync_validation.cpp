@@ -3013,6 +3013,20 @@ struct QueuePresentCmdState {
     QueuePresentCmdState(const SyncValidator &sync_validator) : signals_update(sync_validator) {}
 };
 
+static PresentedImages GetPresentedImages(const SyncValidator &sync_state, const VkPresentInfoKHR &present_info,
+                                          const BatchContextPtr &batch) {
+    PresentedImages presented_images;
+    presented_images.reserve(present_info.swapchainCount);
+    for (uint32_t i = 0; i < present_info.swapchainCount; i++) {
+        // Note: Given the "EraseIf" implementation for acquire fence waits, each presentation needs a unique tag.
+        const ResourceUsageTag local_present_tag = i;  // later will be converted to global
+        const VkSwapchainKHR swapchain = present_info.pSwapchains[i];
+        const uint32_t image_index = present_info.pImageIndices[i];
+        presented_images.emplace_back(PresentedImage{sync_state, batch, swapchain, image_index, i, local_present_tag});
+    }
+    return presented_images;
+}
+
 bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo,
                                                    const ErrorObject &error_obj) const {
     bool skip = false;
@@ -3026,62 +3040,63 @@ bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresen
     cmd_state->queue = GetQueueSyncStateShared(queue);
     if (!cmd_state->queue) return skip;  // Invalid Queue
 
+    auto &queue_sync_state = cmd_state->queue;
+
     // The submit id is a mutable automic which is not recoverable on a skip == true condition
     uint64_t submit_id = cmd_state->queue->ReserveSubmitId();
 
-    QueueBatchContext::ConstPtr last_batch = cmd_state->queue->LastBatch();
+    BatchContextConstPtr last_batch = queue_sync_state->LastBatch();
+    const bool has_unresolved_batches = !queue_sync_state->UnresolvedBatches().empty();
+    UnresolvedBatch unresolved_present_batch;
+
     QueueBatchContext::Ptr batch(std::make_shared<QueueBatchContext>(*this, *cmd_state->queue));
 
-    uint32_t present_tag_count = SetupPresentInfo(*pPresentInfo, batch, cmd_state->presented_images);
+    auto presented_images = GetPresentedImages(*this, *pPresentInfo, batch);
 
     const auto wait_semaphores = vvl::make_span(pPresentInfo->pWaitSemaphores, pPresentInfo->waitSemaphoreCount);
 
-    auto resolved_batches = batch->ResolvePresentWaits(wait_semaphores, cmd_state->presented_images, cmd_state->signals_update);
+    auto resolved_batches = batch->ResolvePresentWaits(wait_semaphores, presented_images, cmd_state->signals_update);
 
-    // Import the previous batch information
-    if (last_batch && !vvl::Contains(resolved_batches, last_batch)) {
-        batch->ResolveLastBatch(last_batch);
-        resolved_batches.emplace_back(std::move(last_batch));
+    if (has_unresolved_batches) {
+        unresolved_present_batch.batch = std::move(batch);
+        unresolved_present_batch.submit_index = submit_id;
+        unresolved_present_batch.presented_images = std::move(presented_images);
+        unresolved_present_batch.resolved_dependencies = std::move(resolved_batches);
+        stats.AddUnresolvedBatch();
+    } else {
+        // Import the previous batch information
+        if (last_batch && !vvl::Contains(resolved_batches, last_batch)) {
+            batch->ResolveLastBatch(last_batch);
+            resolved_batches.emplace_back(std::move(last_batch));
+        }
+
+        // The purpose of keeping return value is to ensure async batches are alive during validation.
+        // Validation accesses raw pointer to async contexts stored in AsyncReference.
+        const auto async_batches = batch->RegisterAsyncContexts(resolved_batches);
+
+        const ResourceUsageTag global_range_start = batch->SetupBatchTags(pPresentInfo->swapchainCount);
+        // Update the present tags (convert to global range)
+        for (auto &presented : presented_images) {
+            presented.tag += global_range_start;
+        }
+
+        skip |= batch->DoQueuePresentValidate(error_obj.location, presented_images);
+        batch->DoPresentOperations(presented_images);
+        batch->LogPresentOperations(presented_images, submit_id);
+
+        cmd_state->presented_images = std::move(presented_images);
     }
 
-    // The purpose of keeping return value is to ensure async batches are alive during validation.
-    // Validation accesses raw pointer to async contexts stored in AsyncReference.
-    const auto async_batches = batch->RegisterAsyncContexts(resolved_batches);
-
-    const ResourceUsageTag global_range_start = batch->SetupBatchTags(present_tag_count);
-    // Update the present tags (convert to global range)
-    for (auto &presented : cmd_state->presented_images) {
-        presented.tag += global_range_start;
-    }
-
-    skip |= batch->DoQueuePresentValidate(error_obj.location, cmd_state->presented_images);
-    batch->DoPresentOperations(cmd_state->presented_images);
-    batch->LogPresentOperations(cmd_state->presented_images, submit_id);
-
-    if (!skip) {
+    // Schedule state update
+    if (!skip && !has_unresolved_batches) {
         cmd_state->queue->SetPendingLastBatch(std::move(batch));
     }
-    return skip;
-}
-
-uint32_t SyncValidator::SetupPresentInfo(const VkPresentInfoKHR &present_info, QueueBatchContext::Ptr &batch,
-                                         PresentedImages &presented_images) const {
-    const VkSwapchainKHR *const swapchains = present_info.pSwapchains;
-    const uint32_t *const image_indices = present_info.pImageIndices;
-    const uint32_t swapchain_count = present_info.swapchainCount;
-
-    // Create the working list of presented images
-    presented_images.reserve(swapchain_count);
-    for (uint32_t present_index = 0; present_index < swapchain_count; present_index++) {
-        // Note: Given the "EraseIf" implementation for acquire fence waits, each presentation needs a unique tag.
-        const ResourceUsageTag tag = presented_images.size();
-        presented_images.emplace_back(*this, batch, swapchains[present_index], image_indices[present_index], present_index, tag);
-        if (presented_images.back().Invalid()) {
-            presented_images.pop_back();
-        }
+    if (has_unresolved_batches) {
+        auto unresolved_batches = queue_sync_state->UnresolvedBatches();
+        unresolved_batches.emplace_back(std::move(unresolved_present_batch));
+        queue_sync_state->SetPendingUnresolvedBatches(std::move(unresolved_batches));
     }
-    // Present is tagged for each swapchain.
-    return static_cast<uint32_t>(presented_images.size());
+    return skip;
 }
 
 void SyncValidator::PostCallRecordQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo,

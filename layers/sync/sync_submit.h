@@ -240,6 +240,7 @@ struct UnresolvedBatch {
     uint64_t submit_index = 0;
     uint32_t batch_index = 0;
     std::vector<CommandBufferConstPtr> command_buffers;
+    PresentedImages presented_images;
 
     // Waits-before-signals that prevent this batch from being resolved.
     // When the wait is resolved it is removed from this list and the batch
