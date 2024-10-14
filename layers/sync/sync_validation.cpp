@@ -3006,13 +3006,6 @@ void SyncValidator::PostCallRecordDeviceWaitIdle(VkDevice device, const RecordOb
     host_waitable_semaphores_.clear();
 }
 
-struct QueuePresentCmdState {
-    std::shared_ptr<const QueueSyncState> queue;
-    SignalsUpdate signals_update;
-    PresentedImages presented_images;
-    QueuePresentCmdState(const SyncValidator &sync_validator) : signals_update(sync_validator) {}
-};
-
 static PresentedImages GetPresentedImages(const SyncValidator &sync_state, const VkPresentInfoKHR &present_info,
                                           const BatchContextPtr &batch) {
     PresentedImages presented_images;
@@ -3034,9 +3027,13 @@ bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresen
     // Since this early return is above the TlsGuard, the Record phase must also be.
     if (!syncval_settings.submit_time_validation) return skip;
 
+    std::lock_guard lock_guard(queue_submit_mutex_);
+
     ClearPending();
 
-    vvl::TlsGuard<QueuePresentCmdState> cmd_state(&skip, *this);
+    QueueSubmitCmdState cmd_state_obj(*this);
+    QueueSubmitCmdState *cmd_state = &cmd_state_obj;
+
     cmd_state->queue = GetQueueSyncStateShared(queue);
     if (!cmd_state->queue) return skip;  // Invalid Queue
 
@@ -3047,7 +3044,6 @@ bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresen
 
     BatchContextConstPtr last_batch = queue_sync_state->LastBatch();
     const bool has_unresolved_batches = !queue_sync_state->UnresolvedBatches().empty();
-    UnresolvedBatch unresolved_present_batch;
 
     QueueBatchContext::Ptr batch(std::make_shared<QueueBatchContext>(*this, *cmd_state->queue));
 
@@ -3058,11 +3054,16 @@ bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresen
     auto resolved_batches = batch->ResolvePresentWaits(wait_semaphores, presented_images, cmd_state->signals_update);
 
     if (has_unresolved_batches) {
-        unresolved_present_batch.batch = std::move(batch);
-        unresolved_present_batch.submit_index = submit_id;
-        unresolved_present_batch.presented_images = std::move(presented_images);
-        unresolved_present_batch.resolved_dependencies = std::move(resolved_batches);
+        UnresolvedBatch unresolved_batch;
+        unresolved_batch.batch = std::move(batch);
+        unresolved_batch.submit_index = submit_id;
+        unresolved_batch.presented_images = std::move(presented_images);
+        unresolved_batch.resolved_dependencies = std::move(resolved_batches);
         stats.AddUnresolvedBatch();
+
+        auto unresolved_batches = queue_sync_state->UnresolvedBatches();
+        unresolved_batches.emplace_back(std::move(unresolved_batch));
+        queue_sync_state->SetPendingUnresolvedBatches(std::move(unresolved_batches));
     } else {
         // Import the previous batch information
         if (last_batch && !vvl::Contains(resolved_batches, last_batch)) {
@@ -3085,42 +3086,51 @@ bool SyncValidator::PreCallValidateQueuePresentKHR(VkQueue queue, const VkPresen
         batch->LogPresentOperations(presented_images, submit_id);
 
         cmd_state->presented_images = std::move(presented_images);
+        if (!skip) {
+            cmd_state->queue->SetPendingLastBatch(std::move(batch));
+        }
     }
 
-    // Schedule state update
-    if (!skip && !has_unresolved_batches) {
-        cmd_state->queue->SetPendingLastBatch(std::move(batch));
-    }
-    if (has_unresolved_batches) {
-        auto unresolved_batches = queue_sync_state->UnresolvedBatches();
-        unresolved_batches.emplace_back(std::move(unresolved_present_batch));
-        queue_sync_state->SetPendingUnresolvedBatches(std::move(unresolved_batches));
+    if (!skip) {
+        const_cast<SyncValidator *>(this)->RecordQueuePresent(cmd_state);
     }
     return skip;
+}
+
+void SyncValidator::RecordQueuePresent(QueueSubmitCmdState *cmd_state) {
+    // Update the state with the data from the validate phase
+    std::shared_ptr<QueueSyncState> queue_state = std::const_pointer_cast<QueueSyncState>(std::move(cmd_state->queue));
+    ApplySignalsUpdate(cmd_state->signals_update, queue_state->PendingLastBatch());
+    queue_state->ApplyPendingUnresolvedBatches();
+    for (auto &presented : cmd_state->presented_images) {
+        presented.ExportToSwapchain(*this);
+    }
+    queue_state->ApplyPendingLastBatch();
 }
 
 void SyncValidator::PostCallRecordQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo,
                                                   const RecordObject &record_obj) {
     StateTracker::PostCallRecordQueuePresentKHR(queue, pPresentInfo, record_obj);
-    if (!syncval_settings.submit_time_validation) return;
 
-    // The earliest return (when enabled), must be *after* the TlsGuard, as it is the TlsGuard that cleans up the cmd_state
-    // static payload
-    vvl::TlsGuard<QueuePresentCmdState> cmd_state;
+    // if (!syncval_settings.submit_time_validation) return;
 
-    // See ValidationStateTracker::PostCallRecordQueuePresentKHR for spec excerpt supporting
-    if (record_obj.result == VK_ERROR_OUT_OF_HOST_MEMORY || record_obj.result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
-        record_obj.result == VK_ERROR_DEVICE_LOST) {
-        return;
-    }
+    //// The earliest return (when enabled), must be *after* the TlsGuard, as it is the TlsGuard that cleans up the cmd_state
+    //// static payload
+    // vvl::TlsGuard<QueueSubmitCmdState> cmd_state;
 
-    // Update the state with the data from the validate phase
-    std::shared_ptr<QueueSyncState> queue_state = std::const_pointer_cast<QueueSyncState>(std::move(cmd_state->queue));
-    ApplySignalsUpdate(cmd_state->signals_update, queue_state->PendingLastBatch());
-    for (auto &presented : cmd_state->presented_images) {
-        presented.ExportToSwapchain(*this);
-    }
-    queue_state->ApplyPendingLastBatch();
+    //// See ValidationStateTracker::PostCallRecordQueuePresentKHR for spec excerpt supporting
+    // if (record_obj.result == VK_ERROR_OUT_OF_HOST_MEMORY || record_obj.result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+    //     record_obj.result == VK_ERROR_DEVICE_LOST) {
+    //     return;
+    // }
+
+    //// Update the state with the data from the validate phase
+    // std::shared_ptr<QueueSyncState> queue_state = std::const_pointer_cast<QueueSyncState>(std::move(cmd_state->queue));
+    // ApplySignalsUpdate(cmd_state->signals_update, queue_state->PendingLastBatch());
+    // for (auto &presented : cmd_state->presented_images) {
+    //     presented.ExportToSwapchain(*this);
+    // }
+    // queue_state->ApplyPendingLastBatch();
 }
 
 void SyncValidator::PostCallRecordAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
@@ -3214,13 +3224,14 @@ bool SyncValidator::ValidateQueueSubmit(VkQueue queue, uint32_t submitCount, con
     ClearPending();
 
     QueueSubmitCmdState cmd_state_obj(*this);
-    QueueSubmitCmdState* cmd_state = &cmd_state_obj;
+    QueueSubmitCmdState *cmd_state = &cmd_state_obj;
 
     cmd_state->queue = GetQueueSyncStateShared(queue);
     if (!cmd_state->queue) return skip;  // Invalid Queue
 
     auto &queue_sync_state = cmd_state->queue;
     SignalsUpdate &signals_update = cmd_state->signals_update;
+    PresentedImages &presented_images = cmd_state->presented_images;
 
     // The submit id is a mutable automic which is not recoverable on a skip == true condition
     uint64_t submit_id = queue_sync_state->ReserveSubmitId();
@@ -3298,7 +3309,7 @@ bool SyncValidator::ValidateQueueSubmit(VkQueue queue, uint32_t submitCount, con
 
     // Check if timeline signals resolve existing wait-before-signal dependencies
     if (new_timeline_signals) {
-        skip |= PropagateTimelineSignals(signals_update, error_obj);
+        skip |= PropagateTimelineSignals(signals_update, presented_images, error_obj);
     }
 
     if (!skip) {
@@ -3309,7 +3320,8 @@ bool SyncValidator::ValidateQueueSubmit(VkQueue queue, uint32_t submitCount, con
     return skip;
 }
 
-bool SyncValidator::PropagateTimelineSignals(SignalsUpdate &signals_update, const ErrorObject &error_obj) const {
+bool SyncValidator::PropagateTimelineSignals(SignalsUpdate &signals_update, PresentedImages &presented_images,
+                                             const ErrorObject &error_obj) const {
     bool skip = false;
     // Initialize per-queue unresolved batches state.
     std::vector<UnresolvedQueue> queues;
@@ -3325,7 +3337,7 @@ bool SyncValidator::PropagateTimelineSignals(SignalsUpdate &signals_update, cons
     // Each iteration uses registered timeline signals to resolve existing unresolved batches.
     // Each resolved batch can generate new timeline signals which are used on the next iteration.
     // This finishes when all unresolved batches are resolved or when iteration does not generate new timeline signals.
-    while (ProcessUnresolvedBatches(queues, signals_update, skip, error_obj)) {
+    while (ProcessUnresolvedBatches(queues, signals_update, presented_images, skip, error_obj)) {
         ;
     }
 
@@ -3338,8 +3350,8 @@ bool SyncValidator::PropagateTimelineSignals(SignalsUpdate &signals_update, cons
     return skip;
 }
 
-bool SyncValidator::ProcessUnresolvedBatches(std::vector<UnresolvedQueue> &queues, SignalsUpdate &signals_update, bool &skip,
-                                             const ErrorObject &error_obj) const {
+bool SyncValidator::ProcessUnresolvedBatches(std::vector<UnresolvedQueue> &queues, SignalsUpdate &signals_update,
+                                             PresentedImages &presented_images, bool &skip, const ErrorObject &error_obj) const {
     bool has_new_timeline_signals = false;
     for (auto &queue : queues) {
         if (queue.unresolved_batches.empty()) {
@@ -3383,12 +3395,27 @@ bool SyncValidator::ProcessUnresolvedBatches(std::vector<UnresolvedQueue> &queue
 
             const auto async_batches = ready_batch.batch->RegisterAsyncContexts(ready_batch.resolved_dependencies);
 
-            skip |= ready_batch.batch->ValidateSubmit(ready_batch.command_buffers, ready_batch.submit_index,
-                                                      ready_batch.batch_index, ready_batch.label_stack, error_obj);
+            if (ready_batch.presented_images.empty()) {
+                skip |= ready_batch.batch->ValidateSubmit(ready_batch.command_buffers, ready_batch.submit_index,
+                                                          ready_batch.batch_index, ready_batch.label_stack, error_obj);
 
-            // Process signals. New timeline signals can liberate more unresolved batches on the next iteration
-            const auto submit_signals = vvl::make_span(ready_batch.signals.data(), ready_batch.signals.size());
-            has_new_timeline_signals |= signals_update.RegisterSignals(ready_batch.batch, submit_signals);
+                // Process signals. New timeline signals can liberate more unresolved batches on the next iteration
+                const auto submit_signals = vvl::make_span(ready_batch.signals.data(), ready_batch.signals.size());
+                has_new_timeline_signals |= signals_update.RegisterSignals(ready_batch.batch, submit_signals);
+            } else {
+                const ResourceUsageTag global_range_start =
+                    ready_batch.batch->SetupBatchTags((uint32_t)ready_batch.presented_images.size());
+                // Update the present tags (convert to global range)
+                for (auto &presented : ready_batch.presented_images) {
+                    presented.tag += global_range_start;
+                }
+                skip |= ready_batch.batch->DoQueuePresentValidate(error_obj.location, ready_batch.presented_images);
+                ready_batch.batch->DoPresentOperations(ready_batch.presented_images);
+                ready_batch.batch->LogPresentOperations(ready_batch.presented_images, ready_batch.submit_index);
+
+                // TODO: provide example and add support for *multiple* present commands in unresolved batches list
+                presented_images = std::move(ready_batch.presented_images);
+            }
 
             // Remove processed batch from the (local) unresolved list
             queue.unresolved_batches.erase(queue.unresolved_batches.begin());
@@ -3425,6 +3452,11 @@ void SyncValidator::RecordQueueSubmit(VkQueue queue, VkFence fence, QueueSubmitC
     for (const auto &qs : queue_sync_states_) {
         qs->ApplyPendingLastBatch();
         qs->ApplyPendingUnresolvedBatches();
+    }
+
+    // Presentation batches postponed by wait-before-signal submits
+    for (auto &presented : cmd_state->presented_images) {
+        presented.ExportToSwapchain(*this);
     }
 
     FenceHostSyncPoint sync_point;
@@ -3482,6 +3514,7 @@ bool SyncValidator::PreCallValidateSignalSemaphore(VkDevice device, const VkSema
     ClearPending();
     vvl::TlsGuard<QueueSubmitCmdState> cmd_state(&skip, *this);
     SignalsUpdate &signals_update = cmd_state->signals_update;
+    PresentedImages &presented_images = cmd_state->presented_images;
 
     auto semaphore_state = Get<vvl::Semaphore>(pSignalInfo->semaphore);
     if (!semaphore_state) {
@@ -3496,7 +3529,7 @@ bool SyncValidator::PreCallValidateSignalSemaphore(VkDevice device, const VkSema
     }
 
     signals.emplace_back(SignalInfo(semaphore_state, pSignalInfo->value));
-    skip |= PropagateTimelineSignals(signals_update, error_obj);
+    skip |= PropagateTimelineSignals(signals_update, presented_images, error_obj);
     return skip;
 }
 
@@ -3523,6 +3556,11 @@ void SyncValidator::PostCallRecordSignalSemaphore(VkDevice device, const VkSemap
     for (const auto &qs : queue_sync_states_) {
         qs->ApplyPendingLastBatch();
         qs->ApplyPendingUnresolvedBatches();
+    }
+
+    // Presentation batches postponed by wait-before-signal submits
+    for (auto &presented : cmd_state->presented_images) {
+        presented.ExportToSwapchain(*this);
     }
 }
 
@@ -3671,4 +3709,3 @@ ImageRangeGen syncval_state::ImageViewState::MakeImageRangeGen(const VkOffset3D 
 
     return GetImageState()->MakeImageRangeGen(subresource_range, offset, extent, IsDepthSliced());
 }
-

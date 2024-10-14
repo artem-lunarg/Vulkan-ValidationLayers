@@ -351,5 +351,8 @@ TEST_F(NegativeSyncValWsi, PresentBlockedByTimelineWait) {
                             vkt::TimelineSignal(timeline_semaphore, 2, stage_mask));
     m_errorMonitor->VerifyFound();
 
+    m_second_queue->Submit2(vkt::no_cmd, vkt::TimelineWait(timeline_semaphore, 1, stage_mask),
+                            vkt::TimelineSignal(timeline_semaphore, 2, stage_mask));
+
     m_device->Wait();
 }

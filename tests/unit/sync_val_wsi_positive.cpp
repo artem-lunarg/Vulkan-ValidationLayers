@@ -364,15 +364,14 @@ TEST_F(PositiveSyncValWsi, PresentBlockedByTimelineWait) {
 
     m_default_queue->Submit2(m_command_buffer, vkt::Wait(acquire_semaphore), vkt::TimelineSignal(timeline_semaphore, 1));
 
-    // Wait-before-signal submit before present.
-    // Because present happens on the same queue it has to wait until wait-before-signal is resolved.
+    // Wait-before-signal submission. The following present has to wait for this submission
+    // because it happens on the same queue.
     m_default_queue->Submit2(vkt::no_cmd, vkt::TimelineWait(timeline_semaphore, 2), vkt::Signal(submit_ready_semaphore));
 
-    // In the case of regression, when present does not participates in the wait-before-signal chain,
-    // the layout transition from the first submit can collide with the presentation access.
+    // In the case of regression the layout transition from the first submit can collide with the presentation access
     m_default_queue->Present(m_swapchain, image_index, submit_ready_semaphore);
 
-    // Resolve wait-before-signal on default queue
+    // Initiate forward progress on the default queue by resolving wait-before-signal
     m_second_queue->Submit2(vkt::no_cmd, vkt::TimelineWait(timeline_semaphore, 1), vkt::TimelineSignal(timeline_semaphore, 2));
 
     m_device->Wait();

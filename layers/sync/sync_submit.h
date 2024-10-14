@@ -426,5 +426,6 @@ class QueueSyncState {
 struct QueueSubmitCmdState {
     std::shared_ptr<const QueueSyncState> queue;
     SignalsUpdate signals_update;
+    PresentedImages presented_images;
     QueueSubmitCmdState(const SyncValidator &sync_validator) : signals_update(sync_validator) {}
 };
