@@ -585,8 +585,16 @@ std::vector<BatchContextConstPtr> QueueBatchContext::ResolveSubmitWaits(vvl::spa
 
         if (semaphore_state->type == VK_SEMAPHORE_TYPE_BINARY) {
             resolving_signal = signals_update.OnBinaryWait(wait_info.semaphore);
+
+            // There can be two reasons why binary signal is missing:
+            // * it's a binary wait before signal (core validation error)
+            // * there is a resolving binary signal but it was postponed by timeline wait-before-signal
+            // The specific scenario will be determined later when unresolved list is processed.
             if (!resolving_signal) {
-                continue;  // [core validation check]: binary signal not found
+                if (semaphore_state->Scope() == vvl::Semaphore::Scope::kInternal) {
+                    unresolved_waits.emplace_back(wait_info);
+                }
+                continue;
             }
         } else {
             // Special case when semaphore initial value satisfies the wait.

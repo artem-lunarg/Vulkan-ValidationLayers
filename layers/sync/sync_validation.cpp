@@ -3358,10 +3358,20 @@ bool SyncValidator::ProcessUnresolvedBatch(UnresolvedBatch &unresolved_batch, Si
     auto it = unresolved_batch.unresolved_waits.begin();
     while (it != unresolved_batch.unresolved_waits.end()) {
         const VkSemaphoreSubmitInfo &wait_info = *it;
-        auto resolving_signal = signals_update.OnTimelineWait(wait_info.semaphore, wait_info.value);
-        if (!resolving_signal.has_value()) {
-            ++it;
-            continue;  // resolving signal not found, the wait stays unresolved
+        auto semaphore_state = Get<vvl::Semaphore>(wait_info.semaphore);
+        std::optional<SignalInfo> resolving_signal;
+        if (semaphore_state->type == VK_SEMAPHORE_TYPE_BINARY) {
+            resolving_signal = signals_update.OnBinaryWait(wait_info.semaphore);
+            if (!resolving_signal) {
+                it = unresolved_batch.unresolved_waits.erase(it);
+                continue;  // [core validation check]: binary signal not found
+            }
+        } else {
+            resolving_signal = signals_update.OnTimelineWait(wait_info.semaphore, wait_info.value);
+            if (!resolving_signal) {
+                ++it;
+                continue;  // resolving timeline signal not found, the wait stays unresolved
+            }
         }
         if (resolving_signal->batch) {  // null for host signals
             unresolved_batch.batch->ResolveSubmitSemaphoreWait(*resolving_signal, wait_info.stageMask);

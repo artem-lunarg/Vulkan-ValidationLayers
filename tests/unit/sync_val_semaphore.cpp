@@ -353,3 +353,35 @@ TEST_F(NegativeSyncValTimelineSemaphore, SignalResolvesTwoWaits4) {
     m_errorMonitor->VerifyFound();
     m_device->Wait();
 }
+
+
+TEST_F(NegativeSyncValTimelineSemaphore, BinarySyncAfterTimelineWait) {
+    TEST_DESCRIPTION("Binary semaphore signal->wait after timeline wait-before-signal");
+    RETURN_IF_SKIP(InitTimelineSemaphore());
+
+    if (!m_second_queue) {
+        GTEST_SKIP() << "Two queues are needed";
+    }
+
+    vkt::Buffer buffer_a(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    vkt::Buffer buffer_b(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    m_command_buffer.Begin(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT);
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_command_buffer.End();
+
+    vkt::Semaphore timeline_semaphore(*m_device, VK_SEMAPHORE_TYPE_TIMELINE);
+    vkt::Semaphore binary_semaphore(*m_device);
+
+    m_default_queue->Submit2(m_command_buffer, vkt::TimelineWait(timeline_semaphore, 1), vkt::Signal(binary_semaphore));
+    m_default_queue->Submit2(m_command_buffer, vkt::Wait(binary_semaphore, VK_PIPELINE_STAGE_2_NONE));
+
+    // Unblock default queue. Binary wait uses NONE stage, so it collides with previous copy
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_second_queue->Submit2(vkt::no_cmd, vkt::TimelineSignal(timeline_semaphore, 1));
+    m_errorMonitor->VerifyFound();
+
+    // The previous call did not reach driver due to validation error. Submit one more time to resolve timeline wait.
+    m_second_queue->Submit2(vkt::no_cmd, vkt::TimelineSignal(timeline_semaphore, 1));
+
+    m_default_queue->Wait();
+}
