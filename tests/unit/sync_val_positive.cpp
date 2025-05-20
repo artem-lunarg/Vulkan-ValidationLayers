@@ -2445,7 +2445,7 @@ TEST_F(PositiveSyncVal, Test) {
 
     VkImageMemoryBarrier2 layout_transition = vku::InitStructHelper();
     layout_transition.srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    layout_transition.srcAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    layout_transition.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     layout_transition.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
     layout_transition.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     layout_transition.oldLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ;
