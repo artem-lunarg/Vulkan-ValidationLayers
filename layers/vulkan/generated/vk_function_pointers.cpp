@@ -32,6 +32,7 @@
 #include "containers/custom_containers.h"
 
 #ifdef _WIN32
+#include <Windows.h>
 // Dynamic Loading:
 typedef HMODULE dl_handle;
 static dl_handle open_library(const char *lib_path) {
@@ -53,6 +54,15 @@ static void *get_proc_address(dl_handle library, const char *name) {
     assert(name);
     return (void *)GetProcAddress(library, name);
 }
+/* Windows-specific common code: */
+// WinBase.h defines CreateSemaphore and synchapi.h defines CreateEvent
+//  undefine them to avoid conflicts with VkLayerDispatchTable struct members.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
 #elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__QNX__) || defined(__GNU__)
 
 #include <dlfcn.h>

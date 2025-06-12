@@ -15,6 +15,21 @@
 #include "../framework/external_memory_sync.h"
 #include "utils/math_utils.h"
 
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#include <Windows.h>
+#ifdef _WIN32
+/* Windows-specific common code: */
+// WinBase.h defines CreateSemaphore and synchapi.h defines CreateEvent
+//  undefine them to avoid conflicts with VkLayerDispatchTable struct members.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
+#endif
+#endif
+
 class PositiveExternalMemorySync : public ExternalMemorySyncTest {};
 
 TEST_F(PositiveExternalMemorySync, GetMemoryFdHandle) {

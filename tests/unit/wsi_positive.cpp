@@ -11,6 +11,21 @@
 #include "../framework/layer_validation_tests.h"
 #include "../framework/pipeline_helper.h"
 
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#include <Windows.h>
+#ifdef _WIN32
+/* Windows-specific common code: */
+// WinBase.h defines CreateSemaphore and synchapi.h defines CreateEvent
+//  undefine them to avoid conflicts with VkLayerDispatchTable struct members.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
+#endif
+#endif
+
 void WsiTest::SetImageLayoutPresentSrc(VkImage image) {
     vkt::CommandPool pool(*m_device, m_device->graphics_queue_node_index_);
     vkt::CommandBuffer cmd_buf(*m_device, pool);

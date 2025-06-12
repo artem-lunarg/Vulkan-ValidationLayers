@@ -34,6 +34,10 @@
 #include "apple_wsi.h"
 #endif
 
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#include <Windows.h>
+#endif
+
 template <typename C, typename F>
 typename C::iterator RemoveIf(C &container, F &&fn) {
     return container.erase(std::remove_if(container.begin(), container.end(), std::forward<F>(fn)), container.end());

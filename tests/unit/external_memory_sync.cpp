@@ -12,6 +12,21 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
 
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#include <Windows.h>
+#ifdef _WIN32
+/* Windows-specific common code: */
+// WinBase.h defines CreateSemaphore and synchapi.h defines CreateEvent
+//  undefine them to avoid conflicts with VkLayerDispatchTable struct members.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
+#endif
+#endif
+
 #include "generated/enum_flag_bits.h"
 #include "../framework/layer_validation_tests.h"
 #include "../framework/external_memory_sync.h"

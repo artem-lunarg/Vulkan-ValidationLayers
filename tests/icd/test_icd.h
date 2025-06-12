@@ -26,6 +26,13 @@
 #include <vector>
 
 #include "vulkan/vulkan.h"
+
+typedef long LONG;
+typedef struct _LUID {
+    DWORD LowPart;
+    LONG HighPart;
+} LUID, *PLUID;
+
 #include "vulkan/vk_icd.h"
 
 namespace icd {

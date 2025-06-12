@@ -3,19 +3,19 @@
         {
             "name": "Vulkan-Headers",
             "api": "vulkan",
-            "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+            "url": "https://github.com/artem-lunarg/Vulkan-Headers.git",
             "sub_dir": "Vulkan-Headers",
             "build_dir": "Vulkan-Headers/build",
             "install_dir": "Vulkan-Headers/build/install",
-            "commit": "1d6c53f65443ceeb97d3bdc695aaecc7ea6cc441"
+            "commit": "origin/artem-lunar-vulkan"
         },
         {
             "name": "Vulkan-Utility-Libraries",
-            "url": "https://github.com/KhronosGroup/Vulkan-Utility-Libraries.git",
+            "url": "https://github.com/artem-lunarg/Vulkan-Utility-Libraries.git",
             "sub_dir": "Vulkan-Utility-Libraries",
             "build_dir": "Vulkan-Utility-Libraries/build",
             "install_dir": "Vulkan-Utility-Libraries/build/install",
-            "commit": "v1.4.317",
+            "commit": "origin/artem-lunar-vulkan",
             "deps": [
                 {
                     "var_name": "VULKAN_HEADERS_INSTALL_DIR",

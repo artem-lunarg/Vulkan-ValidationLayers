@@ -183,6 +183,8 @@ bool Device::manual_PreCallValidateGetMemoryWin32HandleKHR(VkDevice device,
     return skip;
 }
 
+#define INVALID_HANDLE_VALUE ((HANDLE)(int64_t)-1)
+
 bool Device::manual_PreCallValidateGetMemoryWin32HandlePropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
                                                                      HANDLE handle,
                                                                      VkMemoryWin32HandlePropertiesKHR *pMemoryWin32HandleProperties,

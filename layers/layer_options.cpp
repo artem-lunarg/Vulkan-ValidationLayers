@@ -41,6 +41,10 @@
 #include "mimalloc-new-delete.h"
 #endif
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+#include <Windows.h>
+#endif
+
 const auto &VkValFeatureDisableLookup() {
     static const vvl::unordered_map<std::string, VkValidationFeatureDisableEXT> vk_val_feature_disable_lookup = {
         {"VK_VALIDATION_FEATURE_DISABLE_SHADERS_EXT", VK_VALIDATION_FEATURE_DISABLE_SHADERS_EXT},

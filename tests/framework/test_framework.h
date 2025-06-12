@@ -23,9 +23,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
+//#ifdef _WIN32
+//#include <windows.h>
+//#endif
 
 // Can be used by tests to record additional details / description of test
 #define TEST_DESCRIPTION(desc) RecordProperty("description", desc)
