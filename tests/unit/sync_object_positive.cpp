@@ -2892,3 +2892,118 @@ TEST_F(PositiveSyncObject, Maintenance9ImageBarriers) {
     m_command_buffer.Barrier(layout_transition);
     m_command_buffer.End();
 }
+
+TEST_F(PositiveSyncObject, QueueFamilyOwnershipTransfer) {
+    TEST_DESCRIPTION("https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/4903");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    RETURN_IF_SKIP(Init());
+
+    vkt::Queue* transfer_queue = m_device->TransferOnlyQueue();
+    if (!transfer_queue) {
+        GTEST_SKIP() << "Transfer-only queue is not present";
+    }
+    vkt::CommandPool transfer_pool(*m_device, transfer_queue->family_index);
+    const uint32_t buffer_count = 2;
+
+    vkt::CommandBuffer graphics_acquire_cb[buffer_count];
+    vkt::CommandBuffer graphics_release_cb[buffer_count];
+    vkt::CommandBuffer transfer_acquire_cb[buffer_count];
+    vkt::CommandBuffer transfer_release_cb[buffer_count];
+
+    vkt::Buffer buffer(*m_device, 64 * buffer_count,
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    VkBufferMemoryBarrier2 transfer_acquire_barrier = vku::InitStructHelper();
+    transfer_acquire_barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    transfer_acquire_barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    transfer_acquire_barrier.srcQueueFamilyIndex = m_default_queue->family_index;
+    transfer_acquire_barrier.dstQueueFamilyIndex = transfer_queue->family_index;
+    transfer_acquire_barrier.buffer = buffer;
+    transfer_acquire_barrier.size = 64;
+
+    VkBufferMemoryBarrier2 transfer_release_barrier = vku::InitStructHelper();
+    transfer_release_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    transfer_release_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    transfer_release_barrier.srcQueueFamilyIndex = transfer_queue->family_index;
+    transfer_release_barrier.dstQueueFamilyIndex = m_default_queue->family_index;
+    transfer_release_barrier.buffer = buffer;
+    transfer_release_barrier.size = 64;
+
+    VkBufferMemoryBarrier2 graphics_acquire_barrier = vku::InitStructHelper();
+    graphics_acquire_barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    graphics_acquire_barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    graphics_acquire_barrier.srcQueueFamilyIndex = transfer_queue->family_index;
+    graphics_acquire_barrier.dstQueueFamilyIndex = m_default_queue->family_index;
+    graphics_acquire_barrier.buffer = buffer;
+    graphics_acquire_barrier.size = 64;
+
+    VkBufferMemoryBarrier2 graphics_release_barrier = vku::InitStructHelper();
+    graphics_release_barrier.srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    graphics_release_barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    graphics_release_barrier.srcQueueFamilyIndex = m_default_queue->family_index;
+    graphics_release_barrier.dstQueueFamilyIndex = transfer_queue->family_index;
+    graphics_release_barrier.buffer = buffer;
+    graphics_release_barrier.size = 64;
+
+    vkt::Fence transfer_fences[buffer_count];
+    vkt::Fence graphics_fences[buffer_count];
+
+    for (uint32_t i = 0; i < buffer_count; ++i) {
+        const uint32_t offset = 64 * i;
+
+        transfer_acquire_barrier.offset = offset;
+        transfer_acquire_cb[i] = {*m_device, transfer_pool};
+        transfer_acquire_cb[i].Begin();
+        transfer_acquire_cb[i].Barrier(transfer_acquire_barrier);
+        transfer_acquire_cb[i].End();
+
+        transfer_release_barrier.offset = offset;
+        transfer_release_cb[i] = {*m_device, transfer_pool};
+        transfer_release_cb[i].Begin();
+        transfer_release_cb[i].Barrier(transfer_release_barrier);
+        transfer_release_cb[i].End();
+
+        graphics_acquire_barrier.offset = offset;
+        graphics_acquire_cb[i] = {*m_device, m_command_pool};
+        graphics_acquire_cb[i].Begin();
+        graphics_acquire_cb[i].Barrier(graphics_acquire_barrier);
+        graphics_acquire_cb[i].End();
+
+        graphics_release_barrier.offset = offset;
+        graphics_release_cb[i] = {*m_device, m_command_pool};
+        graphics_release_cb[i].Begin();
+        graphics_release_cb[i].Barrier(graphics_release_barrier);
+        graphics_release_cb[i].End();
+
+        graphics_fences[i].Init(*m_device, VK_FENCE_CREATE_SIGNALED_BIT);
+        transfer_fences[i].Init(*m_device, VK_FENCE_CREATE_SIGNALED_BIT);
+    }
+
+    const uint32_t frame_count = 1000;
+    for (uint32_t i = 0; i < frame_count; ++i) {
+        const uint32_t index = i % buffer_count;
+
+        vkt::Fence& g_fence = graphics_fences[index];
+        g_fence.Wait(kWaitTimeout);
+        g_fence.Reset();
+
+        vkt::Fence& t_fence = transfer_fences[index];
+        t_fence.Wait(kWaitTimeout);
+        t_fence.Reset();
+
+        const vkt::CommandBuffer& g_acquire_cb = graphics_acquire_cb[index];
+        const vkt::CommandBuffer& g_release_cb = graphics_release_cb[index];
+        const vkt::CommandBuffer& t_acquire_cb = transfer_acquire_cb[index];
+        const vkt::CommandBuffer& t_release_cb = transfer_release_cb[index];
+
+        std::thread thread([&transfer_queue, &t_acquire_cb, &t_release_cb, &t_fence] {
+            transfer_queue->Submit(t_acquire_cb);
+            transfer_queue->Submit(t_release_cb, t_fence);
+        });
+        m_default_queue->Submit(g_acquire_cb);
+        m_default_queue->Submit(g_release_cb, g_fence);
+        thread.join();
+    }
+    m_device->Wait();
+}
