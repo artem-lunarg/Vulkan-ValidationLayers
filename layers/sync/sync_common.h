@@ -19,6 +19,7 @@
 #include "containers/range.h"
 #include "generated/sync_validation_types.h"
 #include "containers/limits.h"
+#include "sync_memory.h"
 #include <set>
 
 namespace vvl {
@@ -91,3 +92,4 @@ class CachedInsertSet : public std::set<IntegralKey> {
     key_type entries_[kSize];
 };
 
+syncval::MemoryPool &GetMemoryPool();

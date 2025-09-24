@@ -34,3 +34,8 @@ ResourceAccessRange MakeRange(const vvl::Buffer& buffer, VkDeviceSize offset, Vk
     }
     return ResourceAccessRange(offset, end);
 }
+
+syncval::MemoryPool& GetMemoryPool() {
+    static thread_local syncval::MemoryPool memory_pool;
+    return memory_pool;
+}

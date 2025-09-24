@@ -465,7 +465,7 @@ void SyncOpPipelineBarrier::ApplyMultipleBarriers(CommandExecutionContext &exec_
     }
 
     // Apply barriers independently and store the result in the pending object.
-    PendingBarriers pending_barriers;
+    PendingBarriers pending_barriers(GetMemoryPool());
     for (const SyncBufferMemoryBarrier &barrier : barrier_set_.buffer_memory_barriers) {
         if (SimpleBinding(*barrier.buffer)) {
             const BarrierScope barrier_scope(barrier.barrier, queue_id);
@@ -497,6 +497,7 @@ void SyncOpPipelineBarrier::ApplyMultipleBarriers(CommandExecutionContext &exec_
 
     // Update access states with collected barriers
     pending_barriers.Apply(exec_tag);
+    GetMemoryPool().Reset();
 }
 
 void SyncOpPipelineBarrier::ReplayRecord(CommandExecutionContext &exec_context, const ResourceUsageTag exec_tag) const {
@@ -818,7 +819,7 @@ void SyncOpWaitEvents::ReplayRecord(CommandExecutionContext &exec_context, Resou
     }
 
     // Apply barriers independently and store the result in the pending object.
-    PendingBarriers pending_barriers;
+    PendingBarriers pending_barriers(GetMemoryPool());
     barrier_set_index = 0;
     barrier_set_incr = (barrier_sets_.size() == 1) ? 0 : 1;
     for (auto &event_shared : events_) {
@@ -884,6 +885,7 @@ void SyncOpWaitEvents::ReplayRecord(CommandExecutionContext &exec_context, Resou
 
     // Update access states with collected barriers
     pending_barriers.Apply(exec_tag);
+    GetMemoryPool().Reset();
 }
 
 bool SyncOpWaitEvents::ReplayValidate(ReplayState &replay, ResourceUsageTag recorded_tag) const {

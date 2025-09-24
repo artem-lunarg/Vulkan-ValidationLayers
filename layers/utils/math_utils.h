@@ -53,6 +53,7 @@ constexpr bool IsSingleBitSet(T flags) {
 
 // Returns the 0-based index of the MSB, like the x86 bit scan reverse (bsr) instruction
 // Note: an input mask of 0 yields -1
+// TODO: C++ 20: return (31 - std::countl_zero(mask)). It will also return -1 if mask is 0
 [[maybe_unused]] static inline int MostSignificantBit(uint32_t mask) {
 #if defined __GNUC__
     return mask ? __builtin_clz(mask) ^ 31 : -1;
@@ -67,6 +68,17 @@ constexpr bool IsSingleBitSet(T flags) {
     }
     return -1;
 #endif
+}
+
+// TODO: C++ 20: std::countl_zero can be used at compile time
+template <size_t N>
+constexpr int MostSignificantBitCompileTime() {
+    int index = 0;
+    size_t x = N;
+    while ((x >>= 1) != 0) {
+        index++;
+    }
+    return index;
 }
 
 static inline int u_ffs(int val) {

@@ -913,13 +913,14 @@ void RenderPassAccessContext::RecordEndRenderPass(AccessContext *external_contex
             external_context->UpdateMemoryAccessState(markup_action, markup_range_gen);
 
             ImageRangeGen range_gen(*ref_range_gen);
-            PendingBarriers pending_barriers;
+            PendingBarriers pending_barriers(GetMemoryPool());
             for (const auto &barrier : last_trackback.barriers) {
                 const BarrierScope barrier_scope(barrier);
                 CollectBarriersFunctor collect_barriers(barrier_scope, barrier, true, vvl::kNoIndex32, pending_barriers);
                 external_context->UpdateMemoryAccessState(collect_barriers, range_gen);
             }
             pending_barriers.Apply(barrier_tag);
+            GetMemoryPool().Reset();
         }
     }
 }
