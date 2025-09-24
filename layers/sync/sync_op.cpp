@@ -465,7 +465,8 @@ void SyncOpPipelineBarrier::ApplyMultipleBarriers(CommandExecutionContext &exec_
     }
 
     // Apply barriers independently and store the result in the pending object.
-    PendingBarriers pending_barriers;
+    MemoryPool pool;
+    PendingBarriers pending_barriers(pool);
     for (const SyncBufferMemoryBarrier &barrier : barrier_set_.buffer_memory_barriers) {
         if (SimpleBinding(*barrier.buffer)) {
             const BarrierScope barrier_scope(barrier.barrier, queue_id);
@@ -818,7 +819,8 @@ void SyncOpWaitEvents::ReplayRecord(CommandExecutionContext &exec_context, Resou
     }
 
     // Apply barriers independently and store the result in the pending object.
-    PendingBarriers pending_barriers;
+    MemoryPool pool;
+    PendingBarriers pending_barriers(pool);
     barrier_set_index = 0;
     barrier_set_incr = (barrier_sets_.size() == 1) ? 0 : 1;
     for (auto &event_shared : events_) {

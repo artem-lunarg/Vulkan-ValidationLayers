@@ -17,6 +17,10 @@
 
 #pragma once
 #include "sync/sync_common.h"
+#include "sync/sync_memory.h"
+
+using syncval::MemoryPool;
+using syncval::PagedVector;
 
 class ResourceAccessState;
 class WriteState;
@@ -361,10 +365,12 @@ struct PendingLayoutTransition {
 // state one at a time. This creates dependencies. PendingBarriers solves this by delaying updates to
 // the access state until all barriers have been processed.
 struct PendingBarriers {
-    std::vector<PendingBarrierInfo> infos;
-    std::vector<PendingReadBarrier> read_barriers;
-    std::vector<PendingWriteBarrier> write_barriers;
-    std::vector<PendingLayoutTransition> layout_transitions;
+    PagedVector<PendingBarrierInfo, 2048> infos;
+    PagedVector<PendingReadBarrier, 16> read_barriers;
+    PagedVector<PendingWriteBarrier, 16> write_barriers;
+    PagedVector<PendingLayoutTransition, 16> layout_transitions;
+
+    PendingBarriers(MemoryPool &pool) : infos(pool), read_barriers(pool), write_barriers(pool), layout_transitions(pool) {}
 
     // Store result of barrier application as PendingBarriers state
     void AddReadBarrier(ResourceAccessState *access_state, uint32_t last_reads_index, const SyncBarrier &barrier);

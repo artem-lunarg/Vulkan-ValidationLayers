@@ -636,18 +636,18 @@ void ResourceAccessState::CollectPendingBarriers(const BarrierScope &barrier_sco
 
 void PendingBarriers::AddReadBarrier(ResourceAccessState *access_state, uint32_t last_reads_index, const SyncBarrier &barrier) {
     size_t barrier_index = 0;
-    for (; barrier_index < read_barriers.size(); barrier_index++) {
+    for (; barrier_index < read_barriers.Size(); barrier_index++) {
         const PendingReadBarrier &pending = read_barriers[barrier_index];
         if (pending.barriers == barrier.dst_exec_scope.exec_scope && pending.last_reads_index == last_reads_index) {
             break;
         }
     }
-    if (barrier_index == read_barriers.size()) {
-        PendingReadBarrier &pending = read_barriers.emplace_back();
+    if (barrier_index == read_barriers.Size()) {
+        PendingReadBarrier &pending = read_barriers.EmplaceBack();
         pending.barriers = barrier.dst_exec_scope.exec_scope;
         pending.last_reads_index = last_reads_index;
     }
-    PendingBarrierInfo &info = infos.emplace_back();
+    PendingBarrierInfo &info = infos.EmplaceBack();
     info.type = PendingBarrierType::ReadAccessBarrier;
     info.index = (uint32_t)barrier_index;
     info.access_state = access_state;
@@ -655,18 +655,18 @@ void PendingBarriers::AddReadBarrier(ResourceAccessState *access_state, uint32_t
 
 void PendingBarriers::AddWriteBarrier(ResourceAccessState *access_state, const SyncBarrier &barrier) {
     size_t barrier_index = 0;
-    for (; barrier_index < write_barriers.size(); barrier_index++) {
+    for (; barrier_index < write_barriers.Size(); barrier_index++) {
         const PendingWriteBarrier &pending = write_barriers[barrier_index];
         if (pending.barriers == barrier.dst_access_scope && pending.dependency_chain == barrier.dst_exec_scope.exec_scope) {
             break;
         }
     }
-    if (barrier_index == write_barriers.size()) {
-        PendingWriteBarrier &pending = write_barriers.emplace_back();
+    if (barrier_index == write_barriers.Size()) {
+        PendingWriteBarrier &pending = write_barriers.EmplaceBack();
         pending.barriers = barrier.dst_access_scope;
         pending.dependency_chain = barrier.dst_exec_scope.exec_scope;
     }
-    PendingBarrierInfo &info = infos.emplace_back();
+    PendingBarrierInfo &info = infos.EmplaceBack();
     info.type = PendingBarrierType::WriteAccessBarrier;
     info.index = (uint32_t)barrier_index;
     info.access_state = access_state;
@@ -677,28 +677,30 @@ void PendingBarriers::AddLayoutTransition(ResourceAccessState *access_state, con
     // NOTE: in contrast to read/write barriers, we don't do reuse search here,
     // mostly because we didn't see a beneficial use case yet.
     // Storing handle index can be a hint it would be harder to find duplicates.
-    PendingBarrierInfo &info = infos.emplace_back();
+    PendingBarrierInfo &info = infos.EmplaceBack();
     info.type = PendingBarrierType::LayoutTransition;
-    info.index = (uint32_t)layout_transitions.size();
+    info.index = (uint32_t)layout_transitions.Size();
     info.access_state = access_state;
 
-    PendingLayoutTransition &layout_transition = layout_transitions.emplace_back();
+    PendingLayoutTransition &layout_transition = layout_transitions.EmplaceBack();
     layout_transition.ordering = OrderingBarrier(barrier.src_exec_scope.exec_scope, barrier.src_access_scope);
     layout_transition.handle_index = layout_transition_handle_index;
 }
 
 void PendingBarriers::Apply(const ResourceUsageTag exec_tag) {
-    for (const PendingBarrierInfo &info : infos) {
-        if (info.type == PendingBarrierType::ReadAccessBarrier) {
-            const PendingReadBarrier &read_barrier = read_barriers[info.index];
-            info.access_state->ApplyPendingReadBarrier(read_barrier, exec_tag);
-        } else if (info.type == PendingBarrierType::WriteAccessBarrier) {
-            const PendingWriteBarrier &write_barrier = write_barriers[info.index];
-            info.access_state->ApplyPendingWriteBarrier(write_barrier);
-        } else {
-            assert(info.type == PendingBarrierType::LayoutTransition);
-            const PendingLayoutTransition &layout_transition = layout_transitions[info.index];
-            info.access_state->ApplyPendingLayoutTransition(layout_transition, exec_tag);
+    for (const auto &page : infos) {
+        for (const PendingBarrierInfo &info : page) {
+            if (info.type == PendingBarrierType::ReadAccessBarrier) {
+                const PendingReadBarrier &read_barrier = read_barriers[info.index];
+                info.access_state->ApplyPendingReadBarrier(read_barrier, exec_tag);
+            } else if (info.type == PendingBarrierType::WriteAccessBarrier) {
+                const PendingWriteBarrier &write_barrier = write_barriers[info.index];
+                info.access_state->ApplyPendingWriteBarrier(write_barrier);
+            } else {
+                assert(info.type == PendingBarrierType::LayoutTransition);
+                const PendingLayoutTransition &layout_transition = layout_transitions[info.index];
+                info.access_state->ApplyPendingLayoutTransition(layout_transition, exec_tag);
+            }
         }
     }
 }
@@ -718,7 +720,8 @@ void ApplyBarriers(ResourceAccessState &access_state, const std::vector<SyncBarr
     // between themselves (result of the previous barrier might affect application of the next barrier).
     // The APIs we are dealing require that the barriers in a set of barriers are applied independently.
     // That's the intended use case of PendingBarriers helper.
-    PendingBarriers pending_barriers;
+    MemoryPool pool;
+    PendingBarriers pending_barriers(pool);
     for (const SyncBarrier &barrier : barriers) {
         access_state.CollectPendingBarriers(BarrierScope(barrier), barrier, layout_transition, vvl::kNoIndex32, pending_barriers);
     }
