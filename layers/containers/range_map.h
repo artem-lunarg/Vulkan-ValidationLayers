@@ -28,6 +28,8 @@
 #include "containers/range.h"
 #include "containers/container_utils.h"
 
+#include "absl/container/btree_map.h"
+
 #define RANGE_ASSERT(b) assert(b)
 
 namespace sparse_container {
@@ -41,7 +43,7 @@ Iterator split(Iterator in, Map &map, const Range &range);
 //
 // The range based sparse map implemented on the ImplMap.
 // Implements an ordered map of non-overlapping, non-empty ranges
-template <typename Key, typename T, typename ImplMap = std::map<vvl::range<Key>, T>>
+template <typename Key, typename T, typename ImplMap = absl::btree_map<vvl::range<Key>, T>>
 class range_map {
   private:
     ImplMap impl_map_;
