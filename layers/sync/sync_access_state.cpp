@@ -19,6 +19,22 @@
 #include "utils/sync_utils.h"
 #include <vulkan/utility/vk_struct_helper.hpp>
 
+static std::mutex write_nodes_mutex;
+static vvl::unordered_set<WriteNode> write_nodes;
+
+static std::mutex read_nodes_mutex;
+static vvl::unordered_set<ReadNode> read_nodes;
+
+uint32_t WriteNode::GetTotalCount() {
+    std::unique_lock<std::mutex> lock(write_nodes_mutex);
+    return (uint32_t)write_nodes.size();
+}
+
+uint32_t ReadNode::GetTotalCount() {
+    std::unique_lock<std::mutex> lock(read_nodes_mutex);
+    return (uint32_t)read_nodes.size();
+}
+
 static bool IsRead(SyncAccessIndex access) { return syncAccessReadMask[access]; }
 
 static const std::array<OrderingBarrier, static_cast<size_t>(SyncOrdering::kNumOrderings)> kOrderingRules = {
@@ -365,10 +381,18 @@ void ResourceAccessState::MergeReads(const ResourceAccessState &other) {
                             // as this is the only stage that affects it.
                             input_attachment_read = other.input_attachment_read;
                         }
+                        {
+                            std::unique_lock<std::mutex> lock(read_nodes_mutex);
+                            read_nodes.insert(my_read.GetReadNode());
+                        }
                     } else if (other_read.tag == my_read.tag) {
                         // The read tags match so merge the barriers
                         my_read.barriers |= other_read.barriers;
                         my_read.sync_stages |= other_read.sync_stages;
+                        {
+                            std::unique_lock<std::mutex> lock(read_nodes_mutex);
+                            read_nodes.insert(my_read.GetReadNode());
+                        }
                     }
 
                     break;
@@ -477,11 +501,19 @@ void ResourceAccessState::Update(const SyncAccessInfo &usage_info, SyncOrdering 
                     //       that sync_stages is a subset of barriers may not apply.
                     read_access.sync_stages &= not_usage_stage;
                 }
+                {
+                    std::unique_lock<std::mutex> lock(read_nodes_mutex);
+                    read_nodes.insert(read_access.GetReadNode());
+                }
             }
         } else {
             for (auto &read_access : last_reads) {
                 if (read_access.barriers & usage_stage) {
                     read_access.sync_stages |= usage_stage;
+                    {
+                        std::unique_lock<std::mutex> lock(read_nodes_mutex);
+                        read_nodes.insert(read_access.GetReadNode());
+                    }
                 }
             }
             ReadState &new_read_state = last_reads.emplace_back();
@@ -569,6 +601,10 @@ void ResourceAccessState::ApplyBarrier(const BarrierScope &barrier_scope, const 
 
         last_write->barriers |= barrier.dst_access_scope;
         last_write->dependency_chain |= barrier.dst_exec_scope.exec_scope;
+        {
+            std::unique_lock<std::mutex> lock(write_nodes_mutex);
+            write_nodes.insert(last_write->GetWriteNode());
+        }
         return;
     }
 
@@ -576,6 +612,10 @@ void ResourceAccessState::ApplyBarrier(const BarrierScope &barrier_scope, const 
     if (last_write.has_value() && last_write->InBarrierSourceScope(barrier_scope)) {
         last_write->barriers |= barrier.dst_access_scope;
         last_write->dependency_chain |= barrier.dst_exec_scope.exec_scope;
+        {
+            std::unique_lock<std::mutex> lock(write_nodes_mutex);
+            write_nodes.insert(last_write->GetWriteNode());
+        }
     }
     // Apply barriers over read accesses
     VkPipelineStageFlags2 stages_in_scope = VK_PIPELINE_STAGE_2_NONE;
@@ -594,6 +634,10 @@ void ResourceAccessState::ApplyBarrier(const BarrierScope &barrier_scope, const 
             // barriers used to determine sync_stages have been propagated to all known earlier stages
             read_access.barriers |= barrier.dst_exec_scope.exec_scope;
             read_execution_barriers |= barrier.dst_exec_scope.exec_scope;
+            {
+                std::unique_lock<std::mutex> lock(read_nodes_mutex);
+                read_nodes.insert(read_access.GetReadNode());
+            }
         }
     }
 }
@@ -743,12 +787,20 @@ void ResourceAccessState::ApplyPendingReadBarrier(const PendingReadBarrier &read
     ReadState &read_state = last_reads[read_barrier.last_reads_index];
     read_state.barriers |= read_barrier.barriers;
     read_execution_barriers |= read_barrier.barriers;
+    {
+        std::unique_lock<std::mutex> lock(read_nodes_mutex);
+        read_nodes.insert(read_state.GetReadNode());
+    }
 }
 
 void ResourceAccessState::ApplyPendingWriteBarrier(const PendingWriteBarrier &write_barrier) {
     if (last_write.has_value()) {
         last_write->dependency_chain |= write_barrier.dependency_chain;
         last_write->barriers |= write_barrier.barriers;
+        {
+            std::unique_lock<std::mutex> lock(write_nodes_mutex);
+            write_nodes.insert(last_write->GetWriteNode());
+        }
     }
 }
 
@@ -773,17 +825,37 @@ void ResourceAccessState::ApplySemaphore(const SemaphoreScope &signal, const Sem
             // Leave sync stages alone. Update method will clear unsynchronized stages on subsequent reads as needed.
             read_access.barriers = VK_PIPELINE_STAGE_2_NONE;
         }
+        {
+            std::unique_lock<std::mutex> lock(read_nodes_mutex);
+            read_nodes.insert(read_access.GetReadNode());
+        }
     }
     if (last_write.has_value() &&
         last_write->WriteOrDependencyChainInSourceScope(signal.queue, signal.exec_scope, signal.valid_accesses)) {
         // Will deflect RAW wait queue, WAW needs a chained barrier on wait queue
         read_execution_barriers = wait.exec_scope;
         last_write->barriers = wait.valid_accesses;
+        {
+            std::unique_lock<std::mutex> lock(write_nodes_mutex);
+            write_nodes.insert(last_write->GetWriteNode());
+        }
     } else {
         read_execution_barriers = VK_PIPELINE_STAGE_2_NONE;
-        if (last_write.has_value()) last_write->barriers.reset();
+        if (last_write.has_value()) {
+            last_write->barriers.reset();
+            {
+                std::unique_lock<std::mutex> lock(write_nodes_mutex);
+                write_nodes.insert(last_write->GetWriteNode());
+            }
+        }
     }
-    if (last_write.has_value()) last_write->dependency_chain = read_execution_barriers;
+    if (last_write.has_value()) {
+        last_write->dependency_chain = read_execution_barriers;
+        {
+            std::unique_lock<std::mutex> lock(write_nodes_mutex);
+            write_nodes.insert(last_write->GetWriteNode());
+        }
+    }
 }
 
 // Read access predicate for queue wait
@@ -986,6 +1058,10 @@ void ReadState::Set(VkPipelineStageFlagBits2 stage, SyncAccessIndex access_index
     tag = tag_ex.tag;
     handle_index = tag_ex.handle_index;
     queue = kQueueIdInvalid;
+    {
+        std::unique_lock<std::mutex> lock(read_nodes_mutex);
+        read_nodes.insert(GetReadNode());
+    }
 }
 
 // Scope test including "queue submission order" effects.  Specifically, accesses from a different queue are not
@@ -1029,6 +1105,11 @@ void WriteState::Set(SyncAccessIndex access_index, ResourceUsageTagEx tag_ex, Sy
     tag = tag_ex.tag;
     handle_index = tag_ex.handle_index;
     queue = kQueueIdInvalid;
+
+    {
+        std::unique_lock<std::mutex> lock(write_nodes_mutex);
+        write_nodes.insert(GetWriteNode());
+    }
 }
 
 void WriteState::SetQueueId(QueueId id) {
@@ -1090,6 +1171,10 @@ bool WriteState::IsWriteBarrierHazard(QueueId queue_id, VkPipelineStageFlags2 sr
 void WriteState::MergeBarriers(const WriteState &other) {
     barriers |= other.barriers;
     dependency_chain |= other.dependency_chain;
+    {
+        std::unique_lock<std::mutex> lock(write_nodes_mutex);
+        write_nodes.insert(GetWriteNode());
+    }
 }
 
 bool WriteState::DependencyChainInSourceScope(VkPipelineStageFlags2 src_exec_scope) const {

@@ -17,6 +17,7 @@
 
 #pragma once
 #include "sync/sync_common.h"
+#include "utils/hash_util.h"
 
 class ResourceAccessState;
 struct WriteState;
@@ -230,6 +231,35 @@ const OrderingBarrier &GetOrderingRules(SyncOrdering ordering_enum);
 
 using ResourceUsageTagSet = CachedInsertSet<ResourceUsageTag, 4>;
 
+struct ReadNode {
+    VkPipelineStageFlagBits2 stage;
+    SyncAccessIndex access_index;
+    VkPipelineStageFlags2 barriers;
+    VkPipelineStageFlags2 sync_stages;
+
+    bool operator==(const ReadNode &other) const {
+        return stage == other.stage && access_index == other.access_index && barriers == other.barriers &&
+               sync_stages == other.sync_stages;
+    }
+
+    static uint32_t GetTotalCount();
+
+    size_t hash() const {
+        hash_util::HashCombiner hc;
+        hc << stage << access_index;
+        hc << barriers;
+        hc << sync_stages;
+        return hc.Value();
+    }
+};
+
+namespace std {
+template <>
+struct hash<ReadNode> {
+    size_t operator()(const ReadNode &k) const { return k.hash(); }
+};
+}  // namespace std
+
 // Mutliple read operations can be simlutaneously (and independently) synchronized,
 // given the only the second execution scope creates a dependency chain, we have to track each,
 // but only up to one per pipeline stage (as another read from the *same* stage become more recent,
@@ -280,9 +310,59 @@ struct ReadState {
     }
     bool ReadOrDependencyChainInSourceScope(QueueId queue, VkPipelineStageFlags2 src_exec_scope) const;
     bool InBarrierSourceScope(const BarrierScope &barrier_scope) const;
+
+    ReadNode GetReadNode() const {
+        ReadNode node{};
+        node.stage = stage;
+        node.access_index = access_index;
+        node.barriers = barriers;
+        node.sync_stages = sync_stages;
+        return node;
+    }
 };
 
 static_assert(std::is_trivially_copyable_v<ReadState>);
+
+template <std::size_t N>
+bool bitset_less(const std::bitset<N> &a, const std::bitset<N> &b) noexcept {
+    if constexpr (N <= 64) {
+        return a.to_ullong() < b.to_ullong();
+    } else {
+        for (std::size_t i = N; i-- > 0;) {
+            if (a[i] != b[i]) return !a[i] && b[i];
+        }
+        return false;
+    }
+}
+
+struct WriteNode {
+    SyncAccessIndex access_index;
+    SyncFlags flags;
+    SyncAccessFlags barriers;
+    VkPipelineStageFlags2 dependency_chain;
+
+    bool operator==(const WriteNode &other) const {
+        return access_index == other.access_index && flags == other.flags && barriers == other.barriers &&
+               dependency_chain == other.dependency_chain;
+    }
+
+    static uint32_t GetTotalCount();
+
+    size_t hash() const {
+        hash_util::HashCombiner hc;
+        hc << access_index << flags;
+        hc << barriers;
+        hc << dependency_chain;
+        return hc.Value();
+    }
+};
+
+namespace std {
+template <>
+struct hash<WriteNode> {
+    size_t operator()(const WriteNode &k) const { return k.hash(); }
+};
+}  // namespace std
 
 struct WriteState {
     SyncAccessIndex access_index;
@@ -319,6 +399,15 @@ struct WriteState {
     bool IsPresent() const { return flags & SyncFlag::kPresent; }
 
     ResourceUsageTagEx TagEx() const { return {tag, handle_index}; }
+
+    WriteNode GetWriteNode() const {
+        WriteNode node{};
+        node.access_index = access_index;
+        node.flags = flags;
+        node.barriers = barriers;
+        node.dependency_chain = dependency_chain;
+        return node;
+    }
 };
 
 static_assert(std::is_trivially_copyable_v<WriteState>);
