@@ -17,6 +17,7 @@
 
 #pragma once
 #include "sync/sync_common.h"
+#include "sync/sync_access_node.h"
 
 class ResourceAccessState;
 struct WriteState;
@@ -67,16 +68,6 @@ enum class SyncOrdering : uint8_t {
     kRaster = 3,
     kNumOrderings = 4,
 };
-
-struct SyncFlag {
-    enum : uint32_t {
-        kLoadOp = 0x01,
-        kStoreOp = 0x02,
-        kPresent = 0x04,
-        kMarker = 0x08,
-    };
-};
-using SyncFlags = uint32_t;
 
 const char *string_SyncHazardVUID(SyncHazard hazard);
 
@@ -235,10 +226,12 @@ using ResourceUsageTagSet = CachedInsertSet<ResourceUsageTag, 4>;
 // but only up to one per pipeline stage (as another read from the *same* stage become more recent,
 // and applicable one for hazard detection
 struct ReadState {
-    VkPipelineStageFlagBits2 stage;     // The stage of this read
-    SyncAccessIndex access_index;       // TODO: Revisit whether this needs to support multiple reads per stage
-    VkPipelineStageFlags2 barriers;     // all applicable barriered stages
-    VkPipelineStageFlags2 sync_stages;  // reads known to have happened after this
+    // VkPipelineStageFlagBits2 stage;     // The stage of this read
+    // SyncAccessIndex access_index;       // TODO: Revisit whether this needs to support multiple reads per stage
+    // VkPipelineStageFlags2 barriers;     // all applicable barriered stages
+    // VkPipelineStageFlags2 sync_stages;  // reads known to have happened after this
+    const ReadNode *node;
+
     ResourceUsageTag tag;
     uint32_t handle_index;
     QueueId queue;
@@ -247,21 +240,22 @@ struct ReadState {
 
     ResourceUsageTagEx TagEx() const { return {tag, handle_index}; }
     bool operator==(const ReadState &rhs) const {
-        return (stage == rhs.stage) && (access_index == rhs.access_index) && (barriers == rhs.barriers) &&
-               (sync_stages == rhs.sync_stages) && (tag == rhs.tag) && (queue == rhs.queue);
+        return (node->stage == rhs.node->stage) && (node->access_index == rhs.node->access_index) &&
+               (node->barriers == rhs.node->barriers) && (node->sync_stages == rhs.node->sync_stages) && (tag == rhs.tag) &&
+               (queue == rhs.queue);
     }
     bool IsReadBarrierHazard(VkPipelineStageFlags2 src_exec_scope) const {
         // If the read stage is not in the src sync scope
         // *AND* not execution chained with an existing sync barrier (that's the or)
         // then the barrier access is unsafe (R/W after R)
-        return (src_exec_scope & (stage | barriers)) == 0;
+        return (src_exec_scope & (node->stage | node->barriers)) == 0;
     }
     bool IsReadBarrierHazard(QueueId barrier_queue, VkPipelineStageFlags2 src_exec_scope,
                              const SyncAccessFlags &src_access_scope) const {
         // If the read stage is not in the src sync scope
         // *AND* not execution chained with an existing sync barrier (that's the or)
         // then the barrier access is unsafe (R/W after R)
-        VkPipelineStageFlags2 queue_ordered_stage = (queue == barrier_queue) ? stage : VK_PIPELINE_STAGE_2_NONE;
+        VkPipelineStageFlags2 queue_ordered_stage = (queue == barrier_queue) ? node->stage : VK_PIPELINE_STAGE_2_NONE;
 
         // Current implementation relies on TOP_OF_PIPE constant due to the fact that it's non-zero value
         // and AND-ing with it can create execution dependency when it's necessary. When NONE constant is
@@ -276,7 +270,7 @@ struct ReadState {
             src_exec_scope = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
         }
 
-        return (src_exec_scope & (queue_ordered_stage | barriers)) == 0;
+        return (src_exec_scope & (queue_ordered_stage | node->barriers)) == 0;
     }
     bool ReadOrDependencyChainInSourceScope(QueueId queue, VkPipelineStageFlags2 src_exec_scope) const;
     bool InBarrierSourceScope(const BarrierScope &barrier_scope) const;
@@ -285,14 +279,15 @@ struct ReadState {
 static_assert(std::is_trivially_copyable_v<ReadState>);
 
 struct WriteState {
-    SyncAccessIndex access_index;
-    SyncFlags flags;
+    //SyncAccessIndex access_index;
+    //SyncFlags flags;
 
-    // Union of applicable barrier masks since last write
-    SyncAccessFlags barriers;
+    //// Union of applicable barrier masks since last write
+    //SyncAccessFlags barriers;
 
-    // Accumulates the dstStages of barriers if they chain
-    VkPipelineStageFlags2 dependency_chain;
+    //// Accumulates the dstStages of barriers if they chain
+    //VkPipelineStageFlags2 dependency_chain;
+    const WriteNode *node;
 
     ResourceUsageTag tag;
     uint32_t handle_index;
@@ -315,8 +310,8 @@ struct WriteState {
                               const SyncAccessFlags &src_access_scope) const;
 
     bool IsOrdered(const OrderingBarrier &ordering, QueueId queue_id) const;
-    bool IsLoadOp() const { return flags & SyncFlag::kLoadOp; }
-    bool IsPresent() const { return flags & SyncFlag::kPresent; }
+    bool IsLoadOp() const { return node->flags & SyncFlag::kLoadOp; }
+    bool IsPresent() const { return node->flags & SyncFlag::kPresent; }
 
     ResourceUsageTagEx TagEx() const { return {tag, handle_index}; }
 };
@@ -451,7 +446,7 @@ class ResourceAccessState {
 
     bool HasWriteOp() const { return last_write.has_value(); }
     bool IsLastWriteOp(SyncAccessIndex access_index) const {
-        return last_write.has_value() && last_write->access_index == access_index;
+        return last_write.has_value() && last_write->node->access_index == access_index;
     }
     ResourceUsageTag LastWriteTag() const { return last_write.has_value() ? last_write->tag : ResourceUsageTag(0); }
     const WriteState &LastWrite() const;
@@ -469,7 +464,7 @@ class ResourceAccessState {
     }
     bool operator!=(const ResourceAccessState &rhs) const { return !(*this == rhs); }
     VkPipelineStageFlags2 GetReadBarriers(SyncAccessIndex access_index) const;
-    SyncAccessFlags GetWriteBarriers() const { return last_write.has_value() ? last_write->barriers : SyncAccessFlags(); }
+    SyncAccessFlags GetWriteBarriers() const { return last_write.has_value() ? last_write->node->barriers : SyncAccessFlags(); }
     void SetQueueId(QueueId id);
 
     bool IsWriteBarrierHazard(QueueId queue_id, VkPipelineStageFlags2 src_exec_scope,
@@ -488,7 +483,7 @@ class ResourceAccessState {
     }
 
     bool IsReadHazard(VkPipelineStageFlags2 stage_mask, const ReadState &read_access) const {
-        return IsReadHazard(stage_mask, read_access.barriers);
+        return IsReadHazard(stage_mask, read_access.node->barriers);
     }
     VkPipelineStageFlags2 GetOrderedStages(QueueId queue_id, const OrderingBarrier &ordering, SyncFlags flags) const;
 
@@ -544,7 +539,7 @@ bool ResourceAccessState::ClearPredicatedAccesses(Predicate &predicate) {
     for (const auto &read_access : last_reads) {
         if (predicate(read_access)) {
             // If we know this stage is before any stage we syncing, or if the predicate tells us that we are waited for..
-            sync_reads |= read_access.stage;
+            sync_reads |= read_access.node->stage;
         }
     }
 
@@ -552,9 +547,9 @@ bool ResourceAccessState::ClearPredicatedAccesses(Predicate &predicate) {
     // NOTE: sync_stages is "deep" catching all stages synchronized after it because we forward barriers
     uint32_t unsync_count = 0;
     for (const auto &read_access : last_reads) {
-        if (0 != ((read_access.stage | read_access.sync_stages) & sync_reads)) {
+        if (0 != ((read_access.node->stage | read_access.node->sync_stages) & sync_reads)) {
             // This is redundant in the "stage" case, but avoids a second branch to get an accurate count
-            sync_reads |= read_access.stage;
+            sync_reads |= read_access.node->stage;
         } else {
             ++unsync_count;
         }
@@ -567,9 +562,9 @@ bool ResourceAccessState::ClearPredicatedAccesses(Predicate &predicate) {
             unsync_reads.reserve(unsync_count);
             VkPipelineStageFlags2 unsync_read_stages = VK_PIPELINE_STAGE_2_NONE;
             for (auto &read_access : last_reads) {
-                if (0 == (read_access.stage & sync_reads)) {
+                if (0 == (read_access.node->stage & sync_reads)) {
                     unsync_reads.emplace_back(read_access);
-                    unsync_read_stages |= read_access.stage;
+                    unsync_read_stages |= read_access.node->stage;
                 }
             }
             last_read_stages = unsync_read_stages;
