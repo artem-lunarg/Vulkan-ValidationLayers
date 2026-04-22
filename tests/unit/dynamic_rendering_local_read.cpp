@@ -592,7 +592,7 @@ TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayoutMismatch) {
     m_command_buffer.End();
 }
 
-TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayout) {
+TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayout) {
     TEST_DESCRIPTION("Barrier within a render pass instance started with vkCmdBeginRendering");
     RETURN_IF_SKIP(InitBasicDynamicRenderingLocalRead());
 
@@ -628,7 +628,7 @@ TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayout) {
     m_command_buffer.End();
 }
 
-TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayout2) {
+TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayout2) {
     TEST_DESCRIPTION("Barrier within a render pass instance started with vkCmdBeginRendering");
     SetTargetApiVersion(VK_API_VERSION_1_3);
     AddRequiredFeature(vkt::Feature::synchronization2);
@@ -664,7 +664,56 @@ TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayout2) {
     m_command_buffer.End();
 }
 
-TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayoutDepthImage) {
+TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayout2Secondary) {
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    RETURN_IF_SKIP(InitBasicDynamicRenderingLocalRead());
+
+    const VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
+    vkt::Image image(*m_device, 256, 256, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    vkt::ImageView image_view = image.CreateView();
+
+    VkCommandBufferInheritanceRenderingInfo inheritance_rendering_info = vku::InitStructHelper();
+    inheritance_rendering_info.colorAttachmentCount = 1;
+    inheritance_rendering_info.pColorAttachmentFormats = &color_format;
+    inheritance_rendering_info.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkCommandBufferInheritanceInfo inheritance_info = vku::InitStructHelper(&inheritance_rendering_info);
+    VkCommandBufferBeginInfo secondary_begin_info = vku::InitStructHelper();
+    secondary_begin_info.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    secondary_begin_info.pInheritanceInfo = &inheritance_info;
+
+    vkt::CommandBuffer secondary(*m_device, m_command_pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+
+    VkRenderingAttachmentInfo color_attachment = vku::InitStructHelper();
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    rendering_info.renderArea = {{0, 0}, {256, 256}};
+    rendering_info.layerCount = 1;
+    rendering_info.colorAttachmentCount = 1;
+    rendering_info.pColorAttachments = &color_attachment;
+
+    VkImageMemoryBarrier2 local_read_barrier = vku::InitStructHelper();
+    local_read_barrier.image = image;
+    local_read_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    secondary.Begin(&secondary_begin_info);
+    secondary.Barrier(local_read_barrier, VK_DEPENDENCY_BY_REGION_BIT);
+    secondary.End();
+
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRendering(rendering_info);
+    m_errorMonitor->SetDesiredError("VUID-vkCmdPipelineBarrier2-image-09555");
+    m_command_buffer.ExecuteCommands(secondary);
+    m_errorMonitor->VerifyFound();
+    m_command_buffer.EndRendering();
+    m_command_buffer.End();
+}
+
+TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayoutDepthImage) {
     TEST_DESCRIPTION("Barrier within a render pass instance started with vkCmdBeginRendering");
     SetTargetApiVersion(VK_API_VERSION_1_3);
     AddRequiredFeature(vkt::Feature::synchronization2);
@@ -701,7 +750,7 @@ TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayoutDepthImage) 
     m_command_buffer.End();
 }
 
-TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierInProperLayoutMultipleSubresources) {
+TEST_F(NegativeDynamicRenderingLocalRead, ImageBarrierLayoutMultipleSubresources) {
     TEST_DESCRIPTION("Barrier within a render pass instance started with vkCmdBeginRendering");
     SetTargetApiVersion(VK_API_VERSION_1_3);
     AddRequiredFeature(vkt::Feature::synchronization2);
