@@ -2401,15 +2401,51 @@ bool Swapchain::TryTransitionToPresentLayout(const vkt::Device& device, vkt::Que
     const size_t iteration_count = swapchain_images.size() * 2;
 
     for (size_t i = 0; i < iteration_count; i++) {
-        const uint32_t image_index = AcquireNextImage(fence, kWaitTimeout);
-        fence.Wait(kWaitTimeout);
-        fence.Reset();
-        queue.SubmitAndWait(transition_to_present_cbs[image_index]);
-        queue.Present(*this, image_index, vkt::no_semaphore);
+        const auto fail = [i](const char* call, VkResult result) {
+            ADD_FAILURE() << "TryTransitionToPresentLayout: " << call << " returned " << string_VkResult(result)
+                          << " on iteration " << i;
+            return false;
+        };
+
+        VkResult result = VK_SUCCESS;
+        const uint32_t image_index = AcquireNextImage(fence, kWaitTimeout, &result);
+        if ((result != VK_SUCCESS) && (result != VK_SUBOPTIMAL_KHR)) {
+            return fail("vkAcquireNextImageKHR", result);
+        }
+        result = fence.Wait(kWaitTimeout);
+        if (result != VK_SUCCESS) {
+            return fail("vkWaitForFences", result);
+        }
+        result = fence.Reset();
+        if (result != VK_SUCCESS) {
+            return fail("vkResetFences", result);
+        }
+
+        result = queue.Submit(transition_to_present_cbs[image_index]);
+        if (result != VK_SUCCESS) {
+            return fail("vkQueueSubmit", result);
+        }
+        result = queue.Wait();
+        if (result != VK_SUCCESS) {
+            return fail("vkQueueWaitIdle", result);
+        }
+        result = queue.Present(*this, image_index, vkt::no_semaphore);
+        if ((result != VK_SUCCESS) && (result != VK_SUBOPTIMAL_KHR)) {
+            return fail("vkQueuePresentKHR", result);
+        }
         is_transitioned[image_index] = true;
     }
-    queue.Wait();
-    return std::all_of(is_transitioned.begin(), is_transitioned.end(), [](bool b) { return b; });
+    const VkResult result = queue.Wait();
+    if (result != VK_SUCCESS) {
+        ADD_FAILURE() << "TryTransitionToPresentLayout: final vkQueueWaitIdle returned " << string_VkResult(result);
+        return false;
+    }
+    const bool all_transitioned = std::all_of(is_transitioned.begin(), is_transitioned.end(), [](bool b) { return b; });
+    if (!all_transitioned) {
+        ADD_FAILURE() << "TryTransitionToPresentLayout: failed to acquire and transition all swapchain images after "
+                      << iteration_count << " iterations";
+    }
+    return all_transitioned;
 }
 
 uint32_t Swapchain::AcquireNextImage(const Semaphore& image_acquired, uint64_t timeout, VkResult* result) {
