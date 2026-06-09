@@ -947,8 +947,7 @@ SyncOpSetEvent::SyncOpSetEvent(vvl::Func command, const SyncValidator& sync_stat
                                VkPipelineStageFlags2 stageMask, const AccessContext* access_context)
     : SyncOpBase(command),
       event_(sync_state.Get<vvl::Event>(event)),
-      src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, stageMask)),
-      dep_info_() {
+      src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, stageMask)) {
     // Snapshot the current access_context for later inspection at wait time.
     // NOTE: This appears brute force, but given that we only save a "first-last" model of access history, the current
     //       access context (include barrier state for chaining) won't necessarily contain the needed information at Wait
@@ -964,8 +963,7 @@ SyncOpSetEvent::SyncOpSetEvent(vvl::Func command, const SyncValidator& sync_stat
                                const VkDependencyInfo& dep_info, const AccessContext* access_context)
     : SyncOpBase(command),
       event_(sync_state.Get<vvl::Event>(event)),
-      src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, sync_utils::GetExecScopes(dep_info).src)),
-      dep_info_(new vku::safe_VkDependencyInfo(&dep_info)) {
+      src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, sync_utils::GetExecScopes(dep_info).src)) {
     if (access_context) {
         auto new_context = std::make_shared<AccessContext>(sync_state);
         new_context->InitFrom(*access_context);
@@ -1386,10 +1384,6 @@ void SyncEventsContext::AddReferencedTags(ResourceUsageTagSet& referenced) const
             event_state->AddReferencedTags(referenced);
         }
     }
-}
-
-SyncEventState::SyncEventState(const SyncEventState::EventPointer& event_state) : SyncEventState() {
-    event = event_state;
 }
 
 void SyncEventState::ResetFirstScope() {

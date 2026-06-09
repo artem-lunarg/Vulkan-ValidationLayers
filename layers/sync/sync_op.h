@@ -17,8 +17,8 @@
 #pragma once
 
 #include "sync/sync_access_context.h"
-#include <vulkan/utility/vk_safe_struct.hpp>
 #include "error_message/error_location.h"
+#include <vulkan/utility/vk_safe_struct.hpp>
 
 struct DeviceExtensions;
 
@@ -37,29 +37,21 @@ class ReplayState;
 class SyncValidator;
 
 struct SyncEventState {
-    using EventPointer = std::shared_ptr<const vvl::Event>;
-    EventPointer event;
-    vvl::Func last_command;             // Only Event commands are valid here.
-    ResourceUsageTag last_command_tag;  // Needed to filter replay validation
-    vvl::Func unsynchronized_set;
-    VkPipelineStageFlags2 barriers;
+    std::shared_ptr<const vvl::Event> event;
+
+    // Only Event commands are valid here.
+    vvl::Func last_command = vvl::Func::Empty;
+
+    // Needed to filter replay validation
+    ResourceUsageTag last_command_tag = 0;
+
+    vvl::Func unsynchronized_set = vvl::Func::Empty;
+    VkPipelineStageFlags2 barriers = VK_PIPELINE_STAGE_NONE;
+
     SyncExecScope scope;
-    ResourceUsageTag first_scope_tag;
+    ResourceUsageTag first_scope_tag = 0;
+
     std::shared_ptr<const AccessContext> first_scope;
-
-    SyncEventState()
-        : event(),
-          last_command(vvl::Func::Empty),
-          last_command_tag(0),
-          unsynchronized_set(vvl::Func::Empty),
-          barriers(0U),
-          scope(),
-          first_scope_tag() {}
-
-    SyncEventState(const SyncEventState &) = default;
-    SyncEventState(SyncEventState &&) = default;
-
-    SyncEventState(const SyncEventState::EventPointer &event_state);
 
     void ResetFirstScope();
     const AccessContext::ScopeMap &FirstScope() const { return first_scope->GetAccessMap(); }
@@ -69,24 +61,25 @@ struct SyncEventState {
 
 class SyncEventsContext {
   public:
-    using Map = vvl::unordered_map<const vvl::Event *, std::shared_ptr<SyncEventState>>;
+    using Map = vvl::unordered_map<const vvl::Event*, std::shared_ptr<SyncEventState>>;
     using iterator = Map::iterator;
     using const_iterator = Map::const_iterator;
 
-    SyncEventState *GetFromShared(const SyncEventState::EventPointer &event_state) {
+    SyncEventState* GetFromShared(const std::shared_ptr<const vvl::Event>& event_state) {
         const auto find_it = map_.find(event_state.get());
         if (find_it == map_.end()) {
             if (!event_state.get()) return nullptr;
 
-            const auto *event_plain_ptr = event_state.get();
-            auto sync_state = std::make_shared<SyncEventState>(event_state);
+            const auto* event_plain_ptr = event_state.get();
+            auto sync_state = std::make_shared<SyncEventState>();
+            sync_state->event = event_state;
             auto insert_pair = map_.emplace(event_plain_ptr, sync_state);
             return insert_pair.first->second.get();
         }
         return find_it->second.get();
     }
 
-    const SyncEventState* Get(const SyncEventState::EventPointer& event_state) const {
+    const SyncEventState* Get(const std::shared_ptr<const vvl::Event>& event_state) const {
         const auto find_it = map_.find(event_state.get());
         if (find_it == map_.end()) {
             return nullptr;
@@ -94,10 +87,10 @@ class SyncEventsContext {
         return find_it->second.get();
     }
 
-    void ApplyBarrier(const SyncExecScope &src, const SyncExecScope &dst, ResourceUsageTag tag);
+    void ApplyBarrier(const SyncExecScope& src, const SyncExecScope& dst, ResourceUsageTag tag);
     void ApplyTaggedWait(VkQueueFlags queue_flags, ResourceUsageTag tag);
 
-    void Destroy(const vvl::Event *event_state) {
+    void Destroy(const vvl::Event* event_state) {
         auto sync_it = map_.find(event_state);
         if (sync_it != map_.end()) {
             map_.erase(sync_it);
@@ -105,8 +98,8 @@ class SyncEventsContext {
     }
     void Clear() { map_.clear(); }
 
-    SyncEventsContext &DeepCopy(const SyncEventsContext &from);
-    void AddReferencedTags(ResourceUsageTagSet &referenced) const;
+    SyncEventsContext& DeepCopy(const SyncEventsContext& from);
+    void AddReferencedTags(ResourceUsageTagSet& referenced) const;
 
   private:
     Map map_;
@@ -288,8 +281,6 @@ class SyncOpSetEvent : public SyncOpBase {
     // The Access context of the command buffer at record set event time.
     std::shared_ptr<const AccessContext> recorded_context_;
     SyncExecScope src_exec_scope_;
-    // Note that the dep info is *not* dehandled, but retained for comparison with a future WaitEvents2
-    std::shared_ptr<vku::safe_VkDependencyInfo> dep_info_;
 };
 
 class SyncOpBeginRenderPass : public SyncOpBase {
