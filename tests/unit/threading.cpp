@@ -121,4 +121,111 @@ TEST_F(NegativeThreading, UpdateDescriptorCollision) {
     m_errorMonitor->VerifyFound();
 }
 
+// The collision tests below hammer an external-synchronization violation from two threads and rely on
+// their Start/Finish windows overlapping, so they are statistical: expected to report on average, a
+// single run may miss. The ThreadTimeoutHelper watchdog additionally turns any reintroduced deadlock
+// into a failure instead of a hang. Matching positive (must-not-report) tests live in
+// threading_positive.cpp.
+
+// Two threads reset the same fence: both take StartWriteObject(fence) -> write-vs-write collision.
+TEST_F(NegativeThreading, ResetFenceCollision) {
+    TEST_DESCRIPTION("Two threads resetting the same fence should raise a threading error");
+    m_errorMonitor->SetDesiredError("THREADING ERROR");
+    m_errorMonitor->SetAllowedFailureMsg("THREADING ERROR");  // tolerate extra threading errors after the first
+
+    RETURN_IF_SKIP(Init());
+
+    vkt::Fence fence(*m_device);
+    const VkFence fence_handle = fence;
+    const VkDevice dev = device();
+
+    std::atomic<bool> bailout{false};
+    m_errorMonitor->SetBailout(&bailout);
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&]() {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 100000 && !bailout.load(); i++) {
+            vk::ResetFences(dev, 1, &fence_handle);
+        }
+    };
+    std::thread t0(worker);
+    std::thread t1(worker);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+
+    m_errorMonitor->SetBailout(nullptr);
+    m_errorMonitor->VerifyFound();
+}
+
+// One thread queries the fence status (StartReadObject), another resets it (StartWriteObject):
+// read-vs-write collision, exercising HandleErrorOnRead in addition to HandleErrorOnWrite.
+TEST_F(NegativeThreading, FenceStatusVsResetCollision) {
+    TEST_DESCRIPTION("Querying a fence status while another thread resets the same fence should raise a threading error");
+    m_errorMonitor->SetDesiredError("THREADING ERROR");
+    m_errorMonitor->SetAllowedFailureMsg("THREADING ERROR");
+
+    RETURN_IF_SKIP(Init());
+
+    vkt::Fence fence(*m_device);
+    const VkFence fence_handle = fence;
+    const VkDevice dev = device();
+
+    std::atomic<bool> bailout{false};
+    m_errorMonitor->SetBailout(&bailout);
+
+    ThreadTimeoutHelper timeout(2);
+    auto reader = [&]() {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 100000 && !bailout.load(); i++) {
+            vk::GetFenceStatus(dev, fence_handle);
+        }
+    };
+    auto writer = [&]() {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 100000 && !bailout.load(); i++) {
+            vk::ResetFences(dev, 1, &fence_handle);
+        }
+    };
+    std::thread t0(reader);
+    std::thread t1(writer);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+
+    m_errorMonitor->SetBailout(nullptr);
+    m_errorMonitor->VerifyFound();
+}
+
+// Two threads wait for the same queue to idle: both take StartWriteObject(queue).
+TEST_F(NegativeThreading, QueueWaitIdleCollision) {
+    TEST_DESCRIPTION("Two threads calling vkQueueWaitIdle on the same queue should raise a threading error");
+    m_errorMonitor->SetDesiredError("THREADING ERROR");
+    m_errorMonitor->SetAllowedFailureMsg("THREADING ERROR");
+
+    RETURN_IF_SKIP(Init());
+
+    const VkQueue queue = m_default_queue->handle();
+
+    std::atomic<bool> bailout{false};
+    m_errorMonitor->SetBailout(&bailout);
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&]() {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 40000 && !bailout.load(); i++) {
+            vk::QueueWaitIdle(queue);
+        }
+    };
+    std::thread t0(worker);
+    std::thread t1(worker);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+
+    m_errorMonitor->SetBailout(nullptr);
+    m_errorMonitor->VerifyFound();
+}
+
 #endif  // GTEST_IS_THREADSAFE

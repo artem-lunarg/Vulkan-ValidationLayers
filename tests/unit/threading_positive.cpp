@@ -267,6 +267,147 @@ TEST_F(PositiveThreading, DebugObjectNames) {
     m_errorMonitor->VerifyFound();
 }
 
+// The following tests guard against false positives in the thread-safety validation after
+// WaitForObjectIdle and the on-race thread-id update were removed: legitimate concurrent-but-safe
+// usage must stay silent. Matching negative (must-report) collision tests live in threading.cpp.
+
+// Different objects must never collide: two threads resetting two different fences.
+TEST_F(PositiveThreading, ResetDifferentFences) {
+    TEST_DESCRIPTION("Two threads resetting different fences must not raise a threading error");
+    RETURN_IF_SKIP(Init());
+
+    vkt::Fence fence0(*m_device);
+    vkt::Fence fence1(*m_device);
+    const VkFence f0 = fence0;
+    const VkFence f1 = fence1;
+    const VkDevice dev = device();
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&](VkFence f) {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 100000; i++) {
+            vk::ResetFences(dev, 1, &f);
+        }
+    };
+    std::thread t0(worker, f0);
+    std::thread t1(worker, f1);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+}
+
+// Concurrent readers of the same object must not collide (reads coexist).
+TEST_F(PositiveThreading, ConcurrentGetFenceStatus) {
+    TEST_DESCRIPTION("Multiple threads reading the same fence status concurrently must not raise a threading error");
+    RETURN_IF_SKIP(Init());
+
+    vkt::Fence fence(*m_device);
+    const VkFence fence_handle = fence;
+    const VkDevice dev = device();
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&]() {
+        auto guard = timeout.ThreadGuard();
+        for (int i = 0; i < 100000; i++) {
+            vk::GetFenceStatus(dev, fence_handle);
+        }
+    };
+    std::thread t0(worker);
+    std::thread t1(worker);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+}
+
+// Same thread, same object referenced twice in one call: StartWriteObject(set) is called twice with
+// thread == tid, which must forge ahead ("safe multiple use in one call"), not report. Deterministic.
+TEST_F(PositiveThreading, UpdateSameDescriptorSetInOneCall) {
+    TEST_DESCRIPTION("Referencing the same descriptor set for multiple writes in one call (same thread) must not report");
+    RETURN_IF_SKIP(Init());
+
+    OneOffDescriptorSet descriptor_set(m_device,
+                                       {
+                                           {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr},
+                                           {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr},
+                                       },
+                                       0);
+    vkt::Buffer buffer(*m_device, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VkDescriptorBufferInfo buffer_info{buffer.handle(), 0, VK_WHOLE_SIZE};
+
+    VkWriteDescriptorSet writes[2];
+    writes[0] = vku::InitStructHelper();
+    writes[0].dstSet = descriptor_set.set_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &buffer_info;
+    writes[1] = writes[0];
+    writes[1].dstBinding = 1;
+
+    vk::UpdateDescriptorSets(device(), 2, writes, 0, nullptr);
+}
+
+// Two threads updating different descriptor sets concurrently must not collide.
+TEST_F(PositiveThreading, UpdateDifferentDescriptorSets) {
+    TEST_DESCRIPTION("Two threads updating different descriptor sets concurrently must not raise a threading error");
+    RETURN_IF_SKIP(Init());
+
+    OneOffDescriptorSet set0(m_device, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr}}, 0);
+    OneOffDescriptorSet set1(m_device, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr}}, 0);
+    vkt::Buffer buffer(*m_device, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    const VkBuffer buf = buffer.handle();
+    const VkDevice dev = device();
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&](VkDescriptorSet set) {
+        auto guard = timeout.ThreadGuard();
+        VkDescriptorBufferInfo buffer_info{buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write = vku::InitStructHelper();
+        write.dstSet = set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buffer_info;
+        for (int i = 0; i < 100000; i++) {
+            vk::UpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+        }
+    };
+    std::thread t0(worker, set0.set_);
+    std::thread t1(worker, set1.set_);
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+}
+
+// Two threads recording into different command buffers (separate pools) must not collide.
+TEST_F(PositiveThreading, RecordDifferentCommandBuffers) {
+    TEST_DESCRIPTION("Two threads recording into different command buffers must not raise a threading error");
+    RETURN_IF_SKIP(Init());
+
+    vkt::CommandPool pool0(*m_device, m_device->graphics_queue_node_index_);
+    vkt::CommandPool pool1(*m_device, m_device->graphics_queue_node_index_);
+    vkt::CommandBuffer cb0(*m_device, pool0);
+    vkt::CommandBuffer cb1(*m_device, pool1);
+    vkt::Event event(*m_device);
+    const VkEvent ev = event;
+
+    ThreadTimeoutHelper timeout(2);
+    auto worker = [&](VkCommandBuffer cb) {
+        auto guard = timeout.ThreadGuard();
+        VkCommandBufferBeginInfo begin_info = vku::InitStructHelper();
+        vk::BeginCommandBuffer(cb, &begin_info);
+        for (int i = 0; i < 20000; i++) {
+            vk::CmdSetEvent(cb, ev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+        vk::EndCommandBuffer(cb);
+    };
+    std::thread t0(worker, cb0.handle());
+    std::thread t1(worker, cb1.handle());
+    if (!timeout.WaitForThreads(60)) ADD_FAILURE() << "Worker threads did not finish in time";
+    t0.join();
+    t1.join();
+}
+
 #endif  // GTEST_IS_THREADSAFE
 
 TEST_F(PositiveThreading, Queue) {
