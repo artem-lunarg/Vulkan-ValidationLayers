@@ -904,14 +904,15 @@ AttachmentViewGenVector RenderPassAccessContext::CreateAttachmentViewGen(
     return view_gens;
 }
 
-RenderPassAccessContext::RenderPassAccessContext(const vvl::RenderPass& rp_state, const VkRect2D& render_area,
+RenderPassAccessContext::RenderPassAccessContext(std::shared_ptr<const vvl::RenderPass> rp_state, const VkRect2D& render_area,
                                                  VkQueueFlags queue_flags,
                                                  const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
                                                  const AccessContext& external_context, uint32_t render_pass_instance_id)
-    : rp_state_(&rp_state),
-      attachment_views_(CreateAttachmentViewGen(render_area, attachment_views)),
+    : rp_state_(std::move(rp_state)),
+      attachment_view_states_(attachment_views),
+      attachment_views_(CreateAttachmentViewGen(render_area, attachment_view_states_)),
       external_context_(&external_context),
-      subpass_contexts_(InitSubpassContexts(queue_flags, rp_state, external_context)),
+      subpass_contexts_(InitSubpassContexts(queue_flags, *rp_state_, external_context)),
       render_pass_instance_id_(render_pass_instance_id),
       current_subpass_(0) {}
 

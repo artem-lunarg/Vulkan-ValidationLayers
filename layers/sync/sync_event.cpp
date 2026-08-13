@@ -300,49 +300,39 @@ bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<con
     return skip;
 }
 
-bool ValidateCmdWaitEvents(const SyncEnvironment& env, const AccessContext& access_context,
-                           const std::vector<std::shared_ptr<const vvl::Event>>& events,
-                           const vvl::span<const BarrierSet>& barrier_sets, const ResourceUsageTag base_tag, const Location& loc) {
-    bool skip = false;
+static void ValidateCmdWaitEventsHostStages(const SyncEnvironment& env, const vvl::span<const BarrierSet>& barrier_sets,
+                                            const Location& loc) {
+    for (size_t barrier_set_index = 0; barrier_set_index < barrier_sets.size(); barrier_set_index++) {
+        const auto& barrier_set = barrier_sets[barrier_set_index];
+        if (!barrier_set.single_exec_scope) continue;
 
-    // This is only interesting at record and not replay (Execute/Submit) time
-    if (base_tag == ResourceUsageRecord::kMaxIndex) {
-        for (size_t barrier_set_index = 0; barrier_set_index < barrier_sets.size(); barrier_set_index++) {
-            const auto& barrier_set = barrier_sets[barrier_set_index];
-            if (barrier_set.single_exec_scope) {
-                if (barrier_set.src_exec_scope.stage_mask & VK_PIPELINE_STAGE_HOST_BIT) {
-                    const std::string vuid =
-                        std::string("SYNC-") + vvl::String(loc.function) + std::string("-hostevent-unsupported");
-                    env.validator.LogInfo(vuid, env.handle, loc,
-                                          "srcStageMask includes %s, unsupported by synchronization validation.",
-                                          string_VkPipelineStageFlagBits(VK_PIPELINE_STAGE_HOST_BIT));
-                } else {
-                    const auto& barriers = barrier_set.memory_barriers;
-                    for (size_t barrier_index = 0; barrier_index < barriers.size(); barrier_index++) {
-                        const auto& barrier = barriers[barrier_index];
-                        if (barrier.src_exec_scope.stage_mask & VK_PIPELINE_STAGE_HOST_BIT) {
-                            const std::string vuid =
-                                std::string("SYNC-") + vvl::String(loc.function) + std::string("-hostevent-unsupported");
+        if (barrier_set.src_exec_scope.stage_mask & VK_PIPELINE_STAGE_HOST_BIT) {
+            const std::string vuid = std::string("SYNC-") + vvl::String(loc.function) + std::string("-hostevent-unsupported");
+            env.validator.LogInfo(vuid, env.handle, loc, "srcStageMask includes %s, unsupported by synchronization validation.",
+                                  string_VkPipelineStageFlagBits(VK_PIPELINE_STAGE_HOST_BIT));
+            continue;
+        }
 
-                            env.validator.LogInfo(vuid, env.handle, loc,
-                                                  "srcStageMask %s of %s %zu, %s %zu, unsupported by synchronization validation.",
-                                                  string_VkPipelineStageFlagBits(VK_PIPELINE_STAGE_HOST_BIT), "pDependencyInfo",
-                                                  barrier_set_index, "pMemoryBarriers", barrier_index);
-                        }
-                    }
-                }
+        const auto& barriers = barrier_set.memory_barriers;
+        for (size_t barrier_index = 0; barrier_index < barriers.size(); barrier_index++) {
+            const auto& barrier = barriers[barrier_index];
+            if (barrier.src_exec_scope.stage_mask & VK_PIPELINE_STAGE_HOST_BIT) {
+                const std::string vuid = std::string("SYNC-") + vvl::String(loc.function) + std::string("-hostevent-unsupported");
+                env.validator.LogInfo(vuid, env.handle, loc,
+                                      "srcStageMask %s of %s %zu, %s %zu, unsupported by synchronization validation.",
+                                      string_VkPipelineStageFlagBits(VK_PIPELINE_STAGE_HOST_BIT), "pDependencyInfo",
+                                      barrier_set_index, "pMemoryBarriers", barrier_index);
             }
         }
     }
+}
 
-    // The rest is common to record time and replay time
-    size_t barrier_set_index = 0;
-    size_t barrier_set_incr = (barrier_sets.size() == 1) ? 0 : 1;
+bool ValidateCmdWaitEventsEventState(const SyncEnvironment& env, const std::vector<std::shared_ptr<const vvl::Event>>& events,
+                                     const ResourceUsageTag base_tag, const Location& loc) {
+    bool skip = false;
     for (const auto& event : events) {
         const auto* sync_event = env.events_context.Get(event);
-        const auto& barrier_set = barrier_sets[barrier_set_index];
         if (!sync_event || !sync_event->first_scope) {
-            barrier_set_index += barrier_set_incr;
             continue;  // Core, Lifetimes, or Param check needs to catch invalid events.
         }
 
@@ -364,29 +354,63 @@ bool ValidateCmdWaitEvents(const SyncEnvironment& env, const AccessContext& acce
                 env.validator.LogError(vuid, event_handle, loc, message, env.validator.FormatHandle(event_handle).c_str(),
                                        vvl::String(sync_event->last_command), reason, "Wait operation is ignored for this event.");
         }
-        if (barrier_set.image_barriers.size()) {
-            const auto& image_memory_barriers = barrier_set.image_barriers;
-            for (const auto& image_memory_barrier : image_memory_barriers) {
-                if (!image_memory_barrier.layout_transition) continue;
-                const auto* image_state = image_memory_barrier.image.get();
-                if (!image_state) continue;
-                const auto& subresource_range = image_memory_barrier.subresource_range;
-                const auto& src_access_scope = image_memory_barrier.barrier.src_access_scope;
-                const auto hazard = access_context.DetectImageBarrierHazard(
-                    *image_state, subresource_range, sync_event->scope.exec_scope, src_access_scope, env.queue_id,
-                    sync_event->FirstScope(), sync_event->first_scope_tag, AccessContext::DetectOptions::kDetectAll);
-                if (hazard.IsHazard()) {
-                    LogObjectList objlist(env.handle, image_state->Handle());
-                    const std::string resource_description = env.validator.FormatHandle(image_state->Handle());
-                    const std::string error = env.validator.error_messages_.ImageBarrierError(
-                        env, hazard, loc.function, resource_description, image_memory_barrier);
-                    skip |= env.validator.SyncError(hazard.Hazard(), image_state->Handle(), loc, error);
-                    break;
-                }
+    }
+    return skip;
+}
+
+bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const AccessContext& access_context,
+                                           const std::vector<std::shared_ptr<const vvl::Event>>& events,
+                                           const vvl::span<const BarrierSet>& barrier_sets, const ResourceUsageTag base_tag,
+                                           const Location& loc) {
+    bool skip = false;
+    assert(barrier_sets.size() == 1 || barrier_sets.size() == events.size());
+
+    for (size_t event_index = 0; event_index < events.size(); event_index++) {
+        const auto* sync_event = env.events_context.Get(events[event_index]);
+        if (!sync_event || !sync_event->first_scope) {
+            continue;  // Core, Lifetimes, or Param check needs to catch invalid events.
+        }
+
+        // For replay calls, don't revalidate "same command buffer" events.
+        if (sync_event->last_command_tag >= base_tag) {
+            continue;
+        }
+
+        const auto& barrier_set = barrier_sets[barrier_sets.size() == 1 ? 0 : event_index];
+        for (const auto& image_memory_barrier : barrier_set.image_barriers) {
+            if (!image_memory_barrier.layout_transition) continue;
+            const auto* image_state = image_memory_barrier.image.get();
+            if (!image_state) continue;
+
+            const auto& subresource_range = image_memory_barrier.subresource_range;
+            const auto& src_access_scope = image_memory_barrier.barrier.src_access_scope;
+            const auto hazard = access_context.DetectImageBarrierHazard(
+                *image_state, subresource_range, sync_event->scope.exec_scope, src_access_scope, env.queue_id,
+                sync_event->FirstScope(), sync_event->first_scope_tag, AccessContext::DetectOptions::kDetectAll);
+            if (hazard.IsHazard()) {
+                LogObjectList objlist(env.handle, image_state->Handle());
+                const std::string resource_description = env.validator.FormatHandle(image_state->Handle());
+                const std::string error = env.validator.error_messages_.ImageBarrierError(
+                    env, hazard, loc.function, resource_description, image_memory_barrier);
+                skip |= env.validator.SyncError(hazard.Hazard(), image_state->Handle(), loc, error);
+                break;
             }
         }
-        barrier_set_index += barrier_set_incr;
     }
+    return skip;
+}
+
+bool ValidateCmdWaitEvents(const SyncEnvironment& env, const AccessContext& access_context,
+                           const std::vector<std::shared_ptr<const vvl::Event>>& events,
+                           const vvl::span<const BarrierSet>& barrier_sets, const ResourceUsageTag base_tag, const Location& loc) {
+    // Host-stage reporting is only interesting at record and not replay (Execute/Submit) time.
+    if (base_tag == ResourceUsageRecord::kMaxIndex) {
+        ValidateCmdWaitEventsHostStages(env, barrier_sets, loc);
+    }
+
+    bool skip = false;
+    skip |= ValidateCmdWaitEventsEventState(env, events, base_tag, loc);
+    skip |= DetectCmdWaitEventsImageBarrierHazard(env, access_context, events, barrier_sets, base_tag, loc);
     return skip;
 }
 
@@ -451,7 +475,7 @@ void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
     // to apply pending barriers in the end).
     //
     // NOTE: event's global barriers can split() access map because EventSimpleRangeGenerator filters kFullRange.
-    // That's why, in contrast to SyncOpPipelineBarrier, we need apply markup action also to global barriers.
+    // That's why, in contrast to PipelineBarrierAction, we need apply markup action also to global barriers.
     // TODO: need a test that demonstrates this (when doing some work on syncval events)
     size_t barrier_set_index = 0;
     size_t barrier_set_incr = (barrier_sets.size() == 1) ? 0 : 1;

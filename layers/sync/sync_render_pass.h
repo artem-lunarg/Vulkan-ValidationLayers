@@ -92,8 +92,8 @@ class RenderPassAccessContext {
         const VkRect2D& render_area, const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views);
     RenderPassAccessContext()
         : rp_state_(nullptr), external_context_(nullptr), render_pass_instance_id_(vvl::kNoIndex32), current_subpass_(0) {}
-    RenderPassAccessContext(const vvl::RenderPass& rp_state, const VkRect2D& render_area, VkQueueFlags queue_flags,
-                            const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
+    RenderPassAccessContext(std::shared_ptr<const vvl::RenderPass> rp_state, const VkRect2D& render_area,
+                            VkQueueFlags queue_flags, const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
                             const AccessContext& external_context, uint32_t render_pass_instance_id);
 
     static bool ValidateLayoutTransitions(const CommandBufferContext& cb_context, const AccessContext& access_context,
@@ -140,14 +140,17 @@ class RenderPassAccessContext {
     const AccessContext& CurrentContext() const;
     vvl::span<const AccessContext> GetSubpassContexts() const;
     vvl::span<AccessContext> GetSubpassContexts();
-    const vvl::RenderPass* GetRenderPassState() const { return rp_state_; }
+    const vvl::RenderPass* GetRenderPassState() const { return rp_state_.get(); }
     AccessContext* CreateStoreResolveProxy() const;
 
   private:
     AttachmentAccess GetAttachmentAccess(SyncOrdering ordering, AttachmentAccessType type = AttachmentAccessType::Access) const;
 
   private:
-    const vvl::RenderPass* rp_state_;
+    // The render pass and attachment view states are owned (not just referenced), so the recorded
+    // state can be replayed after the application destroys these objects.
+    const std::shared_ptr<const vvl::RenderPass> rp_state_;
+    const std::vector<std::shared_ptr<const vvl::ImageView>> attachment_view_states_;
     const AttachmentViewGenVector attachment_views_;
     const AccessContext* external_context_;
     const std::unique_ptr<AccessContext[]> subpass_contexts_;
