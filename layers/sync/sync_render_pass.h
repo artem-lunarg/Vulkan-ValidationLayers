@@ -34,6 +34,7 @@ class RenderPass;
 namespace syncval {
 
 class CommandBufferContext;
+struct ResourceAccessCommand;
 
 enum class AttachmentType { kColor, kDepth, kStencil };
 
@@ -89,51 +90,73 @@ using AttachmentViewGenVector = std::vector<AttachmentViewGen>;
 class RenderPassAccessContext {
   public:
     static AttachmentViewGenVector CreateAttachmentViewGen(
-        const VkRect2D& render_area, const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views);
+        const VkRect2D& render_area, vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views);
     RenderPassAccessContext()
         : rp_state_(nullptr), external_context_(nullptr), render_pass_instance_id_(vvl::kNoIndex32), current_subpass_(0) {}
     RenderPassAccessContext(const vvl::RenderPass& rp_state, const VkRect2D& render_area, VkQueueFlags queue_flags,
-                            const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
+                            vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views,
                             const AccessContext& external_context, uint32_t render_pass_instance_id);
 
-    static bool ValidateLayoutTransitions(const CommandBufferContext& cb_context, const AccessContext& access_context,
+    static bool ValidateLayoutTransitions(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                          const ResourceUsageRange& record_time_validated_tags, const AccessContext& access_context,
                                           const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id, uint32_t subpass,
-                                          uint32_t view_mask, const AttachmentViewGenVector& attachment_views, vvl::Func command);
+                                          uint32_t view_mask, const AttachmentViewGenVector& attachment_views, vvl::Func command,
+                                          ResourceUsageTag replay_tag = kInvalidTag, const Location* replay_loc = nullptr);
 
-    static bool ValidateLoadOperation(const CommandBufferContext& cb_context, const AccessContext& access_context,
+    static bool ValidateLoadOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                      const ResourceUsageRange& record_time_validated_tags, const AccessContext& access_context,
                                       const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id, uint32_t subpass,
-                                      uint32_t view_mask, const AttachmentViewGenVector& attachment_views, vvl::Func command);
+                                      uint32_t view_mask, const AttachmentViewGenVector& attachment_views, vvl::Func command,
+                                      ResourceUsageTag replay_tag = kInvalidTag, const Location* replay_loc = nullptr);
 
-    bool ValidateStoreOperation(const CommandBufferContext& cb_context, vvl::Func command) const;
-    bool ValidateResolveOperations(const CommandBufferContext& cb_context, vvl::Func command) const;
+    bool ValidateBeginRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                 const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                 ResourceUsageTag replay_base_tag = kInvalidTag, const Location* replay_loc = nullptr) const;
+
+    bool ValidateStoreOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                ResourceUsageTag replay_tag = kInvalidTag, const Location* replay_loc = nullptr) const;
+    bool ValidateResolveOperations(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                   const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                   ResourceUsageTag replay_tag = kInvalidTag, const Location* replay_loc = nullptr) const;
 
     static void UpdateAttachmentResolveAccess(const vvl::RenderPass& rp_state, const AttachmentViewGenVector& attachment_views,
                                               uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
-                                              const ResourceUsageTag tag, AccessContext& access_context);
+                                              const ResourceUsageTag tag, AccessContext& access_context,
+                                              QueueId queue_id = kQueueIdInvalid);
 
     static void UpdateAttachmentStoreAccess(const vvl::RenderPass& rp_state, const AttachmentViewGenVector& attachment_views,
                                             uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
-                                            const ResourceUsageTag tag, AccessContext& access_context);
+                                            const ResourceUsageTag tag, AccessContext& access_context,
+                                            QueueId queue_id = kQueueIdInvalid);
 
     static void RecordLayoutTransitions(const vvl::RenderPass& rp_state, uint32_t subpass,
                                         const AttachmentViewGenVector& attachment_views, const ResourceUsageTag tag,
-                                        AccessContext& access_context);
+                                        AccessContext& access_context, QueueId queue_id = kQueueIdInvalid);
 
-    bool ValidateDrawSubpassAttachment(const CommandBufferContext& cb_context, vvl::Func command) const;
-    void RecordDrawSubpassAttachment(const vvl::CommandBuffer& cmd_buffer, ResourceUsageTag tag);
+    ResourceAccessCommand MakeDrawSubpassAttachmentAccessCommand(const vvl::CommandBuffer& cmd_buffer) const;
 
     const vvl::ImageView* GetClearAttachmentView(const VkClearAttachment& clear_attachment) const;
 
-    bool ValidateNextSubpass(const CommandBufferContext& cb_context, vvl::Func command) const;
-    bool ValidateEndRenderPass(const CommandBufferContext& cb_context, vvl::Func command) const;
-    bool ValidateFinalSubpassLayoutTransitions(const CommandBufferContext& cb_context, vvl::Func command) const;
+    bool ValidateNextSubpass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                             const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                             ResourceUsageTag replay_base_tag = kInvalidTag, const Location* replay_loc = nullptr) const;
+    bool ValidateEndRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                               const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                               ResourceUsageTag replay_base_tag = kInvalidTag, const Location* replay_loc = nullptr) const;
+    bool ValidateFinalSubpassLayoutTransitions(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                               const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                               ResourceUsageTag replay_tag = kInvalidTag,
+                                               const Location* replay_loc = nullptr) const;
 
-    void RecordLayoutTransitions(ResourceUsageTag tag);
-    void RecordLoadOperations(ResourceUsageTag tag);
-    void RecordBeginRenderPass(ResourceUsageTag tag, ResourceUsageTag load_tag);
+    void RecordLayoutTransitions(ResourceUsageTag tag, QueueId queue_id = kQueueIdInvalid);
+    void RecordLoadOperations(ResourceUsageTag tag, QueueId queue_id = kQueueIdInvalid);
+    void RecordBeginRenderPass(ResourceUsageTag tag, ResourceUsageTag load_tag, QueueId queue_id = kQueueIdInvalid);
     void RecordNextSubpass(ResourceUsageTag resolve_tag, ResourceUsageTag store_tag, ResourceUsageTag transition_tag,
-                           ResourceUsageTag load_tag);
-    void RecordEndRenderPass(AccessContext* external_context, ResourceUsageTag store_tag, ResourceUsageTag transition_tag);
+                           ResourceUsageTag load_tag, QueueId queue_id = kQueueIdInvalid);
+    void AdvanceSubpass();
+    void RecordEndRenderPass(AccessContext* external_context, ResourceUsageTag store_tag, ResourceUsageTag transition_tag,
+                             QueueId queue_id = kQueueIdInvalid);
 
     uint32_t GetCurrentSubpass() const { return current_subpass_; }
     AccessContext& CurrentContext();
@@ -141,13 +164,15 @@ class RenderPassAccessContext {
     vvl::span<const AccessContext> GetSubpassContexts() const;
     vvl::span<AccessContext> GetSubpassContexts();
     const vvl::RenderPass* GetRenderPassState() const { return rp_state_; }
-    AccessContext* CreateStoreResolveProxy() const;
+    AccessContext* CreateStoreResolveProxy(QueueId queue_id = kQueueIdInvalid) const;
 
   private:
     AttachmentAccess GetAttachmentAccess(SyncOrdering ordering, AttachmentAccessType type = AttachmentAccessType::Access) const;
 
   private:
     const vvl::RenderPass* rp_state_;
+    const VkRect2D render_area_{};
+    const std::vector<std::shared_ptr<const vvl::ImageView>> attachment_view_states_;
     const AttachmentViewGenVector attachment_views_;
     const AccessContext* external_context_;
     const std::unique_ptr<AccessContext[]> subpass_contexts_;

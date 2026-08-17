@@ -23,8 +23,16 @@ struct SyncValSettings {
     bool legacy_submit_time_validation = true;  // TODO: remove after refactor
     bool shader_accesses_heuristic = false;
 
+    // Full validation is the only alternative to record-time validation. Force record-time
+    // validation in configurations without full validation so coverage cannot be disabled
+    // accidentally.
     // TODO: remove this and replace with direct record_time_validation access after refactor
-    bool IsRecordTimeValidationEnabled() const { return record_time_validation || legacy_submit_time_validation; }
+    bool IsRecordTimeValidationEnabled() const { return record_time_validation || !full_validation; }
+
+    // Queue-scope processing (submits, present/acquire, fences, semaphores) backs both the
+    // legacy first-access validation and full validation.
+    // TODO: remove this and replace with direct full_validation access after refactor
+    bool IsSubmitTimeProcessingEnabled() const { return legacy_submit_time_validation || full_validation; }
 
     // This validation currently is controlled only by the settings and is disabled by default.
     // There is a discussion https://gitlab.khronos.org/vulkan/vulkan/-/issues/4513 to clarify

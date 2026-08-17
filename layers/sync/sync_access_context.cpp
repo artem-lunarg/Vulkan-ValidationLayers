@@ -72,16 +72,14 @@ void ApplySingleBufferBarrierFunctor::operator()(const Iterator& pos) const {
 ApplySingleImageBarrierFunctor::ApplySingleImageBarrierFunctor(const AccessContext& access_context,
                                                                const BarrierScope& barrier_scope, const SyncBarrier& barrier,
                                                                bool layout_transition, uint32_t layout_transition_handle_index,
-                                                               ResourceUsageTag exec_tag)
+                                                               ResourceUsageTag exec_tag, bool apply_layout_transition_on_queue)
     : access_context(access_context),
       barrier_scope(barrier_scope),
       barrier(barrier),
       exec_tag(exec_tag),
       layout_transition(layout_transition),
       layout_transition_handle_index(layout_transition_handle_index) {
-    // Suppress layout transition during submit time application.
-    // It adds write access but this is necessary only during recording.
-    if (barrier_scope.scope_queue != kQueueIdInvalid) {
+    if (barrier_scope.scope_queue != kQueueIdInvalid && !apply_layout_transition_on_queue) {
         this->layout_transition = false;
         this->layout_transition_handle_index = vvl::kNoIndex32;
     }
@@ -101,14 +99,15 @@ AccessMap::iterator ApplySingleImageBarrierFunctor::Infill(AccessMap* accesses, 
 void ApplySingleImageBarrierFunctor::operator()(const Iterator& pos) const {
     AccessState& access_state = pos->second;
     access_context.ApplyGlobalBarriers(access_state);
-    access_state.ApplyBarrier(barrier_scope, barrier, layout_transition, layout_transition_handle_index, exec_tag);
+    access_state.ApplyBarrier(barrier_scope, barrier, layout_transition, layout_transition_handle_index, exec_tag,
+                              barrier_scope.scope_queue);
 }
 
 void CollectBarriersFunctor::operator()(const Iterator& pos) const {
     AccessState& access_state = pos->second;
     access_context.ApplyGlobalBarriers(access_state);
-    access_state.CollectPendingBarriers(barrier_scope, barrier, layout_transition, layout_transition_handle_index,
-                                        pending_barriers);
+    access_state.CollectPendingBarriers(barrier_scope, barrier, layout_transition, layout_transition_handle_index, pending_barriers,
+                                        barrier_scope.scope_queue);
 }
 
 void AccessContext::InitFrom(const AccessContext& other) {
@@ -462,7 +461,7 @@ AccessMap::iterator AccessContext::ResolveGapRecursePrev(const AccessRange& gap_
 // Map entries that intersect range.begin or range.end are split at the intersection point.
 AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, const AccessRange& range,
                                                        SyncAccessIndex access_index, const AttachmentAccess& attachment_access,
-                                                       ResourceUsageTagEx tag_ex, SyncFlags flags) {
+                                                       ResourceUsageTagEx tag_ex, SyncFlags flags, QueueId queue_id) {
     assert(range.non_empty());
     const SyncAccessInfo& access_info = GetAccessInfo(access_index);
 
@@ -499,7 +498,7 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
             // Update
             AccessState& new_access_state = infilled_it->second;
             ApplyGlobalBarriers(new_access_state);
-            new_access_state.Update(access_info, attachment_access, tag_ex, flags);
+            new_access_state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
 
             // Advance current location.
             // Do not advance pos, as it's the next map entry to visit
@@ -516,7 +515,7 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
             // Update
             AccessState& access_state = pos->second;
             ApplyGlobalBarriers(access_state);
-            access_state.Update(access_info, attachment_access, tag_ex, flags);
+            access_state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
 
             // Advance both current location and map entry
             current_begin = pos->first.end;
@@ -532,13 +531,13 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
         // Update
         AccessState& new_access_state = infilled_it->second;
         ApplyGlobalBarriers(new_access_state);
-        new_access_state.Update(access_info, attachment_access, tag_ex, flags);
+        new_access_state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
     }
     return pos;
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex current_usage, const AccessRange& range,
-                                      ResourceUsageTagEx tag_ex, SyncFlags flags) {
+                                      ResourceUsageTagEx tag_ex, SyncFlags flags, QueueId queue_id) {
     assert(range.valid());
     assert(!finalized_);
 
@@ -556,45 +555,46 @@ void AccessContext::UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex
     const AccessRange buffer_range = range + base_address;
 
     auto pos = access_state_map_.LowerBound(buffer_range.begin);
-    DoUpdateAccessState(pos, buffer_range, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags);
+    DoUpdateAccessState(pos, buffer_range, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id);
 }
 
 void AccessContext::UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage, ResourceUsageTagEx tag_ex,
-                                      SyncFlags flags) {
+                                      SyncFlags flags, QueueId queue_id) {
     assert(!finalized_);
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
         return;
     }
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
-        pos = DoUpdateAccessState(pos, *range_gen, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags);
+        pos = DoUpdateAccessState(pos, *range_gen, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id);
     }
 }
 
 void AccessContext::UpdateAttachmentAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage,
-                                                const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex) {
+                                                const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
+                                                QueueId queue_id) {
     assert(!finalized_);
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
         return;
     }
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
-        pos = DoUpdateAccessState(pos, *range_gen, current_usage, attachment_access, tag_ex, 0);
+        pos = DoUpdateAccessState(pos, *range_gen, current_usage, attachment_access, tag_ex, 0, queue_id);
     }
 }
 
 void AccessContext::UpdateAttachmentAccessState(const AttachmentViewGen& view_gen, AttachmentViewGen::Gen gen_type,
                                                 SyncAccessIndex current_usage, const AttachmentAccess& attachment_access,
-                                                ResourceUsageTagEx tag_ex, uint32_t view_mask) {
+                                                ResourceUsageTagEx tag_ex, uint32_t view_mask, QueueId queue_id) {
     if (view_mask == 0) {
         ImageRangeGen range_gen = view_gen.GetRangeGen(gen_type);
-        UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex);
+        UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex, queue_id);
     } else {
         uint32_t view_index = 0;
         while (view_mask) {
             if (view_mask & 1) {
                 ImageRangeGen range_gen = view_gen.GetRangeGen(gen_type, view_index);
-                UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex);
+                UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex, queue_id);
             }
             view_mask >>= 1;
             view_index++;

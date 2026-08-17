@@ -715,6 +715,20 @@ std::vector<BatchContextPtr> QueueBatchContext::ResolveSubmitWaits(vvl::span<con
     return resolved_batches;
 }
 
+namespace {
+
+bool NeedsLegacySubmitValidation(const CommandBufferContext& cb_context) {
+    for (const RecordedCommandEntry& entry : cb_context.GetRecordedCommands()) {
+        if (std::holds_alternative<RenderPassCommand::Storage>(entry.command) ||
+            std::holds_alternative<EventCommand::Storage>(entry.command)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 bool QueueBatchContext::ValidateSubmit(const std::vector<CommandBufferConstPtr>& command_buffers, uint64_t submit_index,
                                        uint32_t batch_index, std::vector<std::string>& current_label_stack,
                                        const Location& submit_loc) {
@@ -739,11 +753,43 @@ bool QueueBatchContext::ValidateSubmit(const std::vector<CommandBufferConstPtr>&
                                         ? submit_info_loc.dot(vvl::Field::pCommandBuffers, index)
                                         : submit_info_loc.dot(vvl::Field::pCommandBufferInfos, index);
 
-            skip |= ValidateFirstUseHazards(GetSyncEnvironment(), cb_context, GetAccessContext(), batch.base_tag, cb_loc);
+            if (sync_state_.syncval_settings.full_validation) {
+                // TODO: Remove each command family from this fallback when its command replay becomes the active endpoint and
+                // its intentional output changes establish a new comparison baseline. The legacy access summary exists only
+                // with record-time validation, so submit-only configurations always use command replay.
+                const bool use_legacy_validation = sync_state_.syncval_settings.IsRecordTimeValidationEnabled() &&
+                                                   NeedsLegacySubmitValidation(cb_context);
+                if (use_legacy_validation) {
+                    skip |= ValidateFirstUseHazards(GetSyncEnvironment(), cb_context, GetAccessContext(), batch.base_tag, cb_loc);
+                    batch_log_.Import(batch, cb_context, current_label_stack);
+                    ResolveSubmittedCommandBuffer(cb_context.GetCbAccessContext(), batch.base_tag);
+                } else {
+                    // Every tagged SyncVal command must have a lossless command-stream entry. Do not silently use the legacy
+                    // access summary here: submit-only recording deliberately does not populate that summary.
+                    assert(cb_context.HasCompleteRecordedCommandStream());
 
-            // The barriers have already been applied in ValidateFirstUseHazards
-            batch_log_.Import(batch, cb_context, current_label_stack);
-            ResolveSubmittedCommandBuffer(cb_context.GetCbAccessContext(), batch.base_tag);
+                    // Submit-time command validation needs the current command buffer's log to resolve global tags
+                    // when a hazard is found against an earlier command in this command buffer.
+                    batch_log_.Import(batch, cb_context, current_label_stack);
+
+                    // Record-time validation has already reported hazards against prior accesses in this command buffer.
+                    // Suppress only those duplicates; hazards against prior submissions have tags outside this range.
+                    // Future submit-only access sources will need more precise tracking than this command-buffer-wide range.
+                    const ResourceUsageRange record_time_validated_tags =
+                        sync_state_.syncval_settings.record_time_validation
+                            ? ResourceUsageRange(batch.base_tag, batch.base_tag + cb_context.GetTagCount())
+                            : ResourceUsageRange{};
+                    skip |= ReplayRecordedCommands(GetSyncEnvironment(), GetAccessContext(), cb_context, batch.base_tag,
+                                                   record_time_validated_tags, cb_loc);
+                }
+            } else {
+                // Preserve the existing first-access path when command replay is disabled.
+                skip |= ValidateFirstUseHazards(GetSyncEnvironment(), cb_context, GetAccessContext(), batch.base_tag, cb_loc);
+
+                // The barriers have already been applied in ValidateFirstUseHazards
+                batch_log_.Import(batch, cb_context, current_label_stack);
+                ResolveSubmittedCommandBuffer(cb_context.GetCbAccessContext(), batch.base_tag);
+            }
             batch.base_tag += cb_context.GetTagCount();
         }
         // Apply debug label commands

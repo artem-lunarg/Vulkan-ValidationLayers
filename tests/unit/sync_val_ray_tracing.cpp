@@ -18,8 +18,10 @@
 #include "sync_val_tests.h"
 #include "pipeline_helper.h"
 #include "ray_tracing_objects.h"
+#include "sync/sync_settings.h"
 
 struct NegativeSyncValRayTracing : public VkSyncValTest {};
+struct NewNegativeSyncValRayTracing : public VkSyncValTest {};
 
 TEST_F(NegativeSyncValRayTracing, ScratchBufferHazard) {
     TEST_DESCRIPTION("Write to scratch buffer during acceleration structure build");
@@ -40,6 +42,30 @@ TEST_F(NegativeSyncValRayTracing, ScratchBufferHazard) {
     vk::CmdFillBuffer(m_command_buffer, scratch_buffer, 0, sizeof(uint32_t), 0x42);
     m_errorMonitor->VerifyFound();
     m_command_buffer.End();
+}
+
+TEST_F(NewNegativeSyncValRayTracing, ScratchBufferHazardSubmitOnly) {
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitRayTracing(&settings));
+
+    if (IsPlatformMockICD()) {
+        GTEST_SKIP() << "Test not supported by MockICD: buffer device address consistent support across different functions";
+    }
+
+    vkt::as::BuildGeometryInfoKHR blas = vkt::as::blueprint::BuildGeometryInfoSimpleOnDeviceBottomLevel(*m_device);
+    blas.SetDeviceScratchAdditionalFlags(VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const vkt::Buffer& scratch_buffer = *blas.GetScratchBuffer();
+
+    m_command_buffer.Begin();
+    blas.BuildCmdBuffer(m_command_buffer);
+    vk::CmdFillBuffer(m_command_buffer, scratch_buffer, 0, sizeof(uint32_t), 0x42);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
 }
 
 TEST_F(NegativeSyncValRayTracing, AccelerationStructureBufferHazard) {

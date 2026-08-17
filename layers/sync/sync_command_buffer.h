@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "sync/sync_command.h"
 #include "sync/sync_event.h"
 #include "sync/sync_render_pass.h"
 #include "sync/sync_replay.h"
@@ -210,31 +211,30 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     const RenderPassAccessContext* GetCurrentRenderPassContext() const { return current_renderpass_context_; }
     uint32_t GetCurrentRenderPassInstanceId() const { return current_render_pass_instance_id_; }
     ResourceUsageTag RecordBeginRenderPass(vvl::Func command, const vvl::RenderPass& rp_state, const VkRect2D& render_area,
-                                           const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views);
+                                           vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views,
+                                           bool apply_command);
 
     bool ValidateBeginRendering(const ErrorObject& error_obj, BeginRenderingCmdState& cmd_state) const;
+    ResourceAccessCommand MakeBeginRenderingAccessCommand(const DynamicRenderingInfo& rendering_info) const;
     void RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc);
     bool ValidateEndRendering(const ErrorObject& error_obj) const;
+    ResourceAccessCommand MakeEndRenderingAccessCommand() const;
     void RecordEndRendering(const RecordObject& record_obj);
-    bool ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const Location& loc) const;
-    void RecordDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, ResourceUsageTag tag);
-    bool ValidateDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const Location& loc) const;
-    void RecordDrawVertex(uint32_t vertexCount, uint32_t firstVertex, ResourceUsageTag tag);
-    bool ValidateDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, const Location& loc) const;
-    void RecordDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, ResourceUsageTag tag);
-    bool ValidateDrawAttachment(const Location& loc) const;
-    bool ValidateDrawDynamicRenderingAttachment(const Location& loc) const;
-    void RecordDrawAttachment(ResourceUsageTag tag);
-    void RecordDrawDynamicRenderingAttachment(ResourceUsageTag tag);
+    ResourceAccessCommand MakeDispatchDrawDescriptorAccessCommand(VkPipelineBindPoint pipelineBindPoint) const;
+    ResourceAccessCommand MakeDrawVertexAccessCommand(uint32_t vertex_count, uint32_t first_vertex) const;
+    ResourceAccessCommand MakeDrawVertexIndexAccessCommand(uint32_t index_count, uint32_t first_index) const;
+    ResourceAccessCommand MakeDrawAttachmentAccessCommand() const;
     bool ValidateClearAttachment(const Location& loc, const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
                                  const VkClearRect& clear_rect) const;
+    ResourceAccessCommand MakeClearAttachmentAccessCommand(const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
+                                                           const VkClearRect& clear_rect) const;
     void RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment, const VkClearRect& clear_rect);
 
-    ResourceUsageTag RecordNextSubpass(vvl::Func command);
-    ResourceUsageTag RecordEndRenderPass(vvl::Func command);
+    ResourceUsageTag RecordNextSubpass(vvl::Func command, bool apply_command);
+    ResourceUsageTag RecordEndRenderPass(vvl::Func command, bool apply_command);
     void RecordDestroyEvent(vvl::Event* event_state);
 
-    void RecordExecutedCommandBuffer(const CommandBufferContext& recorded_context);
+    void RecordExecutedCommandBuffer(const CommandBufferContext& recorded_context, bool apply_commands);
     void ResolveExecutedCommandBuffer(const AccessContext& recorded_context, ResourceUsageTag offset);
 
     size_t GetTagCount() const { return access_log_->size(); }
@@ -264,7 +264,55 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     std::shared_ptr<AccessLog> GetAccessLogShared() const { return access_log_; }
     std::shared_ptr<CommandBufferSet> GetCBReferencesShared() const { return cbs_referenced_; }
     void ImportRecordedAccessLog(const CommandBufferContext& cb_context);
+    void ImportRecordedCommands(const CommandBufferContext& cb_context, ResourceUsageTag offset);
     const std::vector<ReplayEntry>& GetReplayEntries() const { return replay_entries_; }
+
+    template <typename Command>
+    void AddRecordedCommand(ResourceUsageTag tag, Command&& command) {
+        recorded_commands_.emplace_back(tag, std::forward<Command>(command));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, const BufferCopyCommand& command, uint32_t src_handle_index,
+                            uint32_t dst_handle_index) {
+        auto storage = command.MakeStorage(command_data_, src_handle_index, dst_handle_index);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, const BufferAccessCommand& command, uint32_t handle_index) {
+        auto storage = command.MakeStorage(command_data_, handle_index);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, ResourceAccessCommand&& command) {
+        auto storage = std::move(command).MakeStorage(command_data_);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, ImageTransferCommand&& command) {
+        auto storage = std::move(command).MakeStorage(command_data_);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, PipelineBarrierCommand&& command) {
+        auto storage = std::move(command).MakeStorage(command_data_);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, EventCommand&& command) {
+        auto storage = std::move(command).MakeStorage(command_data_);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    void AddRecordedCommand(ResourceUsageTag tag, RenderPassCommand&& command) {
+        auto storage = std::move(command).MakeStorage(command_data_);
+        recorded_commands_.emplace_back(tag, std::move(storage));
+    }
+    const std::vector<RecordedCommandEntry>& GetRecordedCommands() const { return recorded_commands_; }
+    const CommandData& GetCommandData() const { return command_data_; }
+    bool HasCompleteRecordedCommandStream() const {
+        if (recorded_commands_.size() != access_log_->size()) {
+            return false;
+        }
+        for (size_t i = 0; i < recorded_commands_.size(); ++i) {
+            if (recorded_commands_[i].tag != i) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     // DebugNameProvider
     std::string GetDebugRegionName(const ResourceUsageRecord& record) const override;
@@ -323,6 +371,8 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     std::vector<std::unique_ptr<RenderPassAccessContext>> render_pass_contexts_;
     RenderPassAccessContext* current_renderpass_context_;
     std::vector<ReplayEntry> replay_entries_;
+    std::vector<RecordedCommandEntry> recorded_commands_;
+    CommandData command_data_;
 
     // State during dynamic rendering (dynamic rendering rendering passes must be
     // contained within a single command buffer)

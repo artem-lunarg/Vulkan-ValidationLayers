@@ -93,7 +93,7 @@ void VkSyncValTest::InitTimelineSemaphore() {
     RETURN_IF_SKIP(InitSyncVal());
 }
 
-void VkSyncValTest::InitRayTracing() {
+void VkSyncValTest::InitRayTracing(const SyncValSettings* p_sync_settings) {
     SetTargetApiVersion(VK_API_VERSION_1_2);
 
     AddRequiredExtensions(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -103,7 +103,7 @@ void VkSyncValTest::InitRayTracing() {
     AddRequiredFeature(vkt::Feature::accelerationStructure);
     AddRequiredFeature(vkt::Feature::rayTracingPipeline);
 
-    RETURN_IF_SKIP(InitSyncVal());
+    RETURN_IF_SKIP(InitSyncVal(p_sync_settings));
 }
 
 std::pair<vkt::Queue*, vkt::Queue*> VkSyncValTest::GetTwoQueuesFromSameFamily(const std::vector<vkt ::Queue*>& queues) {
@@ -340,6 +340,41 @@ TEST_F(PositiveSyncVal, StoreOpImplicitOrdering) {
     // Test ordering rules between input attachment READ and store op WRITE (DONT_CARE).
     // Implicit ordering ensures there is no WAR hazard.
     m_command_buffer.EndRenderPass();
+}
+
+TEST_F(PositiveSyncVal, SubmitOnlyRenderPassStoreQueueWait) {
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    RenderPassSingleSubpass rp(*this);
+    rp.AddAttachmentDescription(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE);
+    rp.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    rp.CreateRenderPass();
+
+    vkt::Image image(*m_device, 64, 64, VK_FORMAT_R8G8B8A8_UNORM,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    vkt::ImageView image_view = image.CreateView();
+    image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::Framebuffer framebuffer(*m_device, rp, 1, &image_view.handle(), 64, 64);
+
+    vkt::CommandBuffer render_pass_cb(*m_device, m_command_pool);
+    render_pass_cb.Begin();
+    render_pass_cb.BeginRenderPass(rp, framebuffer, 64, 64);
+    render_pass_cb.EndRenderPass();
+    render_pass_cb.End();
+
+    vkt::CommandBuffer clear_cb(*m_device, m_command_pool);
+    clear_cb.Begin();
+    const VkImageSubresourceRange subresource_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk::CmdClearColorImage(clear_cb, image, VK_IMAGE_LAYOUT_GENERAL, &m_clear_color, 1, &subresource_range);
+    clear_cb.End();
+
+    m_default_queue->Submit(render_pass_cb);
+    m_default_queue->Wait();
+    m_default_queue->SubmitAndWait(clear_cb);
 }
 
 TEST_F(PositiveSyncVal, SubpassWithBarrier) {

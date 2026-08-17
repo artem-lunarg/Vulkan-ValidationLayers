@@ -230,31 +230,6 @@ static SyncAccessIndex GetSyncStageAccessIndexsByDescriptorSet(VkDescriptorType 
     }
 }
 
-static void UpdateImageAccessState(AccessContext& access_context, const vvl::Image& image, SyncAccessIndex current_usage,
-                                   const VkImageSubresourceRange& subresource_range, const ResourceUsageTag& tag) {
-    const auto& sub_state = SubState(image);
-    ImageRangeGen range_gen = sub_state.MakeImageRangeGen(subresource_range, false);
-    access_context.UpdateAccessState(range_gen, current_usage, ResourceUsageTagEx{tag});
-}
-
-static void UpdateImageAccessState(AccessContext& access_context, const vvl::Image& image, SyncAccessIndex current_usage,
-                                   const VkImageSubresourceRange& subresource_range, const VkOffset3D& offset,
-                                   const VkExtent3D& extent, ResourceUsageTagEx tag_ex) {
-    const auto& sub_state = SubState(image);
-    ImageRangeGen range_gen = sub_state.MakeImageRangeGen(subresource_range, offset, extent, false);
-    access_context.UpdateAccessState(range_gen, current_usage, tag_ex);
-}
-
-static void UpdateVideoAccessState(AccessContext& access_context, const vvl::VideoSession& vs_state,
-                                   const vvl::VideoPictureResource& resource, SyncAccessIndex current_usage, ResourceUsageTag tag) {
-    const auto image = static_cast<const vvl::Image*>(resource.image_state.get());
-    const auto offset = resource.GetEffectiveImageOffset(vs_state);
-    const auto extent = resource.GetEffectiveImageExtent(vs_state);
-    const auto& sub_state = SubState(*image);
-    ImageRangeGen range_gen(sub_state.MakeImageRangeGen(resource.range, offset, extent, false));
-    access_context.UpdateAccessState(range_gen, current_usage, ResourceUsageTagEx{tag});
-}
-
 SyncEnvironment::SyncEnvironment(const SyncValidator& validator, VkQueueFlags queue_flags, QueueId queue_id,
                                  VulkanTypedHandle handle, SyncEventsContext& events_context,
                                  const ResourceUsageInfoProvider& usage_info_provider)
@@ -322,6 +297,8 @@ void CommandBufferContext::Reset() {
         cbs_referenced_->push_back(cb_state_->shared_from_this());
     }
     replay_entries_.clear();
+    recorded_commands_.clear();
+    command_data_ = {};
     command_number_ = 0;
     reset_count_++;
 
@@ -378,23 +355,39 @@ bool CommandBufferContext::ValidateBeginRendering(const ErrorObject& error_obj, 
     return skip;
 }
 
+ResourceAccessCommand CommandBufferContext::MakeBeginRenderingAccessCommand(const DynamicRenderingInfo& rendering_info) const {
+    ResourceAccessCommand command;
+    if ((rendering_info.info.flags & VK_RENDERING_RESUMING_BIT) != 0) {
+        return command;
+    }
+    for (const auto& attachment : rendering_info.attachments) {
+        const SyncAccessIndex load_index = attachment.GetLoadUsage();
+        if (!attachment.view || load_index == SYNC_ACCESS_INDEX_NONE) {
+            continue;
+        }
+        ResourceAccessCommand::ImageViewAccess access;
+        access.image_view = attachment.view;
+        access.access_index = load_index;
+        access.use_render_area = rendering_info.info.viewMask == 0;
+        access.offset = CastTo3D(rendering_info.info.renderArea.offset);
+        access.extent = CastTo3D(rendering_info.info.renderArea.extent);
+        access.view_mask = rendering_info.info.viewMask;
+        access.aspect_mask = attachment.type == AttachmentType::kDepth     ? VK_IMAGE_ASPECT_DEPTH_BIT
+                             : attachment.type == AttachmentType::kStencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                           : 0;
+        access.attachment_access = GetAttachmentAccess(attachment.GetOrdering(), AttachmentAccessType::LoadOp);
+        access.message_type = "BeginRenderingError";
+        command.accesses.emplace_back(std::move(access));
+    }
+    return command;
+}
+
 void CommandBufferContext::RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc) {
     const auto tag = NextCommandTag(loc.function);
-
     const DynamicRenderingInfo& info = cmd_state.GetRenderingInfo();
-    if ((info.info.flags & VK_RENDERING_RESUMING_BIT) == 0) {
-        AccessContext& access_context = GetCbAccessContext();
-        for (size_t i = 0; i < info.attachments.size(); i++) {
-            const DynamicRenderingInfo::Attachment& attachment = info.attachments[i];
-            const SyncAccessIndex load_index = attachment.GetLoadUsage();
-            if (load_index == SYNC_ACCESS_INDEX_NONE) {
-                continue;
-            }
-            ImageRangeGen range_gen = attachment.GetRangeGen(info.info.viewMask);
-            const AttachmentAccess attachment_access = GetAttachmentAccess(attachment.GetOrdering(), AttachmentAccessType::LoadOp);
-            access_context.UpdateAttachmentAccessState(range_gen, load_index, attachment_access, ResourceUsageTagEx{tag});
-        }
-    }
+    auto command = MakeBeginRenderingAccessCommand(info);
+    command.Record(*this, tag, sync_state_.syncval_settings.IsRecordTimeValidationEnabled());
+    AddRecordedCommand(tag, std::move(command));
     dynamic_rendering_info_ = std::move(cmd_state.info);
 }
 
@@ -485,6 +478,49 @@ bool CommandBufferContext::ValidateEndRendering(const ErrorObject& error_obj) co
     return skip;
 }
 
+ResourceAccessCommand CommandBufferContext::MakeEndRenderingAccessCommand() const {
+    ResourceAccessCommand command;
+    if (!dynamic_rendering_info_ || (dynamic_rendering_info_->info.flags & VK_RENDERING_SUSPENDING_BIT) != 0) {
+        return command;
+    }
+
+    auto add_access = [&](const std::shared_ptr<const vvl::ImageView>& view, SyncAccessIndex access_index,
+                          const AttachmentAccess& attachment_access, AttachmentType type, uint32_t view_mask,
+                          const char* message_type) {
+        if (!view || access_index == SYNC_ACCESS_INDEX_NONE) {
+            return;
+        }
+        ResourceAccessCommand::ImageViewAccess access;
+        access.image_view = view;
+        access.access_index = access_index;
+        access.use_render_area = view_mask == 0;
+        access.offset = CastTo3D(cb_state_->render_area.offset);
+        access.extent = CastTo3D(cb_state_->render_area.extent);
+        access.view_mask = view_mask;
+        access.aspect_mask = type == AttachmentType::kDepth     ? VK_IMAGE_ASPECT_DEPTH_BIT
+                             : type == AttachmentType::kStencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                : 0;
+        access.attachment_access = attachment_access;
+        access.message_type = message_type;
+        command.accesses.emplace_back(std::move(access));
+    };
+
+    for (const auto& attachment : dynamic_rendering_info_->attachments) {
+        if (attachment.resolve_gen) {
+            const SyncOrdering resolve_order =
+                attachment.type == AttachmentType::kColor ? kColorResolveOrder : kDepthStencilResolveOrder;
+            add_access(attachment.view, kResolveRead, GetAttachmentAccess(resolve_order, AttachmentAccessType::ResolveRead),
+                       attachment.type, dynamic_rendering_info_->info.viewMask, "EndRenderingResolveError");
+            add_access(attachment.resolve_view, kResolveWrite,
+                       GetAttachmentAccess(resolve_order, AttachmentAccessType::ResolveWrite), attachment.type, 0,
+                       "EndRenderingResolveError");
+        }
+        add_access(attachment.view, attachment.GetStoreUsage(), GetAttachmentAccess(kStoreOrder, AttachmentAccessType::StoreOp),
+                   attachment.type, dynamic_rendering_info_->info.viewMask, "EndRenderingStoreError");
+    }
+    return command;
+}
+
 void CommandBufferContext::RecordEndRendering(const RecordObject& record_obj) {
     if (!dynamic_rendering_info_) {
         return;
@@ -493,47 +529,27 @@ void CommandBufferContext::RecordEndRendering(const RecordObject& record_obj) {
         dynamic_rendering_info_.reset();
         return;
     }
-
-    auto store_tag = NextCommandTag(record_obj.location.function, SubCommandType::kStoreOp);
-    AccessContext& access_context = GetCbAccessContext();
-
-    for (const auto& attachment : dynamic_rendering_info_->attachments) {
-        if (attachment.resolve_gen) {
-            const bool is_color = attachment.type == AttachmentType::kColor;
-            const SyncOrdering kResolveOrder = is_color ? kColorResolveOrder : kDepthStencilResolveOrder;
-
-            const AttachmentAccess resolve_read_access = GetAttachmentAccess(kResolveOrder, AttachmentAccessType::ResolveRead);
-            ImageRangeGen view_gen = attachment.GetRangeGen(dynamic_rendering_info_->info.viewMask);
-            access_context.UpdateAttachmentAccessState(view_gen, kResolveRead, resolve_read_access, ResourceUsageTagEx{store_tag});
-
-            const AttachmentAccess resolve_write_access = GetAttachmentAccess(kResolveOrder, AttachmentAccessType::ResolveWrite);
-            ImageRangeGen resolve_gen = *attachment.resolve_gen;
-            access_context.UpdateAttachmentAccessState(resolve_gen, kResolveWrite, resolve_write_access,
-                                                       ResourceUsageTagEx{store_tag});
-        }
-
-        const SyncAccessIndex store_index = attachment.GetStoreUsage();
-        if (store_index != SYNC_ACCESS_INDEX_NONE) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(kStoreOrder, AttachmentAccessType::StoreOp);
-            ImageRangeGen view_gen = attachment.GetRangeGen(dynamic_rendering_info_->info.viewMask);
-            access_context.UpdateAttachmentAccessState(view_gen, store_index, attachment_access, ResourceUsageTagEx{store_tag});
-        }
-    }
+    const auto store_tag = NextCommandTag(record_obj.location.function, SubCommandType::kStoreOp);
+    auto command = MakeEndRenderingAccessCommand();
+    command.Record(*this, store_tag, sync_state_.syncval_settings.IsRecordTimeValidationEnabled());
+    AddRecordedCommand(store_tag, std::move(command));
     current_render_pass_instance_id_++;
     dynamic_rendering_info_.reset();
 }
 
-bool CommandBufferContext::ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const Location& loc) const {
-    bool skip = false;
+ResourceAccessCommand CommandBufferContext::MakeDispatchDrawDescriptorAccessCommand(VkPipelineBindPoint pipelineBindPoint) const {
+    ResourceAccessCommand command;
     if (!sync_state_.syncval_settings.shader_accesses_heuristic) {
-        return skip;
+        return command;
     }
+
     const auto& last_bound_state = cb_state_->lastBound[ConvertToVvlBindPoint(pipelineBindPoint)];
     const vvl::Pipeline* pipe = last_bound_state.pipeline_state;
     const std::vector<LastBound::DescriptorSetSlot>& ds_slots = last_bound_state.ds_slots;
     if (!pipe) {
-        return skip;
+        return command;
     }
+    const auto pipeline = sync_state_.Get<vvl::Pipeline>(pipe->VkHandle());
 
     using DescriptorClass = vvl::DescriptorClass;
     using BufferDescriptor = vvl::BufferDescriptor;
@@ -548,518 +564,254 @@ bool CommandBufferContext::ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint
         }
         for (const auto& variable : stage_state.entrypoint->resource_interface_variables) {
             if (variable.decorations.set >= ds_slots.size()) {
-                // This should be caught by Core validation, but if core checks are disabled SyncVal should not crash.
                 continue;
             }
             const auto& ds_slot = ds_slots[variable.decorations.set];
             const auto* descriptor_set = ds_slot.ds_state.get();
-            if (!descriptor_set) continue;
-            auto binding = descriptor_set->GetBinding(variable.decorations.binding);
-            if (!binding) continue;
-            const auto descriptor_type = binding->type;
-            SyncAccessIndex sync_index = GetSyncStageAccessIndexsByDescriptorSet(descriptor_type, variable, stage_state.GetStage());
-
-            // Currently, validation of memory accesses based on declared descriptors can produce false-positives.
-            // The shader can decide not to do such accesses, it can perform accesses with more narrow scope
-            // (e.g. read access, when both reads and writes are allowed) or for an array of descriptors, not all
-            // elements are accessed in the general case.
-            //
-            // This workaround disables validation for the descriptor array case.
-            if (binding->count > 1) {
+            if (!descriptor_set) {
                 continue;
             }
+            const auto binding = descriptor_set->GetBinding(variable.decorations.binding);
+            if (!binding || binding->count > 1) {
+                continue;
+            }
+            const auto descriptor_set_state = sync_state_.Get<vvl::DescriptorSet>(descriptor_set->VkHandle());
+            const VkDescriptorType descriptor_type = binding->type;
+            const SyncAccessIndex sync_index =
+                GetSyncStageAccessIndexsByDescriptorSet(descriptor_type, variable, stage_state.GetStage());
 
-            for (uint32_t index = 0; index < binding->count; index++) {
-                const auto* descriptor = binding->GetDescriptor(index);
-                switch (descriptor->GetClass()) {
-                    case DescriptorClass::ImageSampler:
-                    case DescriptorClass::Image: {
-                        if (descriptor->Invalid()) {
-                            continue;
-                        }
+            auto make_descriptor_info = [&](ResourceAccessCommand::DescriptorResourceType resource_type,
+                                            const VulkanTypedHandle& resource_handle,
+                                            VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED) {
+                ResourceAccessCommand::DescriptorInfo info;
+                info.pipeline = pipeline;
+                info.descriptor_set = descriptor_set_state;
+                info.resource_handle = resource_handle;
+                info.resource_type = resource_type;
+                info.set = variable.decorations.set;
+                info.descriptor_type = descriptor_type;
+                info.binding = variable.decorations.binding;
+                info.array_element = 0;
+                info.stage = stage_state.GetStage();
+                info.image_layout = image_layout;
+                return info;
+            };
 
-                        // NOTE: ImageSamplerDescriptor inherits from ImageDescriptor, so this cast works for both types.
-                        const auto* image_descriptor = static_cast<const ImageDescriptor*>(descriptor);
-                        const auto* img_view_state = image_descriptor->GetImageViewState();
-                        VkImageLayout image_layout = image_descriptor->GetImageLayout();
-
-                        if (img_view_state->is_depth_sliced) {
-                            // NOTE: 2D ImageViews of VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT Images are not allowed in
-                            // Descriptors, unless VK_EXT_image_2d_view_of_3d is supported, which it isn't at the moment.
-                            // See: VUID 00343
-                            continue;
-                        }
-
-                        HazardResult hazard;
-
-                        if (sync_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
-                            const VkExtent3D extent = CastTo3D(cb_state_->render_area.extent);
-                            const VkOffset3D offset = CastTo3D(cb_state_->render_area.offset);
-                            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kRaster);
-                            hazard = current_context_->DetectAttachmentHazard(*img_view_state, offset, extent, sync_index,
-                                                                              attachment_access);
-                        } else {
-                            hazard = current_context_->DetectHazard(*img_view_state, sync_index);
-                        }
-
-                        if (hazard.IsHazard()) {
-                            LogObjectList objlist(cb_state_->Handle(), img_view_state->Handle(), pipe->Handle());
-                            const auto error = error_messages_.ImageDescriptorError(
-                                hazard, *this, loc.function, sync_state_.FormatHandle(*img_view_state), *pipe,
-                                variable.decorations.set, *descriptor_set, descriptor_type, variable.decorations.binding, index,
-                                stage_state.GetStage(), image_layout);
-                            skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
-                        }
-                        break;
+            const auto* descriptor = binding->GetDescriptor(0);
+            switch (descriptor->GetClass()) {
+                case DescriptorClass::ImageSampler:
+                case DescriptorClass::Image: {
+                    const auto* image_descriptor = static_cast<const ImageDescriptor*>(descriptor);
+                    if (image_descriptor->Invalid()) {
+                        continue;
                     }
-                    case DescriptorClass::TexelBuffer: {
-                        const auto* texel_descriptor = static_cast<const TexelDescriptor*>(descriptor);
-                        if (texel_descriptor->Invalid()) {
-                            continue;
-                        }
-                        const auto* buf_view_state = texel_descriptor->GetBufferViewState();
-                        const auto* buf_state = buf_view_state->buffer_state.get();
-                        const AccessRange range = MakeRange(*buf_view_state);
-                        auto hazard = current_context_->DetectHazard(*buf_state, sync_index, range);
-                        if (hazard.IsHazard()) {
-                            LogObjectList objlist(cb_state_->Handle(), buf_view_state->Handle(), pipe->Handle());
-                            const auto error = error_messages_.BufferDescriptorError(
-                                hazard, *this, loc.function, sync_state_.FormatHandle(*buf_view_state), *pipe,
-                                variable.decorations.set, *descriptor_set, descriptor_type, variable.decorations.binding, index,
-                                stage_state.GetStage());
-                            skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
-                        }
-                        break;
+                    const auto* image_view = image_descriptor->GetImageViewState();
+                    if (!image_view || image_view->is_depth_sliced) {
+                        continue;
                     }
-                    case DescriptorClass::GeneralBuffer: {
-                        const auto* buffer_descriptor = static_cast<const BufferDescriptor*>(descriptor);
-                        if (buffer_descriptor->Invalid()) {
-                            continue;
-                        }
-                        VkDeviceSize offset = buffer_descriptor->GetOffset();
-                        if (vvl::IsDynamicDescriptor(descriptor_type)) {
-                            const uint32_t dynamic_offset_index =
-                                descriptor_set->GetDynamicOffsetIndexFromBinding(binding->binding);
-                            if (dynamic_offset_index >= ds_slot.dynamic_offsets.size()) {
-                                continue;  // core validation error
-                            }
-                            offset += ds_slot.dynamic_offsets[dynamic_offset_index];
-                        }
-                        const auto* buf_state = buffer_descriptor->GetBufferState();
-                        const AccessRange range = MakeRange(*buf_state, offset, buffer_descriptor->GetRange());
-                        auto hazard = current_context_->DetectHazard(*buf_state, sync_index, range);
-                        if (hazard.IsHazard()) {
-                            LogObjectList objlist(cb_state_->Handle(), buf_state->Handle(), pipe->Handle());
-                            const auto error = error_messages_.BufferDescriptorError(
-                                hazard, *this, loc.function, sync_state_.FormatHandle(*buf_state), *pipe, variable.decorations.set,
-                                *descriptor_set, descriptor_type, variable.decorations.binding, index, stage_state.GetStage());
-                            skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
-                        }
-                        break;
+                    ResourceAccessCommand::ImageViewAccess access;
+                    access.image_view = sync_state_.Get<vvl::ImageView>(image_view->VkHandle());
+                    access.access_index = sync_index;
+                    access.tag_handle = image_view->image_state->Handle();
+                    access.descriptor_info = make_descriptor_info(ResourceAccessCommand::DescriptorResourceType::kImage,
+                                                                  image_view->Handle(), image_descriptor->GetImageLayout());
+                    if (sync_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
+                        access.use_render_area = true;
+                        access.offset = CastTo3D(cb_state_->render_area.offset);
+                        access.extent = CastTo3D(cb_state_->render_area.extent);
+                        access.attachment_access = GetAttachmentAccess(SyncOrdering::kRaster);
                     }
-                    case DescriptorClass::AccelerationStructure: {
-                        const auto* accel_descriptor = static_cast<const vvl::AccelerationStructureDescriptor*>(descriptor);
-                        if (accel_descriptor->Invalid()) {
-                            continue;
-                        }
-                        const vvl::AccelerationStructureKHR* accel = accel_descriptor->GetAccelerationStructureStateKHR();
-                        if (!accel) {
-                            continue;
-                        }
-                        if (const vvl::BufferAndOffset as_buffer = accel->GetFirstValidBuffer(cb_state_->dev_data)) {
-                            const AccessRange range = MakeRange(*as_buffer.state, as_buffer.offset, accel->GetSize());
-                            auto hazard = current_context_->DetectHazard(*as_buffer.state, sync_index, range);
-                            if (hazard.IsHazard()) {
-                                LogObjectList objlist(cb_state_->Handle(), as_buffer.state->Handle(), pipe->Handle());
-                                const std::string resource_description = sync_state_.FormatHandle(accel->Handle());
-                                const std::string error = error_messages_.AccelerationStructureDescriptorError(
-                                    hazard, *this, loc.function, resource_description, *pipe, variable.decorations.set,
-                                    *descriptor_set, descriptor_type, variable.decorations.binding, index, stage_state.GetStage());
-                                skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
-                            }
-                        }
-                        break;
-                    }
-                    // TODO: INLINE_UNIFORM_BLOCK_EXT
-                    default:
-                        break;
+                    command.accesses.emplace_back(std::move(access));
+                    break;
                 }
+                case DescriptorClass::TexelBuffer: {
+                    const auto* texel_descriptor = static_cast<const TexelDescriptor*>(descriptor);
+                    if (texel_descriptor->Invalid()) {
+                        continue;
+                    }
+                    const auto* buffer_view = texel_descriptor->GetBufferViewState();
+                    const auto* buffer = buffer_view->buffer_state.get();
+                    ResourceAccessCommand::BufferAccess access;
+                    access.buffer = sync_state_.Get<vvl::Buffer>(buffer->VkHandle());
+                    access.access_index = sync_index;
+                    access.range = MakeRange(*buffer_view);
+                    access.tag_handle = buffer_view->Handle();
+                    access.descriptor_info =
+                        make_descriptor_info(ResourceAccessCommand::DescriptorResourceType::kBuffer, buffer_view->Handle());
+                    command.accesses.emplace_back(std::move(access));
+                    break;
+                }
+                case DescriptorClass::GeneralBuffer: {
+                    const auto* buffer_descriptor = static_cast<const BufferDescriptor*>(descriptor);
+                    if (buffer_descriptor->Invalid()) {
+                        continue;
+                    }
+                    VkDeviceSize offset = buffer_descriptor->GetOffset();
+                    if (vvl::IsDynamicDescriptor(descriptor_type)) {
+                        const uint32_t dynamic_offset_index = descriptor_set->GetDynamicOffsetIndexFromBinding(binding->binding);
+                        if (dynamic_offset_index >= ds_slot.dynamic_offsets.size()) {
+                            continue;
+                        }
+                        offset += ds_slot.dynamic_offsets[dynamic_offset_index];
+                    }
+                    const auto* buffer = buffer_descriptor->GetBufferState();
+                    ResourceAccessCommand::BufferAccess access;
+                    access.buffer = sync_state_.Get<vvl::Buffer>(buffer->VkHandle());
+                    access.access_index = sync_index;
+                    access.range = MakeRange(*buffer, offset, buffer_descriptor->GetRange());
+                    access.tag_handle = buffer->Handle();
+                    access.descriptor_info =
+                        make_descriptor_info(ResourceAccessCommand::DescriptorResourceType::kBuffer, buffer->Handle());
+                    command.accesses.emplace_back(std::move(access));
+                    break;
+                }
+                case DescriptorClass::AccelerationStructure: {
+                    const auto* accel_descriptor = static_cast<const vvl::AccelerationStructureDescriptor*>(descriptor);
+                    if (accel_descriptor->Invalid()) {
+                        continue;
+                    }
+                    const vvl::AccelerationStructureKHR* accel = accel_descriptor->GetAccelerationStructureStateKHR();
+                    if (!accel) {
+                        continue;
+                    }
+                    const vvl::BufferAndOffset as_buffer = accel->GetFirstValidBuffer(cb_state_->dev_data);
+                    if (!as_buffer) {
+                        continue;
+                    }
+                    ResourceAccessCommand::BufferAccess access;
+                    access.buffer = sync_state_.Get<vvl::Buffer>(as_buffer.state->VkHandle());
+                    access.access_index = sync_index;
+                    access.range = MakeRange(*as_buffer.state, as_buffer.offset, accel->GetSize());
+                    access.tag_handle = accel->Handle();
+                    access.descriptor_info = make_descriptor_info(
+                        ResourceAccessCommand::DescriptorResourceType::kAccelerationStructure, accel->Handle());
+                    command.accesses.emplace_back(std::move(access));
+                    break;
+                }
+                default:
+                    break;
             }
         }
     }
-    return skip;
+    return command;
 }
 
-// TODO: Record structure repeats Validate. Unify this code, it was the source of bugs few times already.
-void CommandBufferContext::RecordDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const ResourceUsageTag tag) {
-    if (!sync_state_.syncval_settings.shader_accesses_heuristic) {
-        return;
-    }
-
-    const auto& last_bound_state = cb_state_->lastBound[ConvertToVvlBindPoint(pipelineBindPoint)];
-    const vvl::Pipeline* pipe = last_bound_state.pipeline_state;
-    const std::vector<LastBound::DescriptorSetSlot>& ds_slots = last_bound_state.ds_slots;
-    if (!pipe) {
-        return;
-    }
-
-    using DescriptorClass = vvl::DescriptorClass;
-    using BufferDescriptor = vvl::BufferDescriptor;
-    using ImageDescriptor = vvl::ImageDescriptor;
-    using TexelDescriptor = vvl::TexelDescriptor;
-
-    for (const auto& stage_state : pipe->stage_states) {
-        if (stage_state.GetStage() == VK_SHADER_STAGE_FRAGMENT_BIT && pipe->RasterizationDisabled()) {
-            continue;
-        } else if (!stage_state.HasSpirv()) {
-            continue;
-        }
-        for (const auto& variable : stage_state.entrypoint->resource_interface_variables) {
-            if (variable.decorations.set >= ds_slots.size()) {
-                // This should be caught by Core validation, but if core checks are disabled SyncVal should not crash.
-                continue;
-            }
-            const auto& ds_slot = ds_slots[variable.decorations.set];
-            const auto* descriptor_set = ds_slot.ds_state.get();
-            if (!descriptor_set) continue;
-            auto binding = descriptor_set->GetBinding(variable.decorations.binding);
-            if (!binding) continue;
-            const auto descriptor_type = binding->type;
-            SyncAccessIndex sync_index = GetSyncStageAccessIndexsByDescriptorSet(descriptor_type, variable, stage_state.GetStage());
-
-            // Do not update state for descriptor array (the same as in Validate function).
-            if (binding->count > 1) {
-                continue;
-            }
-
-            for (uint32_t i = 0; i < binding->count; i++) {
-                const auto* descriptor = binding->GetDescriptor(i);
-                switch (descriptor->GetClass()) {
-                    case DescriptorClass::ImageSampler:
-                    case DescriptorClass::Image: {
-                        // NOTE: ImageSamplerDescriptor inherits from ImageDescriptor, so this cast works for both types.
-                        const auto* image_descriptor = static_cast<const ImageDescriptor*>(descriptor);
-                        if (image_descriptor->Invalid()) {
-                            continue;
-                        }
-                        const auto* img_view_state = image_descriptor->GetImageViewState();
-                        if (img_view_state->is_depth_sliced) {
-                            // NOTE: 2D ImageViews of VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT Images are not allowed in
-                            // Descriptors, unless VK_EXT_image_2d_view_of_3d is supported, which it isn't at the moment.
-                            // See: VUID 00343
-                            continue;
-                        }
-                        const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, img_view_state->image_state->Handle());
-                        if (sync_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
-                            const VkExtent3D extent = CastTo3D(cb_state_->render_area.extent);
-                            const VkOffset3D offset = CastTo3D(cb_state_->render_area.offset);
-                            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kRaster);
-
-                            ImageRangeGen range_gen(MakeImageRangeGen(*img_view_state, offset, extent));
-                            current_context_->UpdateAttachmentAccessState(range_gen, SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ,
-                                                                          attachment_access, tag_ex);
-                        } else {
-                            ImageRangeGen range_gen = MakeImageRangeGen(*img_view_state);
-                            current_context_->UpdateAccessState(range_gen, sync_index, tag_ex);
-                        }
-                        break;
-                    }
-                    case DescriptorClass::TexelBuffer: {
-                        const auto* texel_descriptor = static_cast<const TexelDescriptor*>(descriptor);
-                        if (texel_descriptor->Invalid()) {
-                            continue;
-                        }
-                        const auto* buf_view_state = texel_descriptor->GetBufferViewState();
-                        const auto* buf_state = buf_view_state->buffer_state.get();
-                        const AccessRange range = MakeRange(*buf_view_state);
-                        const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, buf_view_state->Handle());
-                        current_context_->UpdateAccessState(*buf_state, sync_index, range, tag_ex);
-                        break;
-                    }
-                    case DescriptorClass::GeneralBuffer: {
-                        const auto* buffer_descriptor = static_cast<const BufferDescriptor*>(descriptor);
-                        if (buffer_descriptor->Invalid()) {
-                            continue;
-                        }
-                        VkDeviceSize offset = buffer_descriptor->GetOffset();
-                        if (vvl::IsDynamicDescriptor(descriptor_type)) {
-                            const uint32_t dynamic_offset_index =
-                                descriptor_set->GetDynamicOffsetIndexFromBinding(binding->binding);
-                            if (dynamic_offset_index >= ds_slot.dynamic_offsets.size()) {
-                                continue;  // core validation error
-                            }
-                            offset += ds_slot.dynamic_offsets[dynamic_offset_index];
-                        }
-                        const auto* buf_state = buffer_descriptor->GetBufferState();
-                        const AccessRange range = MakeRange(*buf_state, offset, buffer_descriptor->GetRange());
-                        const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, buf_state->Handle());
-                        current_context_->UpdateAccessState(*buf_state, sync_index, range, tag_ex);
-                        break;
-                    }
-                    case DescriptorClass::AccelerationStructure: {
-                        const auto* accel_descriptor = static_cast<const vvl::AccelerationStructureDescriptor*>(descriptor);
-                        if (accel_descriptor->Invalid()) {
-                            continue;
-                        }
-                        const vvl::AccelerationStructureKHR* accel = accel_descriptor->GetAccelerationStructureStateKHR();
-                        if (!accel) {
-                            continue;
-                        }
-                        if (const vvl::BufferAndOffset as_buffer = accel->GetFirstValidBuffer(cb_state_->dev_data)) {
-                            const AccessRange range = MakeRange(*as_buffer.state, as_buffer.offset, accel->GetSize());
-                            const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, accel->Handle());
-                            current_context_->UpdateAccessState(*as_buffer.state, sync_index, range, tag_ex);
-                        }
-                        break;
-                    }
-                    // TODO: INLINE_UNIFORM_BLOCK_EXT
-                    default:
-                        break;
-                }
-            }
-        }
-    }
-}
-
-bool CommandBufferContext::ValidateDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const Location& loc) const {
-    bool skip = false;
+ResourceAccessCommand CommandBufferContext::MakeDrawVertexAccessCommand(uint32_t vertex_count, uint32_t first_vertex) const {
+    ResourceAccessCommand command;
     const auto* pipe = cb_state_->GetLastBoundGraphics().pipeline_state;
     if (!pipe) {
-        return skip;
+        return command;
     }
+    const auto pipeline = sync_state_.Get<vvl::Pipeline>(pipe->VkHandle());
 
     const auto& binding_buffers = cb_state_->current_vertex_buffer_binding_info;
     const auto& vertex_bindings = pipe->IsDynamic(CB_DYNAMIC_STATE_VERTEX_INPUT_EXT)
                                       ? cb_state_->dynamic_state_value.vertex_bindings
                                       : pipe->vertex_input_state->bindings;
-
     for (const auto& [_, binding_state] : vertex_bindings) {
-        const auto& binding_desc = binding_state.desc;
-        if (binding_desc.inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
-            // TODO: add support to determine range of instance level attributes
+        if (binding_state.desc.inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
             continue;
         }
-        if (const vvl::VertexBufferBinding* vertex_buffer = vvl::Find(binding_buffers, binding_desc.binding)) {
-            // TODO - Handle https://gitlab.khronos.org/vulkan/Vulkan-ValidationLayers/-/issues/45
-            const auto buf_state = sync_state_.Get<vvl::Buffer>(vertex_buffer->Buffer());
-            if (!buf_state) continue;  // also skips if using nullDescriptor
-
-            const AccessRange range =
-                MakeRangeForVertexData(vertex_buffer->BufferOffset(), firstVertex, vertexCount, binding_state);
-            auto hazard = current_context_->DetectHazard(*buf_state, SYNC_VERTEX_ATTRIBUTE_INPUT_VERTEX_ATTRIBUTE_READ, range);
-            if (hazard.IsHazard()) {
-                LogObjectList objlist(cb_state_->Handle(), buf_state->Handle(), pipe->Handle());
-                const std::string resource_description = "vertex " + sync_state_.FormatHandle(*buf_state);
-                const auto error = error_messages_.BufferError(hazard, *this, loc.function, resource_description, range);
-                skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
-            }
-        }
-    }
-    return skip;
-}
-
-void CommandBufferContext::RecordDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const ResourceUsageTag tag) {
-    const auto* pipe = cb_state_->GetLastBoundGraphics().pipeline_state;
-    if (!pipe) {
-        return;
-    }
-    const auto& binding_buffers = cb_state_->current_vertex_buffer_binding_info;
-    const auto& vertex_bindings = pipe->IsDynamic(CB_DYNAMIC_STATE_VERTEX_INPUT_EXT)
-                                      ? cb_state_->dynamic_state_value.vertex_bindings
-                                      : pipe->vertex_input_state->bindings;
-
-    for (const auto& [_, binding_state] : vertex_bindings) {
-        const auto& binding_desc = binding_state.desc;
-        if (binding_desc.inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
-            // TODO: add support to determine range of instance level attributes
+        const vvl::VertexBufferBinding* vertex_buffer = vvl::Find(binding_buffers, binding_state.desc.binding);
+        if (!vertex_buffer) {
             continue;
         }
-        if (const auto* vertex_buffer = vvl::Find(binding_buffers, binding_desc.binding)) {
-            // TODO - Handle https://gitlab.khronos.org/vulkan/Vulkan-ValidationLayers/-/issues/45
-            const auto buf_state = sync_state_.Get<vvl::Buffer>(vertex_buffer->Buffer());
-            if (!buf_state) continue;  // also skips if using nullDescriptor
-
-            const AccessRange range =
-                MakeRangeForVertexData(vertex_buffer->BufferOffset(), firstVertex, vertexCount, binding_state);
-            const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, buf_state->Handle());
-            current_context_->UpdateAccessState(*buf_state, SYNC_VERTEX_ATTRIBUTE_INPUT_VERTEX_ATTRIBUTE_READ, range, tag_ex);
+        const auto buffer = sync_state_.Get<vvl::Buffer>(vertex_buffer->Buffer());
+        if (!buffer) {
+            continue;
         }
+        ResourceAccessCommand::BufferAccess access;
+        access.buffer = buffer;
+        access.pipeline = pipeline;
+        access.access_index = SYNC_VERTEX_ATTRIBUTE_INPUT_VERTEX_ATTRIBUTE_READ;
+        access.range = MakeRangeForVertexData(vertex_buffer->BufferOffset(), first_vertex, vertex_count, binding_state);
+        access.tag_handle = buffer->Handle();
+        access.resource_name = "vertex ";
+        command.accesses.emplace_back(std::move(access));
     }
+    return command;
 }
 
-bool CommandBufferContext::ValidateDrawVertexIndex(uint32_t index_count, uint32_t firstIndex, const Location& loc) const {
-    bool skip = false;
+ResourceAccessCommand CommandBufferContext::MakeDrawVertexIndexAccessCommand(uint32_t index_count, uint32_t first_index) const {
+    ResourceAccessCommand command;
     const auto& index_binding = cb_state_->index_buffer_binding;
-    // TODO - Handle https://gitlab.khronos.org/vulkan/Vulkan-ValidationLayers/-/issues/45
-    const auto index_buf_state = sync_state_.Get<vvl::Buffer>(index_binding.Buffer());
-    if (!index_buf_state) return skip;
-
-    const uint32_t index_size = IndexTypeByteSize(index_binding.index_type);
-    const AccessRange range = MakeRangeForIndexData(index_binding.BufferOffset(), firstIndex, index_count, index_size);
-
-    auto hazard = current_context_->DetectHazard(*index_buf_state, SYNC_INDEX_INPUT_INDEX_READ, range);
-    if (hazard.IsHazard()) {
-        LogObjectList objlist(cb_state_->Handle(), index_buf_state->Handle());
-        if (const auto* pipe = cb_state_->GetLastBoundGraphics().pipeline_state) {
-            objlist.add(pipe->Handle());
-        }
-        const std::string resource_description = "index " + sync_state_.FormatHandle(*index_buf_state);
-        const auto error = error_messages_.BufferError(hazard, *this, loc.function, resource_description, range);
-        skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc, error);
+    const auto buffer = sync_state_.Get<vvl::Buffer>(index_binding.Buffer());
+    if (!buffer) {
+        return command;
     }
-
-    // TODO: Shader instrumentation support is needed to read index buffer content and determine the range of accessed
-    // versices (new syncval mode). Scanning index buffer for each draw call might be the simplest option to implement
-    // and the most reliable one, but potentially it can be heavy (still might be okay, testing is needed).
-    // Some other options: a) rescan index buffer when its modification is detected, b) scan index buffer only once and
-    // then assume it is immutable (common scenario).
-    // skip |= ValidateDrawVertex(?, ?, loc);
-
-    return skip;
+    ResourceAccessCommand::BufferAccess access;
+    access.buffer = buffer;
+    if (const auto* pipe = cb_state_->GetLastBoundGraphics().pipeline_state) {
+        access.pipeline = sync_state_.Get<vvl::Pipeline>(pipe->VkHandle());
+    }
+    access.access_index = SYNC_INDEX_INPUT_INDEX_READ;
+    access.range =
+        MakeRangeForIndexData(index_binding.BufferOffset(), first_index, index_count, IndexTypeByteSize(index_binding.index_type));
+    access.tag_handle = buffer->Handle();
+    access.resource_name = "index ";
+    command.accesses.emplace_back(std::move(access));
+    return command;
 }
 
-void CommandBufferContext::RecordDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, const ResourceUsageTag tag) {
-    const auto& index_binding = cb_state_->index_buffer_binding;
-    // TODO - Handle https://gitlab.khronos.org/vulkan/Vulkan-ValidationLayers/-/issues/45
-    const auto index_buf_state = sync_state_.Get<vvl::Buffer>(index_binding.Buffer());
-    if (!index_buf_state) {
-        return;
-    }
-
-    const uint32_t index_size = IndexTypeByteSize(index_binding.index_type);
-    const AccessRange range = MakeRangeForIndexData(index_binding.BufferOffset(), firstIndex, indexCount, index_size);
-    const ResourceUsageTagEx tag_ex = AddCommandHandle(tag, index_buf_state->Handle());
-    current_context_->UpdateAccessState(*index_buf_state, SYNC_INDEX_INPUT_INDEX_READ, range, tag_ex);
-
-    // TODO: Shader instrumentation support is needed to read index buffer content and determine the range of accessed
-    // versices (new syncval mode). Scanning index buffer for each draw call might be the simplest option to implement
-    // and the most reliable one, but potentially it can be heavy (still might be okay, testing is needed).
-    // Some other options: a) rescan index buffer when its modification is detected, b) scan index buffer only once and
-    // then assume it is immutable (common scenario).
-    // RecordDrawVertex(?, ?, tag);
-}
-
-bool CommandBufferContext::ValidateDrawAttachment(const Location& loc) const {
-    bool skip = false;
+ResourceAccessCommand CommandBufferContext::MakeDrawAttachmentAccessCommand() const {
+    ResourceAccessCommand command;
     if (current_renderpass_context_) {
-        skip |= current_renderpass_context_->ValidateDrawSubpassAttachment(*this, loc.function);
-    } else if (dynamic_rendering_info_) {
-        skip |= ValidateDrawDynamicRenderingAttachment(loc);
+        return current_renderpass_context_->MakeDrawSubpassAttachmentAccessCommand(*cb_state_);
     }
-    return skip;
-}
-
-bool CommandBufferContext::ValidateDrawDynamicRenderingAttachment(const Location& location) const {
-    bool skip = false;
-    const auto& last_bound_state = cb_state_->GetLastBoundGraphics();
-    const auto* pipe = last_bound_state.pipeline_state;
-    if (!pipe || pipe->RasterizationDisabled()) return skip;
-
-    const auto& list = pipe->fs_writable_output_location_list;
-    const AccessContext& access_context = GetCbAccessContext();
-
-    const DynamicRenderingInfo& info = *dynamic_rendering_info_;
-    for (const auto output_location : list) {
-        if (output_location >= info.info.colorAttachmentCount) {
-            continue;
-        }
-        const auto& attachment = info.attachments[output_location];
-        if (!attachment.IsWriteable(last_bound_state)) {
-            continue;
-        }
-        const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kColorAttachment);
-        ImageRangeGen view_gen = attachment.GetRangeGen(info.info.viewMask);
-        HazardResult hazard =
-            access_context.DetectAttachmentHazard(view_gen, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access);
-
-        if (hazard.IsHazard()) {
-            LogObjectList obj_list(cb_state_->Handle(), attachment.view->Handle());
-            Location loc = attachment.GetLocation(location, output_location);
-            const std::string error =
-                error_messages_.Error(environment_, hazard, location.function, sync_state_.FormatHandle(*attachment.view),
-                                      "DynamicRenderingAttachmentError");
-            skip |= sync_state_.SyncError(hazard.Hazard(), obj_list, loc.dot(vvl::Field::imageView), error);
-        }
+    if (!dynamic_rendering_info_) {
+        return command;
     }
-
-    // TODO -- fixup this and Subpass attachment to correct map the various depth stencil enables/reads vs. writes
-    // PHASE1 TODO: Add layout based read/vs. write selection.
-    // PHASE1 TODO: Read operations for both depth and stencil are possible in the future.
-    // PHASE1 TODO: Add EARLY stage detection based on ExecutionMode.
-    for (size_t i = info.info.colorAttachmentCount; i < info.attachments.size(); i++) {
-        const auto& attachment = info.attachments[i];
-        bool writeable = attachment.IsWriteable(last_bound_state);
-
-        if (writeable) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kDepthStencilAttachment);
-            ImageRangeGen view_gen = attachment.GetRangeGen(info.info.viewMask);
-            HazardResult hazard = access_context.DetectAttachmentHazard(
-                view_gen, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE, attachment_access);
-
-            if (hazard.IsHazard()) {
-                LogObjectList objlist(cb_state_->Handle(), attachment.view->Handle());
-                Location loc = attachment.GetLocation(location);
-                const std::string error =
-                    error_messages_.Error(environment_, hazard, location.function, sync_state_.FormatHandle(*attachment.view),
-                                          "DynamicRenderingAttachmentError");
-                skip |= sync_state_.SyncError(hazard.Hazard(), objlist, loc.dot(vvl::Field::imageView), error);
-            }
-        }
-    }
-
-    return skip;
-}
-
-void CommandBufferContext::RecordDrawAttachment(const ResourceUsageTag tag) {
-    if (current_renderpass_context_) {
-        current_renderpass_context_->RecordDrawSubpassAttachment(*cb_state_, tag);
-    } else if (dynamic_rendering_info_) {
-        RecordDrawDynamicRenderingAttachment(tag);
-    }
-}
-
-void CommandBufferContext::RecordDrawDynamicRenderingAttachment(ResourceUsageTag tag) {
     const auto& last_bound_state = cb_state_->GetLastBoundGraphics();
     const auto* pipe = last_bound_state.pipeline_state;
     if (!pipe || pipe->RasterizationDisabled()) {
-        return;
+        return command;
     }
 
-    const auto& list = pipe->fs_writable_output_location_list;
-    auto& access_context = GetCbAccessContext();
-
     const DynamicRenderingInfo& info = *dynamic_rendering_info_;
-    for (const auto output_location : list) {
+    auto add_attachment = [&](const DynamicRenderingInfo::Attachment& attachment, uint32_t attachment_index,
+                              SyncAccessIndex access_index, SyncOrdering ordering) {
+        if (!attachment.view) {
+            return;
+        }
+        ResourceAccessCommand::ImageViewAccess access;
+        access.image_view = attachment.view;
+        access.access_index = access_index;
+        access.use_render_area = info.info.viewMask == 0;
+        access.offset = CastTo3D(cb_state_->render_area.offset);
+        access.extent = CastTo3D(cb_state_->render_area.extent);
+        access.view_mask = info.info.viewMask;
+        access.aspect_mask = attachment.type == AttachmentType::kDepth     ? VK_IMAGE_ASPECT_DEPTH_BIT
+                             : attachment.type == AttachmentType::kStencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                           : 0;
+        access.attachment_access = GetAttachmentAccess(ordering);
+        access.tag_handle = attachment.view->Handle();
+        access.message_type = "DynamicRenderingAttachmentError";
+        access.attachment_index = attachment_index;
+        access.error_location =
+            attachment.type == AttachmentType::kColor   ? ResourceAccessCommand::ImageViewAccess::ErrorLocation::kColorAttachment
+            : attachment.type == AttachmentType::kDepth ? ResourceAccessCommand::ImageViewAccess::ErrorLocation::kDepthAttachment
+                                                        : ResourceAccessCommand::ImageViewAccess::ErrorLocation::kStencilAttachment;
+        command.accesses.emplace_back(std::move(access));
+    };
+
+    for (const uint32_t output_location : pipe->fs_writable_output_location_list) {
         if (output_location >= info.info.colorAttachmentCount) {
             continue;
         }
         const auto& attachment = info.attachments[output_location];
-        if (!attachment.IsWriteable(last_bound_state)) {
-            continue;
+        if (attachment.IsWriteable(last_bound_state)) {
+            add_attachment(attachment, output_location, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
+                           SyncOrdering::kColorAttachment);
         }
-        const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kColorAttachment);
-        ImageRangeGen view_gen = attachment.GetRangeGen(info.info.viewMask);
-        access_context.UpdateAttachmentAccessState(view_gen, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access,
-                                                   ResourceUsageTagEx{tag});
     }
-
-    // TODO -- fixup this and Subpass attachment to correct map the various depth stencil enables/reads vs. writes
-    // PHASE1 TODO: Add layout based read/vs. write selection.
-    // PHASE1 TODO: Read operations for both depth and stencil are possible in the future.
-    // PHASE1 TODO: Add EARLY stage detection based on ExecutionMode.
-
-    const uint32_t attachment_count = static_cast<uint32_t>(info.attachments.size());
-    for (uint32_t i = info.info.colorAttachmentCount; i < attachment_count; i++) {
+    for (size_t i = info.info.colorAttachmentCount; i < info.attachments.size(); ++i) {
         const auto& attachment = info.attachments[i];
-        bool writeable = attachment.IsWriteable(last_bound_state);
-
-        if (writeable) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kDepthStencilAttachment);
-            ImageRangeGen view_gen = attachment.GetRangeGen(info.info.viewMask);
-            access_context.UpdateAttachmentAccessState(view_gen, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                       attachment_access, ResourceUsageTagEx{tag});
+        if (attachment.IsWriteable(last_bound_state)) {
+            add_attachment(attachment, static_cast<uint32_t>(i), SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
+                           SyncOrdering::kDepthStencilAttachment);
         }
     }
+    return command;
 }
 
 VkImageAspectFlags CommandBufferContext::GetAttachmentAspectsToClear(VkImageAspectFlags clear_aspect_mask,
@@ -1275,6 +1027,67 @@ bool CommandBufferContext::ValidateClearAttachment(const Location& loc, const Vk
     return skip;
 }
 
+ResourceAccessCommand CommandBufferContext::MakeClearAttachmentAccessCommand(const VkClearAttachment& clear_attachment,
+                                                                             uint32_t clear_rect_index,
+                                                                             const VkClearRect& clear_rect) const {
+    ResourceAccessCommand command;
+    const auto optional_info = GetClearAttachmentInfo(clear_attachment, clear_rect.baseArrayLayer, clear_rect.layerCount);
+    if (!optional_info) {
+        return command;
+    }
+    const ClearAttachmentInfo& info = *optional_info;
+    const VkImageAspectFlags aspects_to_clear = info.subresource_range.aspectMask;
+    const bool color_clear = (aspects_to_clear & kColorAspects) != 0;
+    const SyncAccessIndex access_index =
+        color_clear ? SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE : SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE;
+    const SyncOrdering ordering = color_clear ? SyncOrdering::kColorAttachment : SyncOrdering::kDepthStencilAttachment;
+
+    std::ostringstream ss;
+    if (color_clear) {
+        ss << string_VkImageAspectFlags(clear_attachment.aspectMask) << " aspect of color attachment "
+           << clear_attachment.colorAttachment;
+    } else {
+        ss << string_VkImageAspectFlags(clear_attachment.aspectMask) << " aspect(s) of depth-stencil attachment";
+    }
+    ss << " (" << sync_state_.FormatHandle(info.attachment_view) << ")";
+    if (current_renderpass_context_) {
+        ss << " in subpass " << current_renderpass_context_->GetCurrentSubpass();
+    }
+    const std::string resource_description = ss.str();
+
+    auto add_access = [&](const VkImageSubresourceRange& subresource_range) {
+        ResourceAccessCommand::ImageRangeAccess access;
+        access.image = info.attachment_view.image_state;
+        access.access_index = access_index;
+        access.subresource_range = subresource_range;
+        access.is_depth_sliced = info.attachment_view.is_depth_sliced;
+        access.attachment_access = GetAttachmentAccess(ordering);
+        access.tag_handle = info.attachment_view.Handle();
+        access.resource_description = resource_description;
+        access.error_type = ResourceAccessCommand::ImageRangeAccess::ErrorType::kClearAttachment;
+        access.clear_aspects = clear_attachment.aspectMask;
+        access.clear_rect_index = clear_rect_index;
+        access.clear_rect = clear_rect;
+        command.accesses.emplace_back(std::move(access));
+    };
+
+    const uint32_t view_mask = GetViewMask();
+    if (view_mask == 0) {
+        add_access(info.subresource_range);
+    } else {
+        const VkImageSubresourceRange& attachment_subresource = info.attachment_view.normalized_subresource_range;
+        for (uint32_t view_index : GetSetBitIndices(view_mask)) {
+            if (view_index < attachment_subresource.layerCount) {
+                VkImageSubresourceRange view_subresource = attachment_subresource;
+                view_subresource.baseArrayLayer += view_index;
+                view_subresource.layerCount = 1;
+                add_access(view_subresource);
+            }
+        }
+    }
+    return command;
+}
+
 void CommandBufferContext::RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment,
                                                  const VkClearRect& rect) {
     const auto optional_info = GetClearAttachmentInfo(clear_attachment, rect.baseArrayLayer, rect.layerCount);
@@ -1321,7 +1134,7 @@ QueueId CommandBufferContext::GetQueueId() const { return kQueueIdInvalid; }
 
 ResourceUsageTag CommandBufferContext::RecordBeginRenderPass(
     vvl::Func command, const vvl::RenderPass& rp_state, const VkRect2D& render_area,
-    const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views) {
+    vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views, bool apply_command) {
     // Create an access context the current renderpass.
     const auto barrier_tag = NextCommandTag(command, SubCommandType::kSubpassTransition, 0);
     AddCommandHandle(barrier_tag, rp_state.Handle());
@@ -1329,12 +1142,14 @@ ResourceUsageTag CommandBufferContext::RecordBeginRenderPass(
     render_pass_contexts_.emplace_back(std::make_unique<RenderPassAccessContext>(
         rp_state, render_area, environment_.queue_flags, attachment_views, cb_access_context_, current_render_pass_instance_id_));
     current_renderpass_context_ = render_pass_contexts_.back().get();
-    current_renderpass_context_->RecordBeginRenderPass(barrier_tag, load_tag);
+    if (apply_command) {
+        current_renderpass_context_->RecordBeginRenderPass(barrier_tag, load_tag);
+    }
     current_context_ = &current_renderpass_context_->CurrentContext();
     return barrier_tag;
 }
 
-ResourceUsageTag CommandBufferContext::RecordNextSubpass(vvl::Func command) {
+ResourceUsageTag CommandBufferContext::RecordNextSubpass(vvl::Func command, bool apply_command) {
     // At this point current subpass value has not updated yet to the index of "next subpass"
     const uint32_t previous_subpass = current_renderpass_context_->GetCurrentSubpass();
     const uint32_t this_subpass = previous_subpass + 1;
@@ -1345,12 +1160,16 @@ ResourceUsageTag CommandBufferContext::RecordNextSubpass(vvl::Func command) {
     auto transition_tag = NextSubCommandTag(command, SubCommandType::kSubpassTransition, this_subpass);
     auto load_tag = NextSubCommandTag(command, SubCommandType::kLoadOp, this_subpass);
 
-    current_renderpass_context_->RecordNextSubpass(resolve_tag, store_tag, transition_tag, load_tag);
+    if (apply_command) {
+        current_renderpass_context_->RecordNextSubpass(resolve_tag, store_tag, transition_tag, load_tag);
+    } else {
+        current_renderpass_context_->AdvanceSubpass();
+    }
     current_context_ = &current_renderpass_context_->CurrentContext();
-    return transition_tag;
+    return resolve_tag;
 }
 
-ResourceUsageTag CommandBufferContext::RecordEndRenderPass(vvl::Func command) {
+ResourceUsageTag CommandBufferContext::RecordEndRenderPass(vvl::Func command, bool apply_command) {
     const uint32_t current_subpass = current_renderpass_context_->GetCurrentSubpass();
 
     auto store_tag = NextCommandTag(command, SubCommandType::kStoreOp, current_subpass);
@@ -1358,30 +1177,41 @@ ResourceUsageTag CommandBufferContext::RecordEndRenderPass(vvl::Func command) {
 
     auto barrier_tag = NextSubCommandTag(command, SubCommandType::kSubpassTransition);
 
-    current_renderpass_context_->RecordEndRenderPass(&cb_access_context_, store_tag, barrier_tag);
+    if (apply_command) {
+        current_renderpass_context_->RecordEndRenderPass(&cb_access_context_, store_tag, barrier_tag);
+    }
     current_context_ = &cb_access_context_;
     current_renderpass_context_ = nullptr;
     current_render_pass_instance_id_++;
-    return barrier_tag;
+    return store_tag;
 }
 
 void CommandBufferContext::RecordDestroyEvent(vvl::Event* event_state) { events_context_.Destroy(event_state); }
 
-void CommandBufferContext::RecordExecutedCommandBuffer(const CommandBufferContext& recorded_cb_context) {
+void CommandBufferContext::RecordExecutedCommandBuffer(const CommandBufferContext& recorded_cb_context, bool apply_commands) {
     const AccessContext& recorded_context = recorded_cb_context.GetCbAccessContext();
-
-    // Replay synchronization actions against the current destination state. The
-    // secondary's recorded access state already includes their effects and is resolved below.
     const ResourceUsageTag base_tag = GetTagCount();
-    for (const ReplayEntry& entry : recorded_cb_context.GetReplayEntries()) {
-        const bool replay_action = GetReplayContextChange(entry.operation) == nullptr;
-        if (replay_action) {
-            ApplyReplayAction(environment_, entry.operation, *current_context_, base_tag + entry.tag);
+
+    if (apply_commands) {
+        if (sync_state_.syncval_settings.full_validation) {
+            assert(recorded_cb_context.HasCompleteRecordedCommandStream());
+        }
+        if (recorded_cb_context.HasCompleteRecordedCommandStream()) {
+            ApplyRecordedCommands(environment_, *current_context_, recorded_cb_context, base_tag);
+        } else {
+            // Preserve the legacy secondary-command-buffer path when command replay is disabled.
+            for (const ReplayEntry& entry : recorded_cb_context.GetReplayEntries()) {
+                const bool replay_action = GetReplayContextChange(entry.operation) == nullptr;
+                if (replay_action) {
+                    ApplyReplayAction(environment_, entry.operation, *current_context_, base_tag + entry.tag);
+                }
+            }
+            ResolveExecutedCommandBuffer(recorded_context, base_tag);
         }
     }
 
     ImportRecordedAccessLog(recorded_cb_context);
-    ResolveExecutedCommandBuffer(recorded_context, base_tag);
+    ImportRecordedCommands(recorded_cb_context, base_tag);
 }
 
 void CommandBufferContext::ResolveExecutedCommandBuffer(const AccessContext& recorded_context, ResourceUsageTag offset) {
@@ -1405,6 +1235,32 @@ void CommandBufferContext::ImportRecordedAccessLog(const CommandBufferContext& r
             assert((*access_log_)[index].label_command_index != vvl::kNoIndex32);
             (*access_log_)[index].label_command_index += command_offset;
         }
+    }
+}
+
+void CommandBufferContext::ImportRecordedCommands(const CommandBufferContext& recorded_context, ResourceUsageTag offset) {
+    for (const RecordedCommandEntry& entry : recorded_context.recorded_commands_) {
+        std::visit(
+            [&](const auto& source_storage) {
+                using StorageType = std::decay_t<decltype(source_storage)>;
+                if constexpr (std::is_same_v<StorageType, BufferCopyCommand::Storage>) {
+                    const BufferCopyCommand command = source_storage.MakeCommand(recorded_context.command_data_);
+                    auto destination_storage =
+                        command.MakeStorage(command_data_, source_storage.src_handle_index, source_storage.dst_handle_index);
+                    recorded_commands_.emplace_back(offset + entry.tag, std::move(destination_storage));
+                } else if constexpr (std::is_same_v<StorageType, BufferAccessCommand::Storage>) {
+                    const BufferAccessCommand command = source_storage.MakeCommand(recorded_context.command_data_);
+                    auto destination_storage = command.MakeStorage(command_data_, source_storage.handle_index);
+                    recorded_commands_.emplace_back(offset + entry.tag, std::move(destination_storage));
+                } else if constexpr (std::is_same_v<StorageType, NoOpCommand>) {
+                    recorded_commands_.emplace_back(offset + entry.tag, source_storage);
+                } else {
+                    const auto& command = source_storage.MakeCommand(recorded_context.command_data_);
+                    auto destination_storage = command.MakeStorage(command_data_);
+                    recorded_commands_.emplace_back(offset + entry.tag, std::move(destination_storage));
+                }
+            },
+            entry.command);
     }
 }
 
@@ -1594,376 +1450,220 @@ void CommandBufferSubState::NotifyInvalidate(const vvl::StateObject::NodeList& i
 void CommandBufferSubState::RecordCopyBuffer(vvl::Buffer& src_buffer_state, vvl::Buffer& dst_buffer_state, uint32_t region_count,
                                              const VkBufferCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
+    const auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
+    const auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
 
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        const AccessRange src_range = MakeRange(src_buffer_state, copy_region.srcOffset, copy_region.size);
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        const AccessRange dst_range = MakeRange(dst_buffer_state, copy_region.dstOffset, copy_region.size);
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
+    small_vector<BufferCopyRegion, 1> command_regions;
+    command_regions.reserve(region_count);
+    for (const VkBufferCopy& region : vvl::make_span(regions, region_count)) {
+        command_regions.emplace_back(BufferCopyRegion{region.srcOffset, region.dstOffset, region.size});
     }
+    const BufferCopyCommand command{src_buffer_state, dst_buffer_state, command_regions};
+
+    if (cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), cb_context.GetCbAccessContext(), src_tag_ex, dst_tag_ex);
+    }
+    cb_context.AddRecordedCommand(tag, command, src_tag_ex.handle_index, dst_tag_ex.handle_index);
 }
 
 void CommandBufferSubState::RecordCopyBuffer2(vvl::Buffer& src_buffer_state, vvl::Buffer& dst_buffer_state, uint32_t region_count,
                                               const VkBufferCopy2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
+    const auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
+    const auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
 
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        const AccessRange src_range = MakeRange(src_buffer_state, copy_region.srcOffset, copy_region.size);
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        const AccessRange dst_range = MakeRange(dst_buffer_state, copy_region.dstOffset, copy_region.size);
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
+    small_vector<BufferCopyRegion, 1> command_regions;
+    command_regions.reserve(region_count);
+    for (const VkBufferCopy2& region : vvl::make_span(regions, region_count)) {
+        command_regions.emplace_back(BufferCopyRegion{region.srcOffset, region.dstOffset, region.size});
     }
+    const BufferCopyCommand command{src_buffer_state, dst_buffer_state, command_regions};
+
+    if (cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), cb_context.GetCbAccessContext(), src_tag_ex, dst_tag_ex);
+    }
+    cb_context.AddRecordedCommand(tag, command, src_tag_ex.handle_index, dst_tag_ex.handle_index);
 }
 
 void CommandBufferSubState::RecordCopyImage(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                             VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                             const VkImageCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.srcSubresource),
-                               copy_region.srcOffset, copy_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.dstSubresource),
-                               copy_region.dstOffset, copy_region.extent, dst_tag_ex);
-    }
+    auto command =
+        MakeImageCopyCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                             cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyImage2(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                              VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                              const VkImageCopy2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.srcSubresource),
-                               copy_region.srcOffset, copy_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.dstSubresource),
-                               copy_region.dstOffset, copy_region.extent, dst_tag_ex);
-    }
+    auto command =
+        MakeImageCopyCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                             cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyBufferToImage(vvl::Buffer& src_buffer_state, vvl::Image& dst_image_state, VkImageLayout,
                                                     uint32_t region_count, const VkBufferImageCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        AccessRange src_range = MakeRange(copy_region.bufferOffset, dst_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, dst_tag_ex);
-    }
+    auto command =
+        MakeBufferToImageCopyCommand(cb_context.GetSyncState().Get<vvl::Buffer>(src_buffer_state.VkHandle()),
+                                     cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyBufferToImage2(vvl::Buffer& src_buffer_state, vvl::Image& dst_image_state, VkImageLayout,
                                                      uint32_t region_count, const VkBufferImageCopy2* regions,
                                                      const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        AccessRange src_range = MakeRange(copy_region.bufferOffset, dst_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, dst_tag_ex);
-    }
+    auto command =
+        MakeBufferToImageCopyCommand(cb_context.GetSyncState().Get<vvl::Buffer>(src_buffer_state.VkHandle()),
+                                     cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyImageToBuffer(vvl::Image& src_image_state, vvl::Buffer& dst_buffer_state,
                                                     VkImageLayout src_image_layout, uint32_t region_count,
                                                     const VkBufferImageCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, src_tag_ex);
-
-        AccessRange dst_range = MakeRange(copy_region.bufferOffset, src_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
-    }
+    auto command = MakeImageToBufferCopyCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                                                cb_context.GetSyncState().Get<vvl::Buffer>(dst_buffer_state.VkHandle()),
+                                                region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyImageToBuffer2(vvl::Image& src_image_state, vvl::Buffer& dst_buffer_state,
                                                      VkImageLayout src_image_layout, uint32_t region_count,
                                                      const VkBufferImageCopy2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, src_tag_ex);
-
-        AccessRange dst_range = MakeRange(copy_region.bufferOffset, src_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
-    }
+    auto command = MakeImageToBufferCopyCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                                                cb_context.GetSyncState().Get<vvl::Buffer>(dst_buffer_state.VkHandle()),
+                                                region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordBlitImage(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                             VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                             const VkImageBlit* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& blit_region : vvl::make_span(regions, region_count)) {
-        VkOffset3D offset = {std::min(blit_region.srcOffsets[0].x, blit_region.srcOffsets[1].x),
-                             std::min(blit_region.srcOffsets[0].y, blit_region.srcOffsets[1].y),
-                             std::min(blit_region.srcOffsets[0].z, blit_region.srcOffsets[1].z)};
-        VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.srcOffsets[1].x - blit_region.srcOffsets[0].x)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].y - blit_region.srcOffsets[0].y)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].z - blit_region.srcOffsets[0].z))};
-        UpdateImageAccessState(context, src_image_state, SYNC_BLIT_TRANSFER_READ, RangeFromLayers(blit_region.srcSubresource),
-                               offset, extent, src_tag_ex);
-
-        offset = {std::min(blit_region.dstOffsets[0].x, blit_region.dstOffsets[1].x),
-                  std::min(blit_region.dstOffsets[0].y, blit_region.dstOffsets[1].y),
-                  std::min(blit_region.dstOffsets[0].z, blit_region.dstOffsets[1].z)};
-        extent = {static_cast<uint32_t>(abs(blit_region.dstOffsets[1].x - blit_region.dstOffsets[0].x)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].y - blit_region.dstOffsets[0].y)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].z - blit_region.dstOffsets[0].z))};
-        UpdateImageAccessState(context, dst_image_state, SYNC_BLIT_TRANSFER_WRITE, RangeFromLayers(blit_region.dstSubresource),
-                               offset, extent, dst_tag_ex);
-    }
+    auto command =
+        MakeImageBlitCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                             cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordBlitImage2(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                              VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                              const VkImageBlit2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& blit_region : vvl::make_span(regions, region_count)) {
-        VkOffset3D offset = {std::min(blit_region.srcOffsets[0].x, blit_region.srcOffsets[1].x),
-                             std::min(blit_region.srcOffsets[0].y, blit_region.srcOffsets[1].y),
-                             std::min(blit_region.srcOffsets[0].z, blit_region.srcOffsets[1].z)};
-        VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.srcOffsets[1].x - blit_region.srcOffsets[0].x)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].y - blit_region.srcOffsets[0].y)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].z - blit_region.srcOffsets[0].z))};
-        UpdateImageAccessState(context, src_image_state, SYNC_BLIT_TRANSFER_READ, RangeFromLayers(blit_region.srcSubresource),
-                               offset, extent, src_tag_ex);
-
-        offset = {std::min(blit_region.dstOffsets[0].x, blit_region.dstOffsets[1].x),
-                  std::min(blit_region.dstOffsets[0].y, blit_region.dstOffsets[1].y),
-                  std::min(blit_region.dstOffsets[0].z, blit_region.dstOffsets[1].z)};
-        extent = {static_cast<uint32_t>(abs(blit_region.dstOffsets[1].x - blit_region.dstOffsets[0].x)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].y - blit_region.dstOffsets[0].y)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].z - blit_region.dstOffsets[0].z))};
-        UpdateImageAccessState(context, dst_image_state, SYNC_BLIT_TRANSFER_WRITE, RangeFromLayers(blit_region.dstSubresource),
-                               offset, extent, dst_tag_ex);
-    }
+    auto command =
+        MakeImageBlitCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                             cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordResolveImage(vvl::Image& src_image_state, vvl::Image& dst_image_state, uint32_t region_count,
                                                const VkImageResolve* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& resolve_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_RESOLVE_TRANSFER_READ, RangeFromLayers(resolve_region.srcSubresource),
-                               resolve_region.srcOffset, resolve_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_RESOLVE_TRANSFER_WRITE,
-                               RangeFromLayers(resolve_region.dstSubresource), resolve_region.dstOffset, resolve_region.extent,
-                               dst_tag_ex);
-    }
+    auto command =
+        MakeImageResolveCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                                cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordResolveImage2(vvl::Image& src_image_state, vvl::Image& dst_image_state, uint32_t region_count,
                                                 const VkImageResolve2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& resolve_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_RESOLVE_TRANSFER_READ, RangeFromLayers(resolve_region.srcSubresource),
-                               resolve_region.srcOffset, resolve_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_RESOLVE_TRANSFER_WRITE,
-                               RangeFromLayers(resolve_region.dstSubresource), resolve_region.dstOffset, resolve_region.extent,
-                               dst_tag_ex);
-    }
+    auto command =
+        MakeImageResolveCommand(cb_context.GetSyncState().Get<vvl::Image>(src_image_state.VkHandle()),
+                                cb_context.GetSyncState().Get<vvl::Image>(dst_image_state.VkHandle()), region_count, regions);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordClearColorImage(vvl::Image& image_state, VkImageLayout, const VkClearColorValue*,
                                                   uint32_t range_count, const VkImageSubresourceRange* ranges,
                                                   const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    cb_context.AddCommandHandle(tag, image_state.Handle());
-
-    for (uint32_t index = 0; index < range_count; index++) {
-        const auto& range = ranges[index];
-        UpdateImageAccessState(context, image_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag);
-    }
+    auto command = MakeImageClearCommand(cb_context.GetSyncState().Get<vvl::Image>(image_state.VkHandle()), range_count, ranges);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordClearDepthStencilImage(vvl::Image& image_state, VkImageLayout, const VkClearDepthStencilValue*,
                                                          uint32_t range_count, const VkImageSubresourceRange* ranges,
                                                          const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    cb_context.AddCommandHandle(tag, image_state.Handle());
-
-    for (uint32_t index = 0; index < range_count; index++) {
-        const auto& range = ranges[index];
-        UpdateImageAccessState(context, image_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag);
-    }
+    auto command = MakeImageClearCommand(cb_context.GetSyncState().Get<vvl::Image>(image_state.VkHandle()), range_count, ranges);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordClearAttachments(uint32_t attachment_count, const VkClearAttachment* pAttachments,
                                                    uint32_t rect_count, const VkClearRect* pRects, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-
+    ResourceAccessCommand command;
     for (const auto& attachment : vvl::make_span(pAttachments, attachment_count)) {
-        for (const auto& rect : vvl::make_span(pRects, rect_count)) {
-            cb_context.RecordClearAttachment(tag, attachment, rect);
+        for (const auto [rect_index, rect] : vvl::enumerate(pRects, rect_count)) {
+            command.Append(cb_context.MakeClearAttachmentAccessCommand(attachment, rect_index, rect));
         }
     }
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordFillBuffer(vvl::Buffer& buffer_state, VkDeviceSize offset, VkDeviceSize size,
                                              const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     const AccessRange range = MakeRange(buffer_state, offset, size);
-    const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
-    context.UpdateAccessState(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command =
+        MakeBufferAccessCommand(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, 0, {}, "dstBuffer ");
+    const auto tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
+    if (cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), cb_context.GetCbAccessContext(), tag_ex);
+    }
+    cb_context.AddRecordedCommand(tag, command, tag_ex.handle_index);
 }
 
 void CommandBufferSubState::RecordUpdateBuffer(vvl::Buffer& buffer_state, VkDeviceSize offset, VkDeviceSize size,
                                                const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     // VK_WHOLE_SIZE not allowed
     const AccessRange range = MakeRange(offset, size);
-    const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
-    context.UpdateAccessState(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command =
+        MakeBufferAccessCommand(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, 0, {}, "dstBuffer ");
+    const auto tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
+    if (cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), cb_context.GetCbAccessContext(), tag_ex);
+    }
+    cb_context.AddRecordedCommand(tag, command, tag_ex.handle_index);
 }
 
 void CommandBufferSubState::RecordDecodeVideo(vvl::VideoSession& vs_state, const VkVideoDecodeInfoKHR& decode_info,
                                               const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    if (auto src_buffer = base.dev_data.Get<vvl::Buffer>(decode_info.srcBuffer)) {
-        const AccessRange src_range = MakeRange(*src_buffer, decode_info.srcBufferOffset, decode_info.srcBufferRange);
-        const ResourceUsageTagEx src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer->Handle());
-        context.UpdateAccessState(*src_buffer, SYNC_VIDEO_DECODE_VIDEO_DECODE_READ, src_range, src_tag_ex);
-    }
-
-    const vvl::DeviceState* device_state = cb_context.GetSyncState().device_state;
-    auto dst_resource = vvl::VideoPictureResource(*device_state, decode_info.dstPictureResource);
-    if (dst_resource) {
-        UpdateVideoAccessState(context, vs_state, dst_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_WRITE, tag);
-    }
-
-    if (decode_info.pSetupReferenceSlot != nullptr && decode_info.pSetupReferenceSlot->pPictureResource != nullptr) {
-        auto setup_resource = vvl::VideoPictureResource(*device_state, *decode_info.pSetupReferenceSlot->pPictureResource);
-        if (setup_resource && (setup_resource != dst_resource)) {
-            UpdateVideoAccessState(context, vs_state, setup_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_WRITE, tag);
-        }
-    }
-
-    for (uint32_t i = 0; i < decode_info.referenceSlotCount; ++i) {
-        if (decode_info.pReferenceSlots[i].pPictureResource != nullptr) {
-            auto reference_resource = vvl::VideoPictureResource(*device_state, *decode_info.pReferenceSlots[i].pPictureResource);
-            if (reference_resource) {
-                UpdateVideoAccessState(context, vs_state, reference_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_READ, tag);
-            }
-        }
-    }
+    auto command = cb_context.GetSyncState().MakeDecodeVideoAccessCommand(cb_context.GetCBState(), decode_info);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordEncodeVideo(vvl::VideoSession& vs_state, const VkVideoEncodeInfoKHR& encode_info,
                                               const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    if (auto src_buffer = base.dev_data.Get<vvl::Buffer>(encode_info.dstBuffer)) {
-        const AccessRange src_range = MakeRange(*src_buffer, encode_info.dstBufferOffset, encode_info.dstBufferRange);
-        const ResourceUsageTagEx src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer->Handle());
-        context.UpdateAccessState(*src_buffer, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_WRITE, src_range, src_tag_ex);
-    }
-
-    const vvl::DeviceState* device_state = cb_context.GetSyncState().device_state;
-    auto src_resource = vvl::VideoPictureResource(*device_state, encode_info.srcPictureResource);
-    if (src_resource) {
-        UpdateVideoAccessState(context, vs_state, src_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, tag);
-    }
-
-    if (encode_info.pSetupReferenceSlot != nullptr && encode_info.pSetupReferenceSlot->pPictureResource != nullptr) {
-        auto setup_resource = vvl::VideoPictureResource(*device_state, *encode_info.pSetupReferenceSlot->pPictureResource);
-        if (setup_resource) {
-            UpdateVideoAccessState(context, vs_state, setup_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_WRITE, tag);
-        }
-    }
-
-    for (uint32_t i = 0; i < encode_info.referenceSlotCount; ++i) {
-        if (encode_info.pReferenceSlots[i].pPictureResource != nullptr) {
-            auto reference_resource = vvl::VideoPictureResource(*device_state, *encode_info.pReferenceSlots[i].pPictureResource);
-            if (reference_resource) {
-                UpdateVideoAccessState(context, vs_state, reference_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, tag);
-            }
-        }
-    }
-
-    if (encode_info.flags & (VK_VIDEO_ENCODE_WITH_QUANTIZATION_DELTA_MAP_BIT_KHR | VK_VIDEO_ENCODE_WITH_EMPHASIS_MAP_BIT_KHR)) {
-        auto quantization_map_info = vku::FindStructInPNextChain<VkVideoEncodeQuantizationMapInfoKHR>(encode_info.pNext);
-        if (quantization_map_info) {
-            auto image_view_state = base.dev_data.Get<vvl::ImageView>(quantization_map_info->quantizationMap);
-            if (image_view_state) {
-                VkOffset3D offset = {0, 0, 0};
-                VkExtent3D extent = {quantization_map_info->quantizationMapExtent.width,
-                                     quantization_map_info->quantizationMapExtent.height, 1};
-                ImageRangeGen range_gen(MakeImageRangeGen(*image_view_state, offset, extent));
-                context.UpdateAccessState(range_gen, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, ResourceUsageTagEx{tag});
-            }
-        }
-    }
+    auto command = cb_context.GetSyncState().MakeEncodeVideoAccessCommand(cb_context.GetCBState(), encode_info);
+    command.Record(cb_context, tag, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.AddRecordedCommand(tag, std::move(command));
 }
 
 void CommandBufferSubState::RecordCopyQueryPoolResults(vvl::QueryPool& pool_state, vvl::Buffer& dst_buffer_state,
@@ -1973,13 +1673,16 @@ void CommandBufferSubState::RecordCopyQueryPoolResults(vvl::QueryPool& pool_stat
         return;
     }
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     const uint32_t query_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
     const VkDeviceSize range_size = (query_count - 1) * stride + query_size;
     const AccessRange range = MakeRange(dst_offset, range_size);
-    const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-    context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command = MakeBufferAccessCommand(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, range, 0,
+                                                                pool_state.VkHandle(), "dstBuffer ");
+    const auto tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
+    if (cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), cb_context.GetCbAccessContext(), tag_ex);
+    }
+    cb_context.AddRecordedCommand(tag, command, tag_ex.handle_index);
 
     // TODO:Track VkQueryPool
 }
@@ -2002,10 +1705,20 @@ void CommandBufferSubState::RecordBeginRenderPass(const VkRenderPassBeginInfo& r
         attachments = validator.device_state->GetAttachmentViews(render_pass_begin, *fb_state);
     }
 
+    RenderPassCommand command;
+    command.type = RenderPassCommand::Type::kBegin;
+    command.render_pass = rp_state;
+    command.attachments = attachments;
+    command.render_area = render_pass_begin.renderArea;
+    command.render_pass_instance_id = cb_context.GetCurrentRenderPassInstanceId();
+    command.command = loc.function;
     const ResourceUsageTag begin_tag =
-        cb_context.RecordBeginRenderPass(loc.function, *rp_state, render_pass_begin.renderArea, attachments);
+        command.Record(cb_context, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+
     const RenderPassAccessContext* rp_context = cb_context.GetCurrentRenderPassContext();
     cb_context.AddReplayEntry(begin_tag, true, ReplayContextChange(std::move(rp_state), std::move(attachments), rp_context));
+    cb_context.AddRecordedCommand(begin_tag, std::move(command));
+    cb_context.AddRecordedCommand(begin_tag + 1, NoOpCommand{});
 }
 
 void CommandBufferSubState::RecordNextSubpass(const VkSubpassBeginInfo& subpass_begin_info,
@@ -2016,8 +1729,17 @@ void CommandBufferSubState::RecordNextSubpass(const VkSubpassBeginInfo& subpass_
     if (!cb_context.GetCurrentRenderPassContext()) {
         return;  // [core validation check]: begin render pass was not called
     }
-    const ResourceUsageTag tag = cb_context.RecordNextSubpass(loc.function);
-    cb_context.AddReplayEntry(tag, true, ReplayContextChange(ReplayContextChange::Type::kNextSubpass));
+    RenderPassCommand command;
+    command.type = RenderPassCommand::Type::kNext;
+    command.command = loc.function;
+    const ResourceUsageTag resolve_tag =
+        command.Record(cb_context, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+
+    cb_context.AddReplayEntry(resolve_tag + 2, true, ReplayContextChange(ReplayContextChange::Type::kNextSubpass));
+    cb_context.AddRecordedCommand(resolve_tag, std::move(command));
+    cb_context.AddRecordedCommand(resolve_tag + 1, NoOpCommand{});
+    cb_context.AddRecordedCommand(resolve_tag + 2, NoOpCommand{});
+    cb_context.AddRecordedCommand(resolve_tag + 3, NoOpCommand{});
 }
 
 void CommandBufferSubState::RecordEndRenderPass(const VkSubpassEndInfo* subpass_end_info, const Location& loc) {
@@ -2027,20 +1749,30 @@ void CommandBufferSubState::RecordEndRenderPass(const VkSubpassEndInfo* subpass_
     if (!cb_context.GetCurrentRenderPassContext()) {
         return;  // [core validation check]: begin render pass was not called
     }
-    const ResourceUsageTag tag = cb_context.RecordEndRenderPass(loc.function);
-    cb_context.AddReplayEntry(tag, true, ReplayContextChange(ReplayContextChange::Type::kEndRenderPass));
+    RenderPassCommand command;
+    command.type = RenderPassCommand::Type::kEnd;
+    command.command = loc.function;
+    const ResourceUsageTag store_tag =
+        command.Record(cb_context, cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+
+    cb_context.AddReplayEntry(store_tag + 1, true, ReplayContextChange(ReplayContextChange::Type::kEndRenderPass));
+    cb_context.AddRecordedCommand(store_tag, std::move(command));
+    cb_context.AddRecordedCommand(store_tag + 1, NoOpCommand{});
 }
 
 void CommandBufferSubState::RecordExecuteCommand(vvl::CommandBuffer& secondary_command_buffer, uint32_t cmd_index,
                                                  const Location& loc) {
+    ResourceUsageTag cb_tag;
     if (cmd_index == 0) {
-        ResourceUsageTag cb_tag = cb_context.NextCommandTag(loc.function, SubCommandType::kIndex);
+        cb_tag = cb_context.NextCommandTag(loc.function, SubCommandType::kIndex);
         cb_context.AddCommandHandleIndexed(cb_tag, secondary_command_buffer.Handle(), cmd_index);
     } else {
-        ResourceUsageTag cb_tag = cb_context.NextSubCommandTag(loc.function, SubCommandType::kIndex);
+        cb_tag = cb_context.NextSubCommandTag(loc.function, SubCommandType::kIndex);
         cb_context.AddSubcommandHandleIndexed(cb_tag, secondary_command_buffer.Handle(), cmd_index);
     }
-    cb_context.RecordExecutedCommandBuffer(GetCommandBufferContext(secondary_command_buffer));
+    cb_context.AddRecordedCommand(cb_tag, NoOpCommand{});
+    cb_context.RecordExecutedCommandBuffer(GetCommandBufferContext(secondary_command_buffer),
+                                           cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
 }
 
 }  // namespace syncval

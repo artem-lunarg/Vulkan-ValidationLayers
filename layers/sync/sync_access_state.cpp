@@ -523,7 +523,7 @@ void AccessState::Resolve(const AccessState& other) {
 }
 
 void AccessState::Update(const SyncAccessInfo& usage_info, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                         SyncFlags flags) {
+                         SyncFlags flags, QueueId queue_id) {
     const VkPipelineStageFlagBits2 usage_stage = usage_info.stage_mask;
     if (IsRead(usage_info.access_index)) {
         // Mulitple outstanding reads may be of interest and do dependency chains independently
@@ -532,7 +532,7 @@ void AccessState::Update(const SyncAccessInfo& usage_info, const AttachmentAcces
             const auto not_usage_stage = ~usage_stage;
             for (auto& read_access : GetReads()) {
                 if (read_access.stage == usage_stage) {
-                    read_access.Set(usage_stage, usage_info.access_index, attachment_access, tag_ex);
+                    read_access.Set(usage_stage, usage_info.access_index, attachment_access, tag_ex, queue_id);
                 } else if (read_access.barriers & usage_stage) {
                     // If the current access is barriered to this stage, mark it as "known to happen after"
                     read_access.sync_stages |= usage_stage;
@@ -550,7 +550,7 @@ void AccessState::Update(const SyncAccessInfo& usage_info, const AttachmentAcces
                 }
             }
             ReadState new_read_state;
-            new_read_state.Set(usage_stage, usage_info.access_index, attachment_access, tag_ex);
+            new_read_state.Set(usage_stage, usage_info.access_index, attachment_access, tag_ex, queue_id);
             AddRead(new_read_state);
             last_read_stages |= usage_stage;
         }
@@ -561,7 +561,7 @@ void AccessState::Update(const SyncAccessInfo& usage_info, const AttachmentAcces
             input_attachment_read = (usage_info.access_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ);
         }
     } else {
-        SetWrite(usage_info.access_index, attachment_access, tag_ex, flags);
+        SetWrite(usage_info.access_index, attachment_access, tag_ex, flags, queue_id);
     }
     UpdateFirst(tag_ex, usage_info, attachment_access, flags);
 }
@@ -595,12 +595,12 @@ bool HazardResult::IsWAWHazard() const {
 // if the last_reads/last_write were unsafe, we've reported them, in either case the prior access is irrelevant.
 // We can overwrite them as *this* write is now after them.
 void AccessState::SetWrite(SyncAccessIndex access_index, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                           SyncFlags flags) {
+                           SyncFlags flags, QueueId queue_id) {
     ClearRead();
     if (!last_write.has_value()) {
         last_write.emplace();
     }
-    last_write->Set(access_index, attachment_access, tag_ex, flags);
+    last_write->Set(access_index, attachment_access, tag_ex, flags, queue_id);
 }
 
 void AccessState::ClearWrite() { last_write.reset(); }
@@ -628,7 +628,8 @@ void AccessState::ClearFirstUse() {
 }
 
 bool AccessState::ApplyBarrier(const BarrierScope& barrier_scope, const SyncBarrier& barrier, bool layout_transition,
-                               uint32_t layout_transition_handle_index, ResourceUsageTag layout_transition_tag) {
+                               uint32_t layout_transition_handle_index, ResourceUsageTag layout_transition_tag,
+                               QueueId layout_transition_queue) {
     // Dedicated layout transition barrier logic
     if (layout_transition) {
         const SyncAccessInfo& layout_transition_access_info = GetAccessInfo(SYNC_IMAGE_LAYOUT_TRANSITION);
@@ -636,7 +637,7 @@ bool AccessState::ApplyBarrier(const BarrierScope& barrier_scope, const SyncBarr
         const OrderingBarrier layout_ordering{barrier.src_exec_scope.exec_scope, barrier.src_access_scope};
 
         // Register write access that models layout transition writes
-        SetWrite(SYNC_IMAGE_LAYOUT_TRANSITION, AttachmentAccess::NonAttachment(), tag_ex);
+        SetWrite(SYNC_IMAGE_LAYOUT_TRANSITION, AttachmentAccess::NonAttachment(), tag_ex, 0, layout_transition_queue);
         UpdateFirst(tag_ex, layout_transition_access_info, AttachmentAccess::NonAttachment());
         TouchupFirstForLayoutTransition(layout_transition_tag, layout_ordering);
 
@@ -677,11 +678,13 @@ bool AccessState::ApplyBarrier(const BarrierScope& barrier_scope, const SyncBarr
 }
 
 void AccessState::CollectPendingBarriers(const BarrierScope& barrier_scope, const SyncBarrier& barrier, bool layout_transition,
-                                         uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers) {
+                                         uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers,
+                                         QueueId layout_transition_queue) {
     if (layout_transition) {
         // Schedule layout transition first: layout transition creates WriteState if necessary
         const OrderingBarrier layout_transition_ordering_barrier{barrier.src_exec_scope.exec_scope, barrier.src_access_scope};
-        pending_barriers.AddLayoutTransition(this, layout_transition_ordering_barrier, layout_transition_handle_index);
+        pending_barriers.AddLayoutTransition(this, layout_transition_ordering_barrier, layout_transition_handle_index,
+                                             layout_transition_queue);
 
         // Apply barrier over layout trasition's write access
         pending_barriers.AddWriteBarrier(this, barrier);
@@ -752,7 +755,7 @@ void PendingBarriers::AddWriteBarrier(AccessState* access_state, const SyncBarri
 }
 
 void PendingBarriers::AddLayoutTransition(AccessState* access_state, const OrderingBarrier& layout_transition_ordering_barrier,
-                                          uint32_t layout_transition_handle_index) {
+                                          uint32_t layout_transition_handle_index, QueueId queue_id) {
     // NOTE: in contrast to read/write barriers, we don't do reuse search here,
     // mostly because we didn't see a beneficial use case yet.
     // Storing handle index can be a hint it would be harder to find duplicates.
@@ -764,6 +767,7 @@ void PendingBarriers::AddLayoutTransition(AccessState* access_state, const Order
     PendingLayoutTransition& layout_transition = layout_transitions.emplace_back();
     layout_transition.ordering = layout_transition_ordering_barrier;
     layout_transition.handle_index = layout_transition_handle_index;
+    layout_transition.queue_id = queue_id;
 }
 
 void PendingBarriers::Apply(const ResourceUsageTag exec_tag) {
@@ -783,13 +787,13 @@ void PendingBarriers::Apply(const ResourceUsageTag exec_tag) {
 }
 
 void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& barriers, bool layout_transition,
-                   ResourceUsageTag layout_transition_tag) {
+                   ResourceUsageTag layout_transition_tag, QueueId layout_transition_queue) {
     // The common case of a single barrier.
     // The pending barrier helper is unnecessary because there are no independent barriers to track.
     // The barrier can be applied directly to the access state.
     if (barriers.size() == 1) {
-        access_state.ApplyBarrier(BarrierScope(barriers[0]), barriers[0], layout_transition, vvl::kNoIndex32,
-                                  layout_transition_tag);
+        access_state.ApplyBarrier(BarrierScope(barriers[0], layout_transition_queue), barriers[0], layout_transition,
+                                  vvl::kNoIndex32, layout_transition_tag);
         return;
     }
 
@@ -806,7 +810,7 @@ void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& ba
             layout_ordering_barrier.exec_scope |= barrier.src_exec_scope.exec_scope;
             layout_ordering_barrier.access_scope |= barrier.src_access_scope;
         }
-        pending_barriers.AddLayoutTransition(&access_state, layout_ordering_barrier, vvl::kNoIndex32);
+        pending_barriers.AddLayoutTransition(&access_state, layout_ordering_barrier, vvl::kNoIndex32, layout_transition_queue);
 
         for (const SyncBarrier& barrier : barriers) {
             pending_barriers.AddWriteBarrier(&access_state, barrier);
@@ -853,7 +857,7 @@ void AccessState::ApplyPendingWriteBarrier(const PendingWriteBarrier& write_barr
 void AccessState::ApplyPendingLayoutTransition(const PendingLayoutTransition& layout_transition, ResourceUsageTag tag) {
     const SyncAccessInfo& layout_usage_info = GetAccessInfo(SYNC_IMAGE_LAYOUT_TRANSITION);
     const ResourceUsageTagEx tag_ex = ResourceUsageTagEx{tag, layout_transition.handle_index};
-    SetWrite(SYNC_IMAGE_LAYOUT_TRANSITION, AttachmentAccess::NonAttachment(), tag_ex);
+    SetWrite(SYNC_IMAGE_LAYOUT_TRANSITION, AttachmentAccess::NonAttachment(), tag_ex, 0, layout_transition.queue_id);
     UpdateFirst(tag_ex, layout_usage_info, AttachmentAccess::NonAttachment());
     TouchupFirstForLayoutTransition(tag, layout_transition.ordering);
 }
@@ -1098,7 +1102,7 @@ void AccessState::TouchupFirstForLayoutTransition(ResourceUsageTag tag, const Or
 }
 
 void ReadState::Set(VkPipelineStageFlagBits2 stage, SyncAccessIndex access_index, const AttachmentAccess& attachment_access,
-                    ResourceUsageTagEx tag_ex) {
+                    ResourceUsageTagEx tag_ex, QueueId queue_id) {
     assert(access_index != SYNC_ACCESS_INDEX_NONE);
     this->stage = stage;
     this->access_index = access_index;
@@ -1107,7 +1111,7 @@ void ReadState::Set(VkPipelineStageFlagBits2 stage, SyncAccessIndex access_index
     sync_stages = VK_PIPELINE_STAGE_2_NONE;
     tag = tag_ex.tag;
     handle_index = tag_ex.handle_index;
-    queue = kQueueIdInvalid;
+    queue = queue_id;
 }
 
 // Scope test including "queue submission order" effects.  Specifically, accesses from a different queue are not
@@ -1144,14 +1148,14 @@ bool ReadState::InBarrierSourceScope(const BarrierScope& barrier_scope) const {
 }
 
 void WriteState::Set(SyncAccessIndex access_index, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                     SyncFlags flags) {
+                     SyncFlags flags, QueueId queue_id) {
     this->access_index = access_index;
     this->attachment_access = attachment_access;
     barriers.reset();
     dependency_chain = VK_PIPELINE_STAGE_2_NONE;
     tag = tag_ex.tag;
     handle_index = tag_ex.handle_index;
-    queue = kQueueIdInvalid;
+    queue = queue_id;
     this->flags = flags;
 }
 

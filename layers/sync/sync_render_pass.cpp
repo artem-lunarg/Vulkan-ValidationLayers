@@ -16,6 +16,7 @@
  */
 
 #include <vulkan/utility/vk_format_utils.h>
+#include "sync/sync_command.h"
 #include "sync/sync_render_pass.h"
 #include "sync/sync_validation.h"
 #include "sync/sync_replay.h"
@@ -26,24 +27,41 @@
 
 namespace syncval {
 
+static bool WasValidatedAtRecordTime(const HazardResult& hazard, const ResourceUsageRange& record_time_validated_tags) {
+    // Temporary render pass accesses (layout transitions and store/resolve proxies) deliberately use kInvalidTag. They are
+    // nevertheless local to this command buffer and were validated at record time whenever the suppression range is non-empty.
+    return record_time_validated_tags.includes(hazard.Tag()) ||
+           (hazard.Tag() == kInvalidTag && record_time_validated_tags.non_empty());
+}
+
 class ValidateResolveAction {
   public:
     ValidateResolveAction(VkRenderPass render_pass, uint32_t subpass, uint32_t view_mask, const AccessContext& access_context,
-                          const CommandBufferContext& cb_context, vvl::Func command)
+                          const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                          const ResourceUsageRange& record_time_validated_tags, vvl::Func command, ResourceUsageTag replay_tag,
+                          const Location* replay_loc)
         : render_pass_(render_pass),
           subpass_(subpass),
           view_mask_(view_mask),
           context_(access_context),
           cb_context_(cb_context),
+          env_(env),
+          record_time_validated_tags_(record_time_validated_tags),
           command_(command),
+          replay_tag_(replay_tag),
+          replay_loc_(replay_loc),
           skip_(false) {}
 
     void operator()(const char* aspect_name, const char* resolve_action_name, uint32_t src_at, uint32_t dst_at,
                     const AttachmentViewGen& view_gen, AttachmentViewGen::Gen gen_type, SyncAccessIndex current_usage,
                     const AttachmentAccess& attachment_access) {
         const HazardResult hazard =
-            context_.DetectAttachmentHazard(view_gen, gen_type, current_usage, attachment_access, view_mask_);
-        if (hazard.IsHazard()) {
+            context_.DetectAttachmentHazard(view_gen, gen_type, current_usage, attachment_access, view_mask_, env_.queue_id);
+        if (hazard.IsHazard() && !WasValidatedAtRecordTime(hazard, record_time_validated_tags_)) {
+            if (replay_loc_) {
+                skip_ |= ReportReplayHazard(env_, cb_context_, hazard, replay_tag_, NullVulkanTypedHandle, *replay_loc_);
+                return;
+            }
             const Location loc(command_);
 
             const SyncValidator& validator = cb_context_.GetSyncState();
@@ -53,8 +71,7 @@ class ValidateResolveAction {
             ss << " (" << resolve_action_name << " of " << aspect_name << " multisample attachment " << src_at;
             ss << " in subpass " << subpass_ << " of " << validator.FormatHandle(render_pass_) << ")";
             const std::string resource_description = ss.str();
-            const auto error =
-                validator.error_messages_.RenderPassResolveError(hazard, cb_context_, command_, resource_description);
+            const auto error = validator.error_messages_.RenderPassResolveError(env_, hazard, command_, resource_description);
             skip_ |= validator.SyncError(hazard.Hazard(), render_pass_, loc, error);
         }
     }
@@ -67,24 +84,29 @@ class ValidateResolveAction {
     const uint32_t view_mask_;
     const AccessContext& context_;
     const CommandBufferContext& cb_context_;
+    const SyncEnvironment& env_;
+    const ResourceUsageRange& record_time_validated_tags_;
     vvl::Func command_;
+    const ResourceUsageTag replay_tag_;
+    const Location* replay_loc_;
     bool skip_;
 };
 
 class UpdateStateResolveAction {
   public:
-    UpdateStateResolveAction(AccessContext& context, uint32_t view_mask, ResourceUsageTag tag)
-        : context_(context), view_mask_(view_mask), tag_(tag) {}
+    UpdateStateResolveAction(AccessContext& context, uint32_t view_mask, ResourceUsageTag tag, QueueId queue_id)
+        : context_(context), view_mask_(view_mask), tag_(tag), queue_id_(queue_id) {}
     void operator()(const char*, const char*, uint32_t, uint32_t, const AttachmentViewGen& view_gen,
                     AttachmentViewGen::Gen gen_type, SyncAccessIndex current_usage, const AttachmentAccess& attachment_access) {
         context_.UpdateAttachmentAccessState(view_gen, gen_type, current_usage, attachment_access, ResourceUsageTagEx{tag_},
-                                             view_mask_);
+                                             view_mask_, queue_id_);
     }
 
   private:
     AccessContext& context_;
     const uint32_t view_mask_;
     const ResourceUsageTag tag_;
+    const QueueId queue_id_;
 };
 
 std::unique_ptr<AccessContext[]> InitSubpassContexts(VkQueueFlags queue_flags, const vvl::RenderPass& rp_state,
@@ -152,21 +174,23 @@ static std::optional<uint32_t> FilterViewMask(uint32_t view_mask, uint32_t subpa
 // Caller must manage returned pointer
 static AccessContext* CreateStoreResolveProxyContext(const AccessContext& context, const vvl::RenderPass& rp_state,
                                                      uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
-                                                     const AttachmentViewGenVector& attachment_views) {
+                                                     const AttachmentViewGenVector& attachment_views, QueueId queue_id) {
     auto* proxy = new AccessContext(*context.validator);
     proxy->InitFrom(context);
     RenderPassAccessContext::UpdateAttachmentResolveAccess(rp_state, attachment_views, render_pass_instance_id, subpass, view_mask,
-                                                           kInvalidTag, *proxy);
+                                                           kInvalidTag, *proxy, queue_id);
     RenderPassAccessContext::UpdateAttachmentStoreAccess(rp_state, attachment_views, render_pass_instance_id, subpass, view_mask,
-                                                         kInvalidTag, *proxy);
+                                                         kInvalidTag, *proxy, queue_id);
     return proxy;
 }
 
 // Layout transitions are handled as if the were occuring in the beginning of the next subpass
-bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferContext& cb_context, const AccessContext& access_context,
-                                                        const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id,
-                                                        uint32_t subpass, uint32_t view_mask,
-                                                        const AttachmentViewGenVector& attachment_views, vvl::Func command) {
+bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                        const ResourceUsageRange& record_time_validated_tags,
+                                                        const AccessContext& access_context, const vvl::RenderPass& rp_state,
+                                                        uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
+                                                        const AttachmentViewGenVector& attachment_views, vvl::Func command,
+                                                        ResourceUsageTag replay_tag, const Location* replay_loc) {
     bool skip = false;
     // As validation methods are const and precede the record/update phase, for any tranistions from the immediately
     // previous subpass, we have to validate them against a copy of the AccessContext, with resolve operations applied, as
@@ -192,14 +216,19 @@ bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferConte
                 // each time when needed. Write a test that exposes this and make a fix.
                 src_context_proxy.reset(CreateStoreResolveProxyContext(*subpass_barrier.src_subpass_context, rp_state,
                                                                        render_pass_instance_id, transition.src_subpass, view_mask,
-                                                                       attachment_views));
+                                                                       attachment_views, env.queue_id));
                 proxy_subpass_barrier = subpass_barrier;
                 proxy_subpass_barrier.src_subpass_context = src_context_proxy.get();
             }
             p_subpass_barrier = &proxy_subpass_barrier;
         }
-        auto hazard = access_context.DetectSubpassTransitionHazard(*p_subpass_barrier, attachment_views[transition.attachment]);
-        if (hazard.IsHazard()) {
+        auto hazard =
+            access_context.DetectSubpassTransitionHazard(*p_subpass_barrier, attachment_views[transition.attachment], env.queue_id);
+        if (hazard.IsHazard() && !WasValidatedAtRecordTime(hazard, record_time_validated_tags)) {
+            if (replay_loc) {
+                skip |= ReportReplayHazard(env, cb_context, hazard, replay_tag, NullVulkanTypedHandle, *replay_loc);
+                continue;
+            }
             const SyncValidator& sync_state = cb_context.GetSyncState();
             const Location loc(command);
 
@@ -216,12 +245,12 @@ bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferConte
 
             if (hazard.Tag() == kInvalidTag) {
                 const auto error = sync_state.error_messages_.RenderPassLayoutTransitionVsResolveError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout,
+                    env, hazard, rp_state.VkHandle(), command, resource_description, transition.old_layout, transition.new_layout,
                     transition.src_subpass);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
             } else {
                 const auto error = sync_state.error_messages_.RenderPassLayoutTransitionError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout);
+                    env, hazard, command, resource_description, transition.old_layout, transition.new_layout);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
             }
         }
@@ -229,10 +258,12 @@ bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferConte
     return skip;
 }
 
-bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& cb_context, const AccessContext& access_context,
-                                                    const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id,
-                                                    uint32_t subpass, uint32_t view_mask,
-                                                    const AttachmentViewGenVector& attachment_views, vvl::Func command) {
+bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                    const ResourceUsageRange& record_time_validated_tags,
+                                                    const AccessContext& access_context, const vvl::RenderPass& rp_state,
+                                                    uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
+                                                    const AttachmentViewGenVector& attachment_views, vvl::Func command,
+                                                    ResourceUsageTag replay_tag, const Location* replay_loc) {
     bool skip = false;
 
     AttachmentAccess attachment_access;
@@ -265,25 +296,31 @@ bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& 
             if (is_color && (load_index != SYNC_ACCESS_INDEX_NONE)) {
                 attachment_access.ordering = SyncOrdering::kColorAttachment;
                 hazard = access_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kRenderArea, load_index,
-                                                               attachment_access, *filtered_view_mask);
+                                                               attachment_access, *filtered_view_mask, env.queue_id);
                 aspect = "color";
             } else {
                 if (has_depth && (load_index != SYNC_ACCESS_INDEX_NONE)) {
                     attachment_access.ordering = SyncOrdering::kDepthStencilAttachment;
-                    hazard = access_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea,
-                                                                   load_index, attachment_access, *filtered_view_mask);
+                    hazard =
+                        access_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea, load_index,
+                                                              attachment_access, *filtered_view_mask, env.queue_id);
                     aspect = "depth";
                 }
                 if (!hazard.IsHazard() && has_stencil && (stencil_load_index != SYNC_ACCESS_INDEX_NONE)) {
                     attachment_access.ordering = SyncOrdering::kDepthStencilAttachment;
                     hazard = access_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kStencilOnlyRenderArea,
-                                                                   stencil_load_index, attachment_access, *filtered_view_mask);
+                                                                   stencil_load_index, attachment_access, *filtered_view_mask,
+                                                                   env.queue_id);
                     aspect = "stencil";
                     checked_stencil = true;
                 }
             }
 
-            if (hazard.IsHazard()) {
+            if (hazard.IsHazard() && !WasValidatedAtRecordTime(hazard, record_time_validated_tags)) {
+                if (replay_loc) {
+                    skip |= ReportReplayHazard(env, cb_context, hazard, replay_tag, NullVulkanTypedHandle, *replay_loc);
+                    continue;
+                }
                 const VkAttachmentLoadOp load_op = checked_stencil ? ci.stencilLoadOp : ci.loadOp;
                 const SyncValidator& sync_state = cb_context.GetSyncState();
                 const Location loc(command);
@@ -298,11 +335,11 @@ bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& 
 
                 if (hazard.Tag() == kInvalidTag) {  // Hazard vs. ILT
                     const auto error = sync_state.error_messages_.RenderPassLoadOpVsLayoutTransitionError(
-                        hazard, cb_context, command, resource_description, load_op, is_color);
+                        env, hazard, command, resource_description, load_op, is_color);
                     skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
                 } else {
                     const std::string error = sync_state.error_messages_.RenderPassLoadOpError(
-                        hazard, cb_context, command, resource_description, subpass, i, load_op, is_color);
+                        env, hazard, command, resource_description, subpass, i, load_op, is_color);
                     skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
                 }
             }
@@ -311,11 +348,34 @@ bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& 
     return skip;
 }
 
+bool RenderPassAccessContext::ValidateBeginRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                      const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                                      ResourceUsageTag replay_base_tag, const Location* replay_loc) const {
+    assert(current_subpass_ == 0);
+    // Tag layout mirrors RecordBeginRenderPass: transitions at the base tag, load operations at the next tag
+    const ResourceUsageTag transition_tag = replay_base_tag;
+    const ResourceUsageTag load_tag = (replay_base_tag != kInvalidTag) ? replay_base_tag + 1 : kInvalidTag;
+    const uint32_t view_mask = rp_state_->create_info.pSubpasses[0].viewMask;
+    bool skip = ValidateLayoutTransitions(cb_context, env, record_time_validated_tags, CurrentContext(), *rp_state_,
+                                          render_pass_instance_id_, 0, view_mask, attachment_views_, command, transition_tag,
+                                          replay_loc);
+    if (!skip) {
+        AccessContext temp_context(cb_context.GetSyncState());
+        temp_context.InitFrom(CurrentContext());
+        RecordLayoutTransitions(*rp_state_, 0, attachment_views_, kInvalidTag, temp_context, env.queue_id);
+        skip |= ValidateLoadOperation(cb_context, env, record_time_validated_tags, temp_context, *rp_state_,
+                                      render_pass_instance_id_, 0, view_mask, attachment_views_, command, load_tag, replay_loc);
+    }
+    return skip;
+}
+
 // Store operation validation can ignore resolve (before it) and layout tranistions after it.  The first is ignored
 // because of the ordering guarantees w.r.t. sample access and that the resolve validation hasn't altered the state, because
 // store is part of the same Next/End operation.
 // The latter is handled in layout transistion validation directly
-bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                     const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                                     ResourceUsageTag replay_tag, const Location* replay_loc) const {
     bool skip = false;
 
     const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kRaster, AttachmentAccessType::StoreOp);
@@ -341,26 +401,30 @@ bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext&
             if (is_color) {
                 hazard = CurrentContext().DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kRenderArea,
                                                                  SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
-                                                                 attachment_access, *filtered_view_mask);
+                                                                 attachment_access, *filtered_view_mask, env.queue_id);
                 aspect = "color";
             } else {
                 const bool stencil_op_stores = ci.stencilStoreOp != VK_ATTACHMENT_STORE_OP_NONE;
                 if (has_depth && store_op_stores) {
                     hazard = CurrentContext().DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea,
                                                                      SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                                     attachment_access, *filtered_view_mask);
+                                                                     attachment_access, *filtered_view_mask, env.queue_id);
                     aspect = "depth";
                 }
                 if (!hazard.IsHazard() && has_stencil && stencil_op_stores) {
                     hazard = CurrentContext().DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kStencilOnlyRenderArea,
                                                                      SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                                     attachment_access, *filtered_view_mask);
+                                                                     attachment_access, *filtered_view_mask, env.queue_id);
                     aspect = "stencil";
                     checked_stencil = true;
                 }
             }
 
-            if (hazard.IsHazard()) {
+            if (hazard.IsHazard() && !WasValidatedAtRecordTime(hazard, record_time_validated_tags)) {
+                if (replay_loc) {
+                    skip |= ReportReplayHazard(env, cb_context, hazard, replay_tag, NullVulkanTypedHandle, *replay_loc);
+                    continue;
+                }
                 const SyncValidator& sync_state = cb_context.GetSyncState();
                 const char* const op_type_string = checked_stencil ? "stencilStoreOp" : "storeOp";
                 const VkAttachmentStoreOp store_op = checked_stencil ? ci.stencilStoreOp : ci.storeOp;
@@ -375,7 +439,7 @@ bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext&
                 const std::string resource_description = ss.str();
 
                 const std::string error =
-                    sync_state.error_messages_.RenderPassStoreOpError(hazard, cb_context, command, resource_description, store_op);
+                    sync_state.error_messages_.RenderPassStoreOpError(env, hazard, command, resource_description, store_op);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             }
         }
@@ -493,10 +557,12 @@ void ResolveOperation(Action& action, const vvl::RenderPass& rp_state, const Att
     }
 }
 
-bool RenderPassAccessContext::ValidateResolveOperations(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateResolveOperations(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                        const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                                        ResourceUsageTag replay_tag, const Location* replay_loc) const {
     const uint32_t view_mask = rp_state_->create_info.pSubpasses[current_subpass_].viewMask;
-    ValidateResolveAction validate_action(rp_state_->VkHandle(), current_subpass_, view_mask, CurrentContext(), cb_context,
-                                          command);
+    ValidateResolveAction validate_action(rp_state_->VkHandle(), current_subpass_, view_mask, CurrentContext(), cb_context, env,
+                                          record_time_validated_tags, command, replay_tag, replay_loc);
     ResolveOperation(validate_action, *rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_);
     return validate_action.GetSkip();
 }
@@ -504,15 +570,17 @@ bool RenderPassAccessContext::ValidateResolveOperations(const CommandBufferConte
 void RenderPassAccessContext::UpdateAttachmentResolveAccess(const vvl::RenderPass& rp_state,
                                                             const AttachmentViewGenVector& attachment_views,
                                                             uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
-                                                            const ResourceUsageTag tag, AccessContext& access_context) {
-    UpdateStateResolveAction update(access_context, view_mask, tag);
+                                                            const ResourceUsageTag tag, AccessContext& access_context,
+                                                            QueueId queue_id) {
+    UpdateStateResolveAction update(access_context, view_mask, tag, queue_id);
     ResolveOperation(update, rp_state, attachment_views, render_pass_instance_id, subpass);
 }
 
 void RenderPassAccessContext::UpdateAttachmentStoreAccess(const vvl::RenderPass& rp_state,
                                                           const AttachmentViewGenVector& attachment_views,
                                                           uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
-                                                          const ResourceUsageTag tag, AccessContext& access_context) {
+                                                          const ResourceUsageTag tag, AccessContext& access_context,
+                                                          QueueId queue_id) {
     AttachmentAccess attachment_access;
     attachment_access.type = AttachmentAccessType::StoreOp;
     attachment_access.ordering = SyncOrdering::kRaster;
@@ -532,18 +600,20 @@ void RenderPassAccessContext::UpdateAttachmentStoreAccess(const vvl::RenderPass&
             if (is_color && store_op_stores) {
                 access_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kRenderArea,
                                                            SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access,
-                                                           ResourceUsageTagEx{tag}, *filtered_view_mask);
+                                                           ResourceUsageTagEx{tag}, *filtered_view_mask, queue_id);
             } else {
                 if (has_depth && store_op_stores) {
                     access_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea,
                                                                SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                               attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask);
+                                                               attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask,
+                                                               queue_id);
                 }
                 const bool stencil_op_stores = ci.stencilStoreOp != VK_ATTACHMENT_STORE_OP_NONE;
                 if (has_stencil && stencil_op_stores) {
                     access_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kStencilOnlyRenderArea,
                                                                SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                               attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask);
+                                                               attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask,
+                                                               queue_id);
                 }
             }
         }
@@ -552,7 +622,7 @@ void RenderPassAccessContext::UpdateAttachmentStoreAccess(const vvl::RenderPass&
 
 void RenderPassAccessContext::RecordLayoutTransitions(const vvl::RenderPass& rp_state, uint32_t subpass,
                                                       const AttachmentViewGenVector& attachment_views, const ResourceUsageTag tag,
-                                                      AccessContext& access_context) {
+                                                      AccessContext& access_context, QueueId queue_id) {
     const auto& transitions = rp_state.subpass_transitions[subpass];
     for (const auto& transition : transitions) {
         const auto& view_gen = attachment_views[transition.attachment];
@@ -560,7 +630,7 @@ void RenderPassAccessContext::RecordLayoutTransitions(const vvl::RenderPass& rp_
         const AccessContext& src_subpass_context = *subpass_barrier.src_subpass_context;
 
         // Import the attachments into the current context
-        ApplySubpassTransitionBarrierAction barrier_action(subpass_barrier, tag);
+        ApplySubpassTransitionBarrierAction barrier_action(subpass_barrier, tag, queue_id);
         ImageRangeGen attachment_gen = view_gen.GetRangeGen(AttachmentViewGen::Gen::kViewSubresource);
         access_context.ResolveFromSubpassContext(barrier_action, src_subpass_context, attachment_gen);
     }
@@ -571,143 +641,70 @@ static uint32_t GetSubpassDepthStencilAttachmentIndex(const vku::safe_VkPipeline
     return (pipe_ds_ci && depth_stencil_ref) ? depth_stencil_ref->attachment : VK_ATTACHMENT_UNUSED;
 }
 
-bool RenderPassAccessContext::ValidateDrawSubpassAttachment(const CommandBufferContext& cb_context, vvl::Func command) const {
-    bool skip = false;
-    const vvl::CommandBuffer& cmd_buffer = cb_context.GetCBState();
+ResourceAccessCommand RenderPassAccessContext::MakeDrawSubpassAttachmentAccessCommand(const vvl::CommandBuffer& cmd_buffer) const {
+    ResourceAccessCommand command;
     const auto& last_bound_state = cmd_buffer.GetLastBoundGraphics();
     const auto* pipe = last_bound_state.pipeline_state;
-
     if (!pipe || pipe->RasterizationDisabled()) {
-        return skip;
+        return command;
     }
 
-    const auto& list = pipe->fs_writable_output_location_list;
     const auto& subpass = rp_state_->create_info.pSubpasses[current_subpass_];
-    const auto& current_context = CurrentContext();
-    const SyncValidator& sync_state = cb_context.GetSyncState();
-
-    auto report_atachment_hazard = [&sync_state, &cb_context, command](const HazardResult& hazard,
-                                                                       const vvl::ImageView& attachment_view,
-                                                                       std::string_view attachment_description) {
-        const vvl::Image& attachment_image = *attachment_view.image_state;
-        LogObjectList objlist(cb_context.GetCBState().Handle(), attachment_view.Handle(), attachment_image.Handle());
-        const Location loc(command);
-
-        std::ostringstream ss;
-        ss << attachment_description;
-        ss << " (" << sync_state.FormatHandle(attachment_view.Handle());
-        ss << ", " << sync_state.FormatHandle(attachment_image.Handle()) << ")";
-        const std::string resource_description = ss.str();
-
-        const std::string error =
-            sync_state.error_messages_.RenderPassAttachmentError(hazard, cb_context, command, resource_description);
-        return sync_state.SyncError(hazard.Hazard(), objlist, loc, error);
+    auto add_attachment = [&](uint32_t attachment_index, SyncAccessIndex access_index, SyncOrdering ordering,
+                              VkImageAspectFlags aspect_mask, std::string resource_description) {
+        if (attachment_index >= attachment_view_states_.size() || !attachment_view_states_[attachment_index]) {
+            return;
+        }
+        ResourceAccessCommand::ImageViewAccess access;
+        access.image_view = attachment_view_states_[attachment_index];
+        access.access_index = access_index;
+        access.use_render_area = subpass.viewMask == 0;
+        access.offset = CastTo3D(render_area_.offset);
+        access.extent = CastTo3D(render_area_.extent);
+        access.view_mask = subpass.viewMask;
+        access.aspect_mask = aspect_mask;
+        access.attachment_access = GetAttachmentAccess(ordering);
+        access.tag_handle = access.image_view->Handle();
+        access.additional_object = access.image_view->image_state->Handle();
+        access.resource_description = std::move(resource_description);
+        access.message_type = "RenderPassAttachmentError";
+        command.accesses.emplace_back(std::move(access));
     };
 
-    // Subpass's inputAttachment has been done in ValidateDispatchDrawDescriptorSet
-    if (subpass.pColorAttachments && subpass.colorAttachmentCount && !list.empty()) {
-        for (const auto location : list) {
-            if (location >= subpass.colorAttachmentCount ||
-                subpass.pColorAttachments[location].attachment == VK_ATTACHMENT_UNUSED) {
+    if (subpass.pColorAttachments && subpass.colorAttachmentCount) {
+        for (const uint32_t location : pipe->fs_writable_output_location_list) {
+            if (location >= subpass.colorAttachmentCount) {
                 continue;
             }
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kColorAttachment);
-            const AttachmentViewGen& view_gen = attachment_views_[subpass.pColorAttachments[location].attachment];
-            HazardResult hazard = current_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kRenderArea,
-                                                                         SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
-                                                                         attachment_access, subpass.viewMask);
-            if (hazard.IsHazard()) {
+            const uint32_t attachment_index = subpass.pColorAttachments[location].attachment;
+            if (attachment_index != VK_ATTACHMENT_UNUSED) {
                 std::ostringstream ss;
-                ss << "color attachment " << location << " in subpass " << cmd_buffer.GetActiveSubpass();
-                const std::string attachment_description = ss.str();
-                skip |= report_atachment_hazard(hazard, *view_gen.GetViewState(), attachment_description);
+                ss << "color attachment " << location << " in subpass " << current_subpass_;
+                add_attachment(attachment_index, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
+                               SyncOrdering::kColorAttachment, 0, ss.str());
             }
         }
     }
 
-    // PHASE1 TODO: Read operations for both depth and stencil are possible in the future.
-    const auto ds_state = pipe->DepthStencilState();
-    const uint32_t depth_stencil_attachment = GetSubpassDepthStencilAttachmentIndex(ds_state, subpass.pDepthStencilAttachment);
-
-    if (depth_stencil_attachment != VK_ATTACHMENT_UNUSED) {
-        const AttachmentViewGen& view_gen = attachment_views_[depth_stencil_attachment];
-        const vvl::ImageView& view_state = *view_gen.GetViewState();
-        const VkFormat ds_format = view_state.create_info.format;
-        const bool depth_write = IsDepthAttachmentWriteable(last_bound_state, ds_format);
-        const bool stencil_write = IsStencilAttachmentWriteable(last_bound_state, ds_format);
-
-        if (depth_write) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kDepthStencilAttachment);
-            HazardResult hazard = current_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea,
-                                                                         SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                                         attachment_access, subpass.viewMask);
-            if (hazard.IsHazard()) {
-                std::ostringstream ss;
-                ss << "depth aspect of depth-stencil attachment in subpass " << cmd_buffer.GetActiveSubpass();
-                const std::string attachment_description = ss.str();
-                skip |= report_atachment_hazard(hazard, view_state, attachment_description);
-            }
-        }
-        if (stencil_write) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kDepthStencilAttachment);
-            HazardResult hazard = current_context.DetectAttachmentHazard(view_gen, AttachmentViewGen::Gen::kStencilOnlyRenderArea,
-                                                                         SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                                         attachment_access, subpass.viewMask);
-            if (hazard.IsHazard()) {
-                std::ostringstream ss;
-                ss << "stencil aspect of depth-stencil attachment in subpass " << cmd_buffer.GetActiveSubpass();
-                const std::string attachment_description = ss.str();
-                skip |= report_atachment_hazard(hazard, view_state, attachment_description);
-            }
-        }
-    }
-    return skip;
-}
-
-void RenderPassAccessContext::RecordDrawSubpassAttachment(const vvl::CommandBuffer& cmd_buffer, const ResourceUsageTag tag) {
-    const auto& last_bound_state = cmd_buffer.GetLastBoundGraphics();
-    const auto* pipe = last_bound_state.pipeline_state;
-    if (!pipe || pipe->RasterizationDisabled()) {
-        return;
-    }
-
-    const auto& list = pipe->fs_writable_output_location_list;
-    const auto& subpass = rp_state_->create_info.pSubpasses[current_subpass_];
-
-    auto& current_context = CurrentContext();
-    // Subpass's inputAttachment has been done in RecordDispatchDrawDescriptorSet
-    if (subpass.pColorAttachments && subpass.colorAttachmentCount && !list.empty()) {
-        for (const auto location : list) {
-            if (location >= subpass.colorAttachmentCount ||
-                subpass.pColorAttachments[location].attachment == VK_ATTACHMENT_UNUSED) {
-                continue;
-            }
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kColorAttachment);
-            const AttachmentViewGen& view_gen = attachment_views_[subpass.pColorAttachments[location].attachment];
-            current_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kRenderArea,
-                                                        SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access,
-                                                        ResourceUsageTagEx{tag}, subpass.viewMask);
-        }
-    }
-
-    // PHASE1 TODO: Read operations for both depth and stencil are possible in the future.
     const auto* ds_state = pipe->DepthStencilState();
     const uint32_t depth_stencil_attachment = GetSubpassDepthStencilAttachmentIndex(ds_state, subpass.pDepthStencilAttachment);
-    if (depth_stencil_attachment != VK_ATTACHMENT_UNUSED) {
-        const AttachmentViewGen& view_gen = attachment_views_[depth_stencil_attachment];
-        const vvl::ImageView& view_state = *view_gen.GetViewState();
-        const VkFormat ds_format = view_state.create_info.format;
-        const bool depth_write = IsDepthAttachmentWriteable(last_bound_state, ds_format);
-        const bool stencil_write = IsStencilAttachmentWriteable(last_bound_state, ds_format);
-
-        if (depth_write || stencil_write) {
-            const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kDepthStencilAttachment);
-            const auto ds_gentype = view_gen.GetDepthStencilRenderAreaGenType(depth_write, stencil_write);
-            current_context.UpdateAttachmentAccessState(view_gen, ds_gentype,
-                                                        SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE, attachment_access,
-                                                        ResourceUsageTagEx{tag}, subpass.viewMask);
+    if (depth_stencil_attachment != VK_ATTACHMENT_UNUSED && depth_stencil_attachment < attachment_view_states_.size() &&
+        attachment_view_states_[depth_stencil_attachment]) {
+        const VkFormat format = attachment_view_states_[depth_stencil_attachment]->create_info.format;
+        if (IsDepthAttachmentWriteable(last_bound_state, format)) {
+            std::ostringstream ss;
+            ss << "depth aspect of depth-stencil attachment in subpass " << current_subpass_;
+            add_attachment(depth_stencil_attachment, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
+                           SyncOrdering::kDepthStencilAttachment, VK_IMAGE_ASPECT_DEPTH_BIT, ss.str());
+        }
+        if (IsStencilAttachmentWriteable(last_bound_state, format)) {
+            std::ostringstream ss;
+            ss << "stencil aspect of depth-stencil attachment in subpass " << current_subpass_;
+            add_attachment(depth_stencil_attachment, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
+                           SyncOrdering::kDepthStencilAttachment, VK_IMAGE_ASPECT_STENCIL_BIT, ss.str());
         }
     }
+    return command;
 }
 
 const vvl::ImageView* RenderPassAccessContext::GetClearAttachmentView(const VkClearAttachment& clear_attachment) const {
@@ -729,11 +726,19 @@ const vvl::ImageView* RenderPassAccessContext::GetClearAttachmentView(const VkCl
     return attachment_views_[attachment_index].GetViewState();
 }
 
-bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                  const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                                  ResourceUsageTag replay_base_tag, const Location* replay_loc) const {
     // PHASE1 TODO: Add Validate Preserve attachments
+    // Tag layout mirrors RecordNextSubpass: resolve, store, transition and load operations in tag order
+    const bool replay = replay_base_tag != kInvalidTag;
+    const ResourceUsageTag resolve_tag = replay_base_tag;
+    const ResourceUsageTag store_tag = replay ? replay_base_tag + 1 : kInvalidTag;
+    const ResourceUsageTag transition_tag = replay ? replay_base_tag + 2 : kInvalidTag;
+    const ResourceUsageTag load_tag = replay ? replay_base_tag + 3 : kInvalidTag;
     bool skip = false;
-    skip |= ValidateResolveOperations(cb_context, command);
-    skip |= ValidateStoreOperation(cb_context, command);
+    skip |= ValidateResolveOperations(cb_context, env, record_time_validated_tags, command, resolve_tag, replay_loc);
+    skip |= ValidateStoreOperation(cb_context, env, record_time_validated_tags, command, store_tag, replay_loc);
 
     const auto next_subpass = current_subpass_ + 1;
     if (next_subpass >= rp_state_->create_info.subpassCount) {
@@ -741,36 +746,47 @@ bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb
     }
     const uint32_t next_subpass_view_mask = rp_state_->create_info.pSubpasses[next_subpass].viewMask;
     const auto& next_context = subpass_contexts_[next_subpass];
-    skip |= ValidateLayoutTransitions(cb_context, next_context, *rp_state_, render_pass_instance_id_, next_subpass,
-                                      next_subpass_view_mask, attachment_views_, command);
+    skip |= ValidateLayoutTransitions(cb_context, env, record_time_validated_tags, next_context, *rp_state_,
+                                      render_pass_instance_id_, next_subpass, next_subpass_view_mask, attachment_views_, command,
+                                      transition_tag, replay_loc);
     if (!skip) {
         // To avoid complex (and buggy) duplication of the affect of layout transitions on load operations, we'll record them
         // on a copy of the (empty) next context.
         // Note: The resource access map should be empty so hopefully this copy isn't too horrible from a perf POV.
         AccessContext temp_context(cb_context.GetSyncState());
         temp_context.InitFrom(next_context);
-        RecordLayoutTransitions(*rp_state_, next_subpass, attachment_views_, kInvalidTag, temp_context);
-        skip |= ValidateLoadOperation(cb_context, temp_context, *rp_state_, render_pass_instance_id_, next_subpass,
-                                      next_subpass_view_mask, attachment_views_, command);
+        RecordLayoutTransitions(*rp_state_, next_subpass, attachment_views_, kInvalidTag, temp_context, env.queue_id);
+        skip |= ValidateLoadOperation(cb_context, env, record_time_validated_tags, temp_context, *rp_state_,
+                                      render_pass_instance_id_, next_subpass, next_subpass_view_mask, attachment_views_, command,
+                                      load_tag, replay_loc);
     }
     return skip;
 }
-bool RenderPassAccessContext::ValidateEndRenderPass(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateEndRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                    const ResourceUsageRange& record_time_validated_tags, vvl::Func command,
+                                                    ResourceUsageTag replay_base_tag, const Location* replay_loc) const {
     // PHASE1 TODO: Validate Preserve
+    // Tag layout mirrors RecordEndRenderPass: store and resolve operations at the base tag, final transitions next
+    const ResourceUsageTag store_tag = replay_base_tag;
+    const ResourceUsageTag transition_tag = (replay_base_tag != kInvalidTag) ? replay_base_tag + 1 : kInvalidTag;
     bool skip = false;
-    skip |= ValidateResolveOperations(cb_context, command);
-    skip |= ValidateStoreOperation(cb_context, command);
-    skip |= ValidateFinalSubpassLayoutTransitions(cb_context, command);
+    skip |= ValidateResolveOperations(cb_context, env, record_time_validated_tags, command, store_tag, replay_loc);
+    skip |= ValidateStoreOperation(cb_context, env, record_time_validated_tags, command, store_tag, replay_loc);
+    skip |= ValidateFinalSubpassLayoutTransitions(cb_context, env, record_time_validated_tags, command, transition_tag, replay_loc);
     return skip;
 }
 
-AccessContext* RenderPassAccessContext::CreateStoreResolveProxy() const {
+AccessContext* RenderPassAccessContext::CreateStoreResolveProxy(QueueId queue_id) const {
     return CreateStoreResolveProxyContext(CurrentContext(), *rp_state_, render_pass_instance_id_, current_subpass_,
-                                          rp_state_->create_info.pSubpasses[current_subpass_].viewMask, attachment_views_);
+                                          rp_state_->create_info.pSubpasses[current_subpass_].viewMask, attachment_views_,
+                                          queue_id);
 }
 
 bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const CommandBufferContext& cb_context,
-                                                                    vvl::Func command) const {
+                                                                    const SyncEnvironment& env,
+                                                                    const ResourceUsageRange& record_time_validated_tags,
+                                                                    vvl::Func command, ResourceUsageTag replay_tag,
+                                                                    const Location* replay_loc) const {
     bool skip = false;
 
     // As validation methods are const and precede the record/update phase, for any tranistions from the current (last)
@@ -795,7 +811,7 @@ bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const Comman
             } else {
                 if (!proxy_for_current) {
                     // We haven't recorded resolve ofor the current_subpass, so we need to copy current and update it *as if*
-                    proxy_for_current.reset(CreateStoreResolveProxy());
+                    proxy_for_current.reset(CreateStoreResolveProxy(env.queue_id));
                 }
                 context = proxy_for_current.get();
             }
@@ -806,8 +822,13 @@ bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const Comman
         }
 
         // Use the merged barrier for the hazard check (safe since it just considers the src (first) scope.
-        auto hazard = context->DetectImageBarrierHazard(view_gen, merged_barrier, AccessContext::DetectOptions::kDetectPrevious);
-        if (hazard.IsHazard()) {
+        auto hazard = context->DetectImageBarrierHazard(view_gen, merged_barrier, env.queue_id,
+                                                        AccessContext::DetectOptions::kDetectPrevious);
+        if (hazard.IsHazard() && !WasValidatedAtRecordTime(hazard, record_time_validated_tags)) {
+            if (replay_loc) {
+                skip |= ReportReplayHazard(env, cb_context, hazard, replay_tag, NullVulkanTypedHandle, *replay_loc);
+                continue;
+            }
             const SyncValidator& sync_state = cb_context.GetSyncState();
             const Location loc(command);
 
@@ -822,12 +843,13 @@ bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const Comman
 
             if (hazard.Tag() == kInvalidTag) {  // Hazard vs. store/resolve
                 const std::string error = sync_state.error_messages_.RenderPassFinalLayoutTransitionVsStoreOrResolveError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout,
+                    env, hazard, rp_state_->VkHandle(), command, resource_description, transition.old_layout, transition.new_layout,
                     transition.src_subpass);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             } else {
                 const std::string error = sync_state.error_messages_.RenderPassFinalLayoutTransitionError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout);
+                    env, hazard, rp_state_->VkHandle(), command, resource_description, transition.old_layout,
+                    transition.new_layout);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             }
         }
@@ -835,12 +857,12 @@ bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const Comman
     return skip;
 }
 
-void RenderPassAccessContext::RecordLayoutTransitions(const ResourceUsageTag tag) {
+void RenderPassAccessContext::RecordLayoutTransitions(const ResourceUsageTag tag, QueueId queue_id) {
     // Add layout transitions...
-    RecordLayoutTransitions(*rp_state_, current_subpass_, attachment_views_, tag, CurrentContext());
+    RecordLayoutTransitions(*rp_state_, current_subpass_, attachment_views_, tag, CurrentContext(), queue_id);
 }
 
-void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
+void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag, QueueId queue_id) {
     const auto* attachment_ci = rp_state_->create_info.pAttachments;
     auto& subpass_context = CurrentContext();
     const uint32_t view_mask = rp_state_->create_info.pSubpasses[current_subpass_].viewMask;
@@ -862,7 +884,8 @@ void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
                     const AttachmentAccess attachment_access =
                         GetAttachmentAccess(SyncOrdering::kColorAttachment, AttachmentAccessType::LoadOp);
                     subpass_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kRenderArea, load_op_access,
-                                                                attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask);
+                                                                attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask,
+                                                                queue_id);
                 }
             } else {
                 // TODO: Update depth/stencil aspects separately only if separateDepthStencilAttachmentAccess is defined,
@@ -875,8 +898,8 @@ void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
                     const SyncAccessIndex load_op = DepthStencilLoadUsage(ci.loadOp);
                     if (load_op != SYNC_ACCESS_INDEX_NONE) {
                         subpass_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kDepthOnlyRenderArea, load_op,
-                                                                    attachment_access, ResourceUsageTagEx{tag},
-                                                                    *filtered_view_mask);
+                                                                    attachment_access, ResourceUsageTagEx{tag}, *filtered_view_mask,
+                                                                    queue_id);
                     }
                 }
                 if (has_stencil) {
@@ -884,7 +907,7 @@ void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
                     if (load_op != SYNC_ACCESS_INDEX_NONE) {
                         subpass_context.UpdateAttachmentAccessState(view_gen, AttachmentViewGen::Gen::kStencilOnlyRenderArea,
                                                                     load_op, attachment_access, ResourceUsageTagEx{tag},
-                                                                    *filtered_view_mask);
+                                                                    *filtered_view_mask, queue_id);
                     }
                 }
             }
@@ -893,7 +916,7 @@ void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
 }
 
 AttachmentViewGenVector RenderPassAccessContext::CreateAttachmentViewGen(
-    const VkRect2D& render_area, const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views) {
+    const VkRect2D& render_area, vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views) {
     AttachmentViewGenVector view_gens;
     VkExtent3D extent = CastTo3D(render_area.extent);
     VkOffset3D offset = CastTo3D(render_area.offset);
@@ -905,34 +928,38 @@ AttachmentViewGenVector RenderPassAccessContext::CreateAttachmentViewGen(
 }
 
 RenderPassAccessContext::RenderPassAccessContext(const vvl::RenderPass& rp_state, const VkRect2D& render_area,
-                                                 VkQueueFlags queue_flags,
-                                                 const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
-                                                 const AccessContext& external_context, uint32_t render_pass_instance_id)
+                                                  VkQueueFlags queue_flags,
+                                                  vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views,
+                                                  const AccessContext& external_context, uint32_t render_pass_instance_id)
     : rp_state_(&rp_state),
+      render_area_(render_area),
+      attachment_view_states_(attachment_views.begin(), attachment_views.end()),
       attachment_views_(CreateAttachmentViewGen(render_area, attachment_views)),
       external_context_(&external_context),
       subpass_contexts_(InitSubpassContexts(queue_flags, rp_state, external_context)),
       render_pass_instance_id_(render_pass_instance_id),
       current_subpass_(0) {}
 
-void RenderPassAccessContext::RecordBeginRenderPass(const ResourceUsageTag barrier_tag, const ResourceUsageTag load_tag) {
+void RenderPassAccessContext::RecordBeginRenderPass(const ResourceUsageTag barrier_tag, const ResourceUsageTag load_tag,
+                                                    QueueId queue_id) {
     assert(0 == current_subpass_);
     AccessContext& current_context = CurrentContext();
     current_context.SetStartTag(barrier_tag);
 
-    RecordLayoutTransitions(barrier_tag);
-    RecordLoadOperations(load_tag);
+    RecordLayoutTransitions(barrier_tag, queue_id);
+    RecordLoadOperations(load_tag, queue_id);
 }
 
 void RenderPassAccessContext::RecordNextSubpass(ResourceUsageTag resolve_tag, const ResourceUsageTag store_tag,
-                                                const ResourceUsageTag transition_tag, const ResourceUsageTag load_tag) {
+                                                const ResourceUsageTag transition_tag, const ResourceUsageTag load_tag,
+                                                QueueId queue_id) {
     const uint32_t view_mask = rp_state_->create_info.pSubpasses[current_subpass_].viewMask;
 
     // Resolves are against *prior* subpass context and thus *before* the subpass increment
     UpdateAttachmentResolveAccess(*rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_, view_mask, resolve_tag,
-                                  CurrentContext());
+                                  CurrentContext(), queue_id);
     UpdateAttachmentStoreAccess(*rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_, view_mask, store_tag,
-                                CurrentContext());
+                                CurrentContext(), queue_id);
 
     if (current_subpass_ + 1 >= rp_state_->create_info.subpassCount) {
         return;
@@ -943,19 +970,25 @@ void RenderPassAccessContext::RecordNextSubpass(ResourceUsageTag resolve_tag, co
     AccessContext& current_context = CurrentContext();
     current_context.SetStartTag(transition_tag);
 
-    RecordLayoutTransitions(transition_tag);
-    RecordLoadOperations(load_tag);
+    RecordLayoutTransitions(transition_tag, queue_id);
+    RecordLoadOperations(load_tag, queue_id);
+}
+
+void RenderPassAccessContext::AdvanceSubpass() {
+    if (current_subpass_ + 1 < rp_state_->create_info.subpassCount) {
+        current_subpass_++;
+    }
 }
 
 void RenderPassAccessContext::RecordEndRenderPass(AccessContext* external_context, const ResourceUsageTag store_tag,
-                                                  const ResourceUsageTag transition_tag) {
+                                                  const ResourceUsageTag transition_tag, QueueId queue_id) {
     const uint32_t view_mask = rp_state_->create_info.pSubpasses[current_subpass_].viewMask;
 
     // Add the resolve and store accesses
     UpdateAttachmentResolveAccess(*rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_, view_mask, store_tag,
-                                  CurrentContext());
+                                  CurrentContext(), queue_id);
     UpdateAttachmentStoreAccess(*rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_, view_mask, store_tag,
-                                CurrentContext());
+                                CurrentContext(), queue_id);
 
     // Export the accesses from the renderpass...
     external_context->ResolveChildContexts(GetSubpassContexts());
@@ -979,17 +1012,17 @@ void RenderPassAccessContext::RecordEndRenderPass(AccessContext* external_contex
             const SubpassBarrier& dst_external_barrier = subpass_contexts_[transition.src_subpass].GetDstExternalSubpassBarrier();
             assert(&subpass_contexts_[transition.src_subpass] == dst_external_barrier.src_subpass_context);
             for (const auto& barrier : dst_external_barrier.barriers) {
-                const BarrierScope barrier_scope(barrier);
+                const BarrierScope barrier_scope(barrier, queue_id);
                 CollectBarriersFunctor collect_barriers(*external_context, barrier_scope, barrier, true, vvl::kNoIndex32,
-                                                        pending_barriers);
+                                                        pending_barriers, true);
                 external_context->UpdateMemoryAccessState(collect_barriers, range_gen);
             }
         } else {
             // Unused attachments still transition from initialLayout to finalLayout, but no subpass
             // uses them, so record the transition without applying a subpass dependency barrier.
             const SyncBarrier empty_barrier;
-            CollectBarriersFunctor collect_barriers(*external_context, BarrierScope(empty_barrier), empty_barrier, true,
-                                                    vvl::kNoIndex32, pending_barriers);
+            CollectBarriersFunctor collect_barriers(*external_context, BarrierScope(empty_barrier, queue_id), empty_barrier, true,
+                                                    vvl::kNoIndex32, pending_barriers, true);
             external_context->UpdateMemoryAccessState(collect_barriers, range_gen);
         }
         pending_barriers.Apply(transition_tag);

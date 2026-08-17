@@ -13,6 +13,37 @@
 
 class NegativeSyncValVideo : public VkVideoSyncLayerTest {};
 
+class NewNegativeSyncValVideoSubmitOnly : public VkVideoSyncLayerTest {
+  public:
+    NewNegativeSyncValVideoSubmitOnly() {
+        settings_[0] = {OBJECT_LAYER_NAME, "syncval_record_time_validation", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
+                        &record_time_validation_};
+        settings_[1] = {OBJECT_LAYER_NAME, "syncval_full_validation", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
+                        &full_validation_};
+        settings_info_ = vku::InitStructHelper();
+        settings_info_.settingCount = size32(settings_);
+        settings_info_.pSettings = settings_.data();
+
+        validation_features_ = vku::InitStructHelper(&settings_info_);
+        validation_features_.enabledValidationFeatureCount = size32(enables_);
+        validation_features_.pEnabledValidationFeatures = enables_.data();
+        validation_features_.disabledValidationFeatureCount = size32(disables_);
+        validation_features_.pDisabledValidationFeatures = disables_.data();
+        SetInstancePNext(&validation_features_);
+    }
+
+  private:
+    VkBool32 record_time_validation_ = VK_FALSE;
+    VkBool32 full_validation_ = VK_TRUE;
+    std::array<VkLayerSettingEXT, 2> settings_{};
+    VkLayerSettingsCreateInfoEXT settings_info_{};
+    const std::array<VkValidationFeatureEnableEXT, 1> enables_ = {VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+    const std::array<VkValidationFeatureDisableEXT, 4> disables_ = {
+        VK_VALIDATION_FEATURE_DISABLE_THREAD_SAFETY_EXT, VK_VALIDATION_FEATURE_DISABLE_API_PARAMETERS_EXT,
+        VK_VALIDATION_FEATURE_DISABLE_OBJECT_LIFETIMES_EXT, VK_VALIDATION_FEATURE_DISABLE_CORE_CHECKS_EXT};
+    VkValidationFeaturesEXT validation_features_{};
+};
+
 TEST_F(NegativeSyncValVideo, DecodeOutputPicture) {
     TEST_DESCRIPTION("Test video decode output picture sync hazard");
 
@@ -41,6 +72,32 @@ TEST_F(NegativeSyncValVideo, DecodeOutputPicture) {
 
     cb.EndVideoCoding(context.End());
     cb.End();
+}
+
+TEST_F(NewNegativeSyncValVideoSubmitOnly, DecodeOutputPicture) {
+    RETURN_IF_SKIP(Init());
+
+    VideoConfig config = GetConfigDecode();
+    if (!config) {
+        GTEST_SKIP() << "Test requires decode support";
+    }
+
+    VideoContext context(m_device, config);
+    context.CreateAndBindSessionMemory();
+    context.CreateResources();
+
+    vkt::CommandBuffer& cb = context.CmdBuffer();
+    cb.Begin();
+    cb.BeginVideoCoding(context.Begin());
+    cb.ControlVideoCoding(context.Control().Reset());
+    cb.DecodeVideo(context.DecodeFrame());
+    cb.DecodeVideo(context.DecodeFrame());
+    cb.EndVideoCoding(context.End());
+    cb.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    context.Queue().Submit(cb);
+    m_errorMonitor->VerifyFound();
 }
 
 TEST_F(NegativeSyncValVideo, DecodeReconstructedPicture) {

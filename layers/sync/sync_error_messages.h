@@ -49,20 +49,34 @@ class ErrorMessages {
     std::string BufferError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                             const std::string& resource_description, const AccessRange range,
                             AdditionalMessageInfo additional_info = {}) const;
+    std::string BufferError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
+                            const std::string& resource_description, const AccessRange range,
+                            AdditionalMessageInfo additional_info = {}) const;
 
     std::string BufferCopyError(const HazardResult& hazard, const CommandBufferContext& cb_context, const vvl::Func command,
+                                const std::string& resouce_description, uint32_t region_index, AccessRange range) const;
+    std::string BufferCopyError(const HazardResult& hazard, const SyncEnvironment& env, const vvl::Func command,
                                 const std::string& resouce_description, uint32_t region_index, AccessRange range) const;
 
     std::string AccelerationStructureError(const HazardResult& hazard, const CommandBufferContext& cb_context,
                                            const vvl::Func command, const std::string& resource_description,
                                            const AccessRange range, VkAccelerationStructureKHR as,
                                            const Location& as_location) const;
+    std::string AccelerationStructureError(const HazardResult& hazard, const SyncEnvironment& env, const vvl::Func command,
+                                           const std::string& resource_description, const AccessRange range,
+                                           VkAccelerationStructureKHR as, std::string_view as_location) const;
 
     std::string ImageCopyResolveBlitError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                           const std::string& resource_description, uint32_t region_index, const VkOffset3D& offset,
                                           const VkExtent3D& extent, const VkImageSubresourceLayers& subresource) const;
+    std::string ImageCopyResolveBlitError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
+                                          const std::string& resource_description, uint32_t region_index, const VkOffset3D& offset,
+                                          const VkExtent3D& extent, const VkImageSubresourceLayers& subresource) const;
 
     std::string ImageClearError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                                const std::string& resource_description, uint32_t subresource_range_index,
+                                const VkImageSubresourceRange& subresource_range) const;
+    std::string ImageClearError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
                                 const std::string& resource_description, uint32_t subresource_range_index,
                                 const VkImageSubresourceRange& subresource_range) const;
 
@@ -71,8 +85,18 @@ class ErrorMessages {
                                       const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                       uint32_t descriptor_binding, uint32_t descriptor_array_element,
                                       VkShaderStageFlagBits shader_stage) const;
+    std::string BufferDescriptorError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
+                                      const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
+                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
+                                      VkShaderStageFlagBits shader_stage) const;
 
     std::string ImageDescriptorError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                                     const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
+                                     const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+                                     uint32_t descriptor_binding, uint32_t descriptor_array_element,
+                                     VkShaderStageFlagBits shader_stage, VkImageLayout image_layout) const;
+    std::string ImageDescriptorError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
                                      const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
@@ -84,8 +108,16 @@ class ErrorMessages {
                                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
                                                      VkShaderStageFlagBits shader_stage) const;
+    std::string AccelerationStructureDescriptorError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
+                                                     const std::string& resource_description, const vvl::Pipeline& pipeline,
+                                                     uint32_t set_number, const vvl::DescriptorSet& descriptor_set,
+                                                     VkDescriptorType descriptor_type, uint32_t descriptor_binding,
+                                                     uint32_t descriptor_array_element, VkShaderStageFlagBits shader_stage) const;
 
     std::string ClearAttachmentError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                                     const std::string& resource_description, VkImageAspectFlags clear_aspects,
+                                     uint32_t clear_rect_index, const VkClearRect& clear_rect) const;
+    std::string ClearAttachmentError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
                                      const std::string& resource_description, VkImageAspectFlags clear_aspects,
                                      uint32_t clear_rect_index, const VkClearRect& clear_rect) const;
 
@@ -100,29 +132,30 @@ class ErrorMessages {
     std::string EndRenderingStoreError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                        const std::string& resource_description, VkAttachmentStoreOp store_op) const;
 
-    std::string RenderPassLoadOpError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLoadOpError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                       const std::string& resource_description, uint32_t subpass, uint32_t attachment,
                                       VkAttachmentLoadOp load_op, bool is_color) const;
-    std::string RenderPassLoadOpVsLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                        vvl::Func command, const std::string& resource_description,
-                                                        VkAttachmentLoadOp load_op, bool is_color) const;
-    std::string RenderPassResolveError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLoadOpVsLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                                        const std::string& resource_description, VkAttachmentLoadOp load_op,
+                                                        bool is_color) const;
+    std::string RenderPassResolveError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                        const std::string& resource_description) const;
-    std::string RenderPassStoreOpError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassStoreOpError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                        const std::string& resource_description, VkAttachmentStoreOp store_op) const;
 
-    std::string RenderPassLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                vvl::Func command, const std::string& resource_description,
-                                                VkImageLayout old_layout, VkImageLayout new_layout) const;
-    std::string RenderPassLayoutTransitionVsResolveError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                         vvl::Func command, const std::string& resource_description,
-                                                         VkImageLayout old_layout, VkImageLayout new_layout,
-                                                         uint32_t resolve_subpass) const;
-    std::string RenderPassFinalLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                     vvl::Func command, const std::string& resource_description,
-                                                     VkImageLayout old_layout, VkImageLayout new_layout) const;
-    std::string RenderPassFinalLayoutTransitionVsStoreOrResolveError(const HazardResult& hazard,
-                                                                     const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                                const std::string& resource_description, VkImageLayout old_layout,
+                                                VkImageLayout new_layout) const;
+    std::string RenderPassLayoutTransitionVsResolveError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                         VkRenderPass render_pass, vvl::Func command,
+                                                         const std::string& resource_description, VkImageLayout old_layout,
+                                                         VkImageLayout new_layout, uint32_t resolve_subpass) const;
+    std::string RenderPassFinalLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                     VkRenderPass render_pass, vvl::Func command,
+                                                     const std::string& resource_description, VkImageLayout old_layout,
+                                                     VkImageLayout new_layout) const;
+    std::string RenderPassFinalLayoutTransitionVsStoreOrResolveError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                                     VkRenderPass render_pass, vvl::Func command,
                                                                      const std::string& resource_description,
                                                                      VkImageLayout old_layout, VkImageLayout new_layout,
                                                                      uint32_t store_resolve_subpass) const;
@@ -133,10 +166,18 @@ class ErrorMessages {
     std::string FirstUseError(const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& recorded_context,
                               uint32_t command_buffer_index) const;
 
+    // Legacy-compatible submit-time report used by recorded command replay. command_tag is the recorded
+    // command's local tag; it selects the recorded command name and debug region from the recorded context.
+    std::string SubmitTimeError(const SyncEnvironment& env, const HazardResult& hazard,
+                                const CommandBufferContext& recorded_context, ResourceUsageTag command_tag,
+                                uint32_t command_buffer_index, const std::string& resource_description) const;
+
     std::string PresentError(const HazardResult& hazard, const QueueBatchContext& batch_context, vvl::Func command,
                              const std::string& resource_description, uint32_t swapchain_index) const;
 
     std::string VideoError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                           const std::string& resource_description) const;
+    std::string VideoError(const HazardResult& hazard, const SyncEnvironment& env, vvl::Func command,
                            const std::string& resource_description) const;
 
   private:

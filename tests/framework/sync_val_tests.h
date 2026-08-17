@@ -37,7 +37,7 @@ class VkSyncValTest : public VkLayerTest {
     void InitSyncValFramework(const SyncValSettings *p_sync_settings = nullptr);
     void InitSyncVal(const SyncValSettings *p_sync_settings = nullptr);
     void InitTimelineSemaphore();
-    void InitRayTracing();
+    void InitRayTracing(const SyncValSettings* p_sync_settings = nullptr);
 
     vkt::Buffer GetSerializationDeserializationBuffer(const vkt::as::AccelerationStructureKHR &as);
     CreateComputePipelineHelper GetRayQueryComputePipeline(VkAccelerationStructureKHR as);
