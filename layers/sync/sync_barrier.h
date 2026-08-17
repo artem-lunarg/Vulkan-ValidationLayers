@@ -162,6 +162,7 @@ struct SemaphoreScope : SyncExecScope {
     QueueId queue;
 };
 
-void ApplyBarrier(SyncEnvironment& env, AccessContext& access_context, const BarrierSet& barrier_set, ResourceUsageTag tag);
+void ApplyBarrier(SyncEnvironment& env, AccessContext& access_context, const BarrierSet& barrier_set, ResourceUsageTag tag,
+                  bool replay_layout_transitions = false);
 
 }  // namespace syncval

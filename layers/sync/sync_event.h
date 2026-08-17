@@ -111,19 +111,55 @@ class SyncEventsContext {
     Map map_;
 };
 
+// Event operation payloads. Shared by the first access replay machinery and the
+// recorded command stream; they carry no machinery specific state.
+struct SetEventReplay {
+    SetEventReplay(std::shared_ptr<const vvl::Event>&& event, const SyncExecScope& src_exec_scope,
+                   std::shared_ptr<const AccessContext>&& src_access_context, const Location& loc);
+
+    vvl::Func command = vvl::Func::Empty;
+    std::shared_ptr<const vvl::Event> event;
+    // Snapshot of the command buffer's access context at set event time
+    std::shared_ptr<const AccessContext> recorded_context;
+    SyncExecScope src_exec_scope;
+};
+
+struct ResetEventReplay {
+    ResetEventReplay(std::shared_ptr<const vvl::Event>&& event, const SyncExecScope& exec_scope, const Location& loc);
+
+    vvl::Func command = vvl::Func::Empty;
+    std::shared_ptr<const vvl::Event> event;
+    SyncExecScope exec_scope;
+};
+
+struct WaitEventsReplay {
+    WaitEventsReplay(std::vector<std::shared_ptr<const vvl::Event>>&& events, std::vector<BarrierSet>&& barrier_sets,
+                     const Location& loc);
+
+    vvl::Func command = vvl::Func::Empty;
+    std::vector<std::shared_ptr<const vvl::Event>> events;
+    std::vector<BarrierSet> barrier_sets;
+};
+
+// The record time validated range suppresses re-reporting during submit replay: a race
+// against an event command whose tag is inside the range was already reported while
+// recording. Record time and the legacy first access replay pass the default empty range.
 bool ValidateCmdSetEvent(const SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event,
-                         const SyncExecScope& src_exec_scope, ResourceUsageTag base_tag, const Location& loc);
+                         const SyncExecScope& src_exec_scope, ResourceUsageTag base_tag, const Location& loc,
+                         const ResourceUsageRange& record_time_validated_tags = {});
 
 bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event,
-                           const SyncExecScope& exec_scope, ResourceUsageTag base_tag, const Location& loc);
+                           const SyncExecScope& exec_scope, ResourceUsageTag base_tag, const Location& loc,
+                           const ResourceUsageRange& record_time_validated_tags = {});
 
 bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::shared_ptr<const vvl::Event>>& events,
-                           const ResourceUsageTag base_tag, const Location& loc);
+                           const ResourceUsageTag base_tag, const Location& loc,
+                           const ResourceUsageRange& record_time_validated_tags = {});
 
 bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const AccessContext& access_context,
                                            const std::vector<std::shared_ptr<const vvl::Event>>& events,
                                            const vvl::span<const BarrierSet>& barrier_sets, ResourceUsageTag base_tag,
-                                           const Location& loc);
+                                           const Location& loc, const ResourceUsageRange& record_time_validated_tags = {});
 
 // Main functionality of the correspodning Record methods, which perform additional setup
 void ApplyCmdSetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event, const SyncExecScope& src_exec_scope,
@@ -132,8 +168,11 @@ void ApplyCmdSetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::Eve
 void ApplyCmdResetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event, ResourceUsageTag tag,
                         vvl::Func command);
 
+// Command replay reconstructs the complete queue context, so unlike the legacy first
+// access replay it must materialize the image barrier layout transition writes
+// (replay_layout_transitions = true, matching PipelineBarrierCommand::Apply).
 void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
                         const std::vector<std::shared_ptr<const vvl::Event>>& events, vvl::span<const BarrierSet> barrier_sets,
-                        ResourceUsageTag tag, vvl::Func command);
+                        ResourceUsageTag tag, vvl::Func command, bool replay_layout_transitions = false);
 
 }  // namespace syncval

@@ -117,6 +117,31 @@ std::pair<vkt::Queue*, vkt::Queue*> VkSyncValTest::GetTwoQueuesFromSameFamily(co
     return {};
 }
 
+TEST_F(PositiveSyncVal, SubmitOnlyBarrier) {
+    TEST_DESCRIPTION("In submit-only mode a properly synchronized workload reports no hazards");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+
+    VkMemoryBarrier barrier = vku::InitStructHelper();
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    m_command_buffer.Begin();
+    vk::CmdFillBuffer(m_command_buffer, buffer_a, 0, 256, 0);
+    vk::CmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                           nullptr, 0, nullptr);
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_command_buffer.End();
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
 TEST_F(PositiveSyncVal, BufferCopyNonOverlappedRegions) {
     TEST_DESCRIPTION("Copy to non-overlapped regions of the same buffer");
     RETURN_IF_SKIP(InitSyncVal());

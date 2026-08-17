@@ -17,8 +17,103 @@
 
 #include "sync_val_tests.h"
 #include "render_pass_helper.h"
+#include "sync/sync_settings.h"
 
 struct NegativeSyncValRenderPass : public VkSyncValTest {};
+struct NegativeSyncStreamRenderPass : public VkSyncValTest {};
+
+TEST_F(NegativeSyncStreamRenderPass, FinalTransitionDedupRecordAndSubmit) {
+    TEST_DESCRIPTION("The final transition vs store op hazard is reported once when record and submit validation are both enabled");
+    SyncValSettings settings;
+    settings.full_validation = true;  // record time validation stays enabled
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image image(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::ImageView image_view = image.CreateView();
+
+    // Execution-only dependency: the store op write is not made available to the final transition
+    VkSubpassDependency external_dependency = {};
+    external_dependency.srcSubpass = 0;
+    external_dependency.dstSubpass = VK_SUBPASS_EXTERNAL;
+    external_dependency.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    external_dependency.srcAccessMask = 0;
+    external_dependency.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    external_dependency.dstAccessMask = 0;
+
+    RenderPassSingleSubpass render_pass(*this);
+    render_pass.AddAttachmentDescription(color_format, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE);
+    render_pass.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    render_pass.AddSubpassDependency(external_dependency);
+    render_pass.CreateRenderPass();
+
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 1, &image_view.handle(), width, height);
+
+    // First establish that the scenario reports at record time (this command buffer is discarded)
+    vkt::CommandBuffer check_cb(*m_device, m_command_pool);
+    check_cb.Begin();
+    check_cb.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    check_cb.EndRenderPass();
+    m_errorMonitor->VerifyFound();
+
+    // Record the same commands keeping them in the command stream; submit replay must not report again
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_errorMonitor->SetAllowedFailureMsg("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.End();
+    m_errorMonitor->Reset();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStreamRenderPass, RenderPassLoadOpSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, render pass load op hazards are reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image src_image(*m_device, width, height, color_format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    vkt::Image image(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    vkt::ImageView image_view = image.CreateView();
+
+    RenderPassSingleSubpass render_pass(*this);
+    render_pass.AddAttachmentDescription(color_format, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE);
+    render_pass.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    render_pass.CreateRenderPass();
+
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 1, &image_view.handle(), width, height);
+
+    VkImageCopy copy_region = {};
+    copy_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.extent = {width, height, 1};
+
+    m_command_buffer.Begin();
+    vk::CmdCopyImage(m_command_buffer, src_image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+    // The load op reads the attachment: RAW against the copy write, not reported during recording
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
 
 TEST_F(NegativeSyncValRenderPass, ClearColorAttachmentWAW) {
     TEST_DESCRIPTION("WAW hazard when color attachment is cleared inside render pass");

@@ -13,6 +13,71 @@
 
 class NegativeSyncValVideo : public VkVideoSyncLayerTest {};
 
+// Enables syncval in submit-only mode: the video test framework configures validation
+// through VK_EXT_validation_features, so the syncval settings are chained alongside it
+// as layer settings on the instance pNext.
+class NegativeSyncStreamVideo : public VkVideoSyncLayerTest {
+  public:
+    NegativeSyncStreamVideo() {
+        layer_settings_[0] = {OBJECT_LAYER_NAME, "syncval_record_time_validation", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
+                              &record_time_validation_};
+        layer_settings_[1] = {OBJECT_LAYER_NAME, "syncval_full_validation", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
+                              &full_validation_};
+        layer_settings_info_ = vku::InitStructHelper();
+        layer_settings_info_.settingCount = 2;
+        layer_settings_info_.pSettings = layer_settings_;
+
+        features_ = vku::InitStructHelper(&layer_settings_info_);
+        features_.enabledValidationFeatureCount = 1;
+        features_.pEnabledValidationFeatures = enables_;
+        features_.disabledValidationFeatureCount = 4;
+        features_.pDisabledValidationFeatures = disables_;
+        SetInstancePNext(&features_);
+    }
+
+  private:
+    const VkBool32 record_time_validation_ = VK_FALSE;
+    const VkBool32 full_validation_ = VK_TRUE;
+    VkLayerSettingEXT layer_settings_[2] = {};
+    VkLayerSettingsCreateInfoEXT layer_settings_info_ = {};
+    const VkValidationFeatureEnableEXT enables_[1] = {VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+    const VkValidationFeatureDisableEXT disables_[4] = {
+        VK_VALIDATION_FEATURE_DISABLE_THREAD_SAFETY_EXT, VK_VALIDATION_FEATURE_DISABLE_API_PARAMETERS_EXT,
+        VK_VALIDATION_FEATURE_DISABLE_OBJECT_LIFETIMES_EXT, VK_VALIDATION_FEATURE_DISABLE_CORE_CHECKS_EXT};
+    VkValidationFeaturesEXT features_ = {};
+};
+
+TEST_F(NegativeSyncStreamVideo, DecodeOutputPicture) {
+    TEST_DESCRIPTION("With record time validation disabled, decode output picture hazards are reported by submit time replay");
+
+    RETURN_IF_SKIP(Init());
+
+    VideoConfig config = GetConfigDecode();
+    if (!config) {
+        GTEST_SKIP() << "Test requires decode support";
+    }
+
+    VideoContext context(m_device, config);
+    context.CreateAndBindSessionMemory();
+    context.CreateResources();
+
+    vkt::CommandBuffer& cb = context.CmdBuffer();
+
+    cb.Begin();
+    cb.BeginVideoCoding(context.Begin());
+    cb.ControlVideoCoding(context.Control().Reset());
+    cb.DecodeVideo(context.DecodeFrame());
+    // WAW on the decode output picture, not reported during recording
+    cb.DecodeVideo(context.DecodeFrame());
+    cb.EndVideoCoding(context.End());
+    cb.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    context.Queue().Submit(cb);
+    m_errorMonitor->VerifyFound();
+    m_device->Wait();
+}
+
 TEST_F(NegativeSyncValVideo, DecodeOutputPicture) {
     TEST_DESCRIPTION("Test video decode output picture sync hazard");
 

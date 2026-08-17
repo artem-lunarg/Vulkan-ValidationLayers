@@ -16,8 +16,13 @@
 #include "pipeline_helper.h"
 #include "render_pass_helper.h"
 #include "descriptor_helper.h"
+#include "sync/sync_settings.h"
 
 class NegativeSyncVal : public VkSyncValTest {};
+
+// Tests for the recorded-command-stream submit-time validation. Kept out of the
+// NegativeSyncVal* suites so the pre-existing tests can be filtered separately.
+class NegativeSyncStream : public VkSyncValTest {};
 
 TEST_F(NegativeSyncVal, BufferCopy) {
     TEST_DESCRIPTION("Hazards caused by buffer copy commands");
@@ -73,6 +78,502 @@ TEST_F(NegativeSyncVal, BufferCopy) {
     m_command_buffer.Copy(buffer_b, buffer_c);
     m_errorMonitor->VerifyFound();
     m_command_buffer.End();
+}
+
+TEST_F(NegativeSyncStream, BufferCopySubmitOnly) {
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+    vkt::Buffer buffer_c(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_command_buffer.Copy(buffer_c, buffer_a);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+}
+
+TEST_F(NegativeSyncStream, BufferCopySubmitReplayMessage) {
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+    vkt::Buffer buffer_c(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_command_buffer.Copy(buffer_c, buffer_a);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("vkCmdCopyBuffer");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+}
+
+TEST_F(NegativeSyncStream, BufferCopyRecordAndSubmitDeduplicatesHazards) {
+    SyncValSettings settings;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+
+    m_command_buffer.Begin(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT);
+    m_command_buffer.Copy(buffer_a, buffer_b);
+
+    // Allow the record-time hazards without aborting the command so submit replay sees the same invalid sequence.
+    m_errorMonitor->SetAllowedFailureMsg("SYNC-HAZARD");
+    m_command_buffer.Copy(buffer_b, buffer_a);
+    m_command_buffer.End();
+    m_errorMonitor->Reset();
+
+    // Both hazards were visible at record time and must not be reported again by the first submit.
+    m_default_queue->Submit(m_command_buffer);
+
+    // Reusing the command buffer conflicts with the previous submission. Those prior tags are outside the current command
+    // buffer replay range and therefore must not be suppressed.
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, BufferCopyRecordValidationRequiredWithoutFullValidation) {
+    TEST_DESCRIPTION("Record time validation is forced on when full validation is disabled, so coverage cannot be lost");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = false;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+    vkt::Buffer buffer_c(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_command_buffer.Copy(buffer_c, buffer_a);
+    m_errorMonitor->VerifyFound();
+    m_command_buffer.End();
+}
+
+TEST_F(NegativeSyncStream, BufferCopyRecordValidationForcedWhenAllValidationDisabled) {
+    TEST_DESCRIPTION("Disabling every syncval setting still leaves record time validation as the coverage floor");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = false;
+    settings.legacy_submit_time_validation = false;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+    vkt::Buffer buffer_c(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_command_buffer.Copy(buffer_c, buffer_a);
+    m_errorMonitor->VerifyFound();
+    m_command_buffer.End();
+}
+
+TEST_F(NegativeSyncStream, FillBufferSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, fill buffer hazards are reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    vk::CmdFillBuffer(m_command_buffer, buffer_a, 0, 256, 0);
+    m_command_buffer.Copy(buffer_a, buffer_b);  // RAW: read of buffer_a, not reported during recording
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+}
+
+TEST_F(NegativeSyncStream, ImageCopySubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, image copy hazards are reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    vkt::Image image_a(*m_device, 64, 64, VK_FORMAT_R8G8B8A8_UNORM, usage);
+    vkt::Image image_b(*m_device, 64, 64, VK_FORMAT_R8G8B8A8_UNORM, usage);
+
+    VkImageCopy region = {};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {64, 64, 1};
+
+    m_command_buffer.Begin();
+    vk::CmdCopyImage(m_command_buffer, image_a, VK_IMAGE_LAYOUT_GENERAL, image_b, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    // WAW on image_b, not reported during recording
+    vk::CmdCopyImage(m_command_buffer, image_a, VK_IMAGE_LAYOUT_GENERAL, image_b, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+}
+
+TEST_F(NegativeSyncStream, SetEventResetRaceSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, the set after reset race is reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Event event(*m_device);
+
+    m_command_buffer.Begin();
+    m_command_buffer.ResetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-vkCmdSetEvent-reset-race");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, DispatchSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, dispatch descriptor hazards are reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    settings.shader_accesses_heuristic = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Buffer buffer(*m_device, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    OneOffDescriptorSet descriptor_set(m_device, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}});
+    descriptor_set.WriteDescriptorBufferInfo(0, buffer, 0, 256, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    descriptor_set.UpdateDescriptorSets();
+
+    const char* cs_source = R"glsl(
+        #version 450
+        layout(set=0, binding=0) readonly buffer In { uint in_data; };
+        void main(){ uint data = in_data; }
+    )glsl";
+    CreateComputePipelineHelper pipe(*this);
+    pipe.cs_ = VkShaderObj(*m_device, cs_source, VK_SHADER_STAGE_COMPUTE_BIT);
+    pipe.pipeline_layout_ = vkt::PipelineLayout(*m_device, {&descriptor_set.layout_});
+    pipe.CreateComputePipeline();
+
+    m_command_buffer.Begin();
+    vk::CmdFillBuffer(m_command_buffer, buffer, 0, 256, 0);
+    vk::CmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk::CmdBindDescriptorSets(m_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout_, 0, 1, &descriptor_set.set_,
+                              0, nullptr);
+    // RAW: shader read of the buffer against the fill, not reported during recording
+    vk::CmdDispatch(m_command_buffer, 1, 1, 1);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, SetEventResetRaceDedupRecordAndSubmit) {
+    TEST_DESCRIPTION("The set after reset race is reported once when record and submit validation are both enabled");
+    SyncValSettings settings;
+    settings.full_validation = true;  // record time validation stays enabled
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Event event(*m_device);
+
+    m_command_buffer.Begin();
+    m_command_buffer.ResetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Allow the record-time race report; submit replay must not report it again
+    m_errorMonitor->SetAllowedFailureMsg("SYNC-vkCmdSetEvent-reset-race");
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    m_command_buffer.End();
+    m_errorMonitor->Reset();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, WaitEventsImageTransitionPriorSubmission) {
+    TEST_DESCRIPTION("A wait event layout transition hazard against a prior submission is reported despite record dedup");
+    SyncValSettings settings;
+    settings.full_validation = true;  // record time validation stays enabled
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Event event(*m_device);
+    vkt::Image image(*m_device, 64, 64, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    const VkClearColorValue clear_color = {};
+    const VkImageSubresourceRange subresource_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    // Submission A: an image write that is not made available
+    vkt::CommandBuffer write_cb(*m_device, m_command_pool);
+    write_cb.Begin();
+    vk::CmdClearColorImage(write_cb, image, VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1, &subresource_range);
+    write_cb.End();
+    m_default_queue->Submit(write_cb);
+
+    // Command buffer B: the wait's layout transition does not synchronize with A's write.
+    // Recording cannot see submission A, so no error is reported here; the hazard must
+    // come from submit replay even though the set event belongs to this command buffer.
+    VkImageMemoryBarrier image_barrier = vku::InitStructHelper();
+    image_barrier.srcAccessMask = 0;
+    image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.image = image;
+    image_barrier.subresourceRange = subresource_range;
+
+    m_command_buffer.Begin();
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+    vk::CmdWaitEvents(m_command_buffer, 1, &event.handle(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0, nullptr, 1, &image_barrier);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, WaitEventsImageTransitionSubmitOnly) {
+    TEST_DESCRIPTION("Submit time replay reconstructs the layout transition write of a wait event image barrier");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Event event(*m_device);
+    vkt::Image image(*m_device, 64, 64, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    const VkClearColorValue clear_color = {};
+    const VkImageSubresourceRange subresource_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    // The wait's dst scope does not cover the second clear, so the clear hazards with the
+    // most recent write: the image barrier's layout transition performed by the wait.
+    VkImageMemoryBarrier image_barrier = vku::InitStructHelper();
+    image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    image_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.image = image;
+    image_barrier.subresourceRange = subresource_range;
+
+    m_command_buffer.Begin();
+    vk::CmdClearColorImage(m_command_buffer, image, VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1, &subresource_range);
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vk::CmdWaitEvents(m_command_buffer, 1, &event.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, nullptr, 0, nullptr, 1, &image_barrier);
+    // WAW against the layout transition write, not reported during recording
+    vk::CmdClearColorImage(m_command_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, 1, &subresource_range);
+    m_command_buffer.End();
+
+    // The prior access must be the reconstructed layout transition write, not the first clear
+    m_errorMonitor->SetDesiredError("written during an image layout transition");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, DrawSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, draw vertex buffer hazards are reported by submit time replay");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Buffer source_buffer(*m_device, 24, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    vkt::Buffer vertex_buffer(*m_device, 24, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    VkVertexInputBindingDescription vertex_binding = {0, 12, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vertex_attrib = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+
+    VkPipelineRenderingCreateInfo pipeline_rendering_info = vku::InitStructHelper();
+    CreatePipelineHelper pipe(*this, &pipeline_rendering_info);
+    pipe.vi_ci_.pVertexBindingDescriptions = &vertex_binding;
+    pipe.vi_ci_.vertexBindingDescriptionCount = 1;
+    pipe.vi_ci_.pVertexAttributeDescriptions = &vertex_attrib;
+    pipe.vi_ci_.vertexAttributeDescriptionCount = 1;
+    pipe.cb_ci_.attachmentCount = 0;
+    pipe.CreateGraphicsPipeline();
+
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {64, 64};
+    rendering_info.layerCount = 1;
+
+    const VkDeviceSize offset = 0;
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(source_buffer, vertex_buffer);
+    m_command_buffer.BeginRendering(rendering_info);
+    vk::CmdBindVertexBuffers(m_command_buffer, 0, 1, &vertex_buffer.handle(), &offset);
+    vk::CmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    // The draw reads the vertex buffer: RAW against the copy, not reported during recording
+    vk::CmdDraw(m_command_buffer, 2, 1, 0, 0);
+    m_command_buffer.EndRendering();
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, ExecuteCommandsSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, secondary command buffer hazards are reported by submit time replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+
+    vkt::CommandBuffer secondary_cb(*m_device, m_command_pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+    secondary_cb.Begin();
+    secondary_cb.Copy(buffer_a, buffer_b);
+    secondary_cb.End();
+
+    m_command_buffer.Begin();
+    vk::CmdFillBuffer(m_command_buffer, buffer_a, 0, 256, 0);
+    // The secondary copy reads buffer_a: RAW against the fill, not reported during recording
+    vk::CmdExecuteCommands(m_command_buffer, 1, &secondary_cb.handle());
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, BeginRenderingLoadSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, rendering load op hazards are reported by submit time replay");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    vkt::Image src_image(*m_device, 64, 64, color_format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    vkt::Image image(*m_device, 64, 64, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    vkt::ImageView image_view = image.CreateView();
+
+    VkRenderingAttachmentInfo color_attachment = vku::InitStructHelper();
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {64, 64};
+    rendering_info.layerCount = 1;
+    rendering_info.colorAttachmentCount = 1;
+    rendering_info.pColorAttachments = &color_attachment;
+
+    VkImageCopy copy_region = {};
+    copy_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.extent = {64, 64, 1};
+
+    m_command_buffer.Begin();
+    vk::CmdCopyImage(m_command_buffer, src_image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+    // loadOp CLEAR writes the attachment: WAW against the copy, not reported during recording
+    m_command_buffer.BeginRendering(rendering_info);
+    m_command_buffer.EndRendering();
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, ClearAttachmentsSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, attachment clear hazards are reported by submit time replay");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    vkt::Image image(*m_device, 64, 64, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    vkt::Image dst_image(*m_device, 64, 64, color_format, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    vkt::ImageView image_view = image.CreateView();
+
+    VkRenderingAttachmentInfo color_attachment = vku::InitStructHelper();
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {64, 64};
+    rendering_info.layerCount = 1;
+    rendering_info.colorAttachmentCount = 1;
+    rendering_info.pColorAttachments = &color_attachment;
+
+    VkImageCopy copy_region = {};
+    copy_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.extent = {64, 64, 1};
+
+    const VkClearAttachment clear_attachment = {VK_IMAGE_ASPECT_COLOR_BIT, 0};
+    VkClearRect clear_rect = {};
+    clear_rect.rect = {{0, 0}, {64, 64}};
+    clear_rect.baseArrayLayer = 0;
+    clear_rect.layerCount = 1;
+
+    m_command_buffer.Begin();
+    vk::CmdCopyImage(m_command_buffer, image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+    m_command_buffer.BeginRendering(rendering_info);
+    // The clear writes the attachment: WAR against the copy read, not reported during recording
+    vk::CmdClearAttachments(m_command_buffer, 1, &clear_attachment, 1, &clear_rect);
+    m_command_buffer.EndRendering();
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
 }
 
 TEST_F(NegativeSyncVal, BufferCopyWrongBarrier) {
@@ -5001,6 +5502,146 @@ TEST_F(NegativeSyncVal, QSBufferCopyHazards) {
     m_default_queue->Wait();
 }
 
+TEST_F(NegativeSyncStream, QSBufferCopyHazardsSubmitReplay) {
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::CommandBuffer cb0(*m_device, m_command_pool);
+    vkt::CommandBuffer cb1(*m_device, m_command_pool);
+
+    vkt::Buffer buffer_a(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    vkt::Buffer buffer_b(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    vkt::Buffer buffer_c(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    cb0.Begin(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT);
+    cb0.Copy(buffer_a, buffer_b);
+    cb0.End();
+
+    cb1.Begin(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT);
+    cb1.Copy(buffer_c, buffer_a);
+    cb1.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit({cb0, cb1});
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+
+    VkSubmitInfo submits[2];
+    submits[0] = vku::InitStructHelper();
+    submits[0].commandBufferCount = 1;
+    submits[0].pCommandBuffers = &cb0.handle();
+    submits[1] = vku::InitStructHelper();
+    submits[1].commandBufferCount = 1;
+    submits[1].pCommandBuffers = &cb1.handle();
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    vk::QueueSubmit(*m_default_queue, 2, submits, VK_NULL_HANDLE);
+    m_errorMonitor->VerifyFound();
+
+    // The failed submits were not recorded, so the queue context is still empty.
+    m_default_queue->Submit(cb0);
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(cb1);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+
+    // The failed submit was not recorded. Exercise disjoint ranges and multiple same-stream barriers.
+    const VkBufferCopy first_half = {0, 0, 128};
+    const VkBufferCopy second_half = {128, 128, 128};
+    cb0.Begin();
+    vk::CmdCopyBuffer(cb0, buffer_a, buffer_c, 1, &first_half);
+    vk::CmdCopyBuffer(cb0, buffer_a, buffer_c, 1, &second_half);
+    cb0.End();
+    m_default_queue->Submit(cb0);
+
+    VkBufferMemoryBarrier barrier_war = vku::InitStructHelper();
+    barrier_war.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier_war.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier_war.size = 256;
+
+    VkBufferMemoryBarrier barrier_raw = vku::InitStructHelper();
+    barrier_raw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier_raw.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier_raw.size = 256;
+
+    cb1.Begin();
+    barrier_war.buffer = buffer_a;
+    vk::CmdPipelineBarrier(cb1, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier_war, 0,
+                           nullptr);
+    cb1.Copy(buffer_b, buffer_a);
+
+    barrier_raw.buffer = buffer_c;
+    vk::CmdPipelineBarrier(cb1, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier_raw, 0,
+                           nullptr);
+    barrier_war.buffer = buffer_b;
+    vk::CmdPipelineBarrier(cb1, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier_war, 0,
+                           nullptr);
+    cb1.Copy(buffer_c, buffer_b);
+    cb1.End();
+    m_default_queue->Submit(cb1);
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, QSBufferCopySubmitOnlyCrossCommandBuffer) {
+    TEST_DESCRIPTION("With record time validation disabled, a hazard between two submitted command buffers is reported");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::CommandBuffer cb0(*m_device, m_command_pool);
+    vkt::CommandBuffer cb1(*m_device, m_command_pool);
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+    vkt::Buffer buffer_c(*m_device, 256, usage);
+
+    cb0.Begin();
+    cb0.Copy(buffer_a, buffer_b);
+    cb0.End();
+    m_default_queue->Submit(cb0);
+
+    cb1.Begin();
+    cb1.Copy(buffer_c, buffer_a);
+    cb1.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(cb1);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, EventHazardDedupRecordAndSubmit) {
+    TEST_DESCRIPTION("A hazard around event synchronization is reported once when record and submit validation are both enabled");
+    SyncValSettings settings;
+    settings.full_validation = true;  // record time validation stays enabled
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::Event event(*m_device);
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkt::Buffer buffer_a(*m_device, 256, usage);
+    vkt::Buffer buffer_b(*m_device, 256, usage);
+
+    m_command_buffer.Begin();
+    vk::CmdFillBuffer(m_command_buffer, buffer_a, 0, 256, 0);
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Execution-only wait: the fill write is not made available, the copy read hazards
+    vk::CmdWaitEvents(m_command_buffer, 1, &event.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                      nullptr, 0, nullptr, 0, nullptr);
+    // Allow the record-time hazard without aborting the copy, so it stays in the command stream
+    m_errorMonitor->SetAllowedFailureMsg("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_command_buffer.Copy(buffer_a, buffer_b);
+    m_command_buffer.End();
+    m_errorMonitor->Reset();
+
+    // Submit replay must suppress the hazard already reported during recording
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
 TEST_F(NegativeSyncVal, QSSubmit2) {
     SetTargetApiVersion(VK_API_VERSION_1_3);
     AddRequiredFeature(vkt::Feature::synchronization2);
@@ -5031,6 +5672,49 @@ TEST_F(NegativeSyncVal, QSSubmit2) {
     m_errorMonitor->VerifyFound();
 
     // Since the last submit skipped, we need a wait that will success
+    cb2.Begin();
+    cb2.End();
+    m_default_queue->Submit2(cb2, vkt::Wait(semaphore));
+    m_default_queue->Wait();
+
+    // This time with the correct first sync scope
+    m_default_queue->Submit2(cb0, vkt::Signal(semaphore, VK_PIPELINE_STAGE_TRANSFER_BIT));
+    m_default_queue->Submit2(cb1, vkt::Wait(semaphore, VK_PIPELINE_STAGE_TRANSFER_BIT));
+    m_default_queue->Wait();
+}
+
+TEST_F(NegativeSyncStream, QSSubmit2SubmitReplay) {
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    SyncValSettings settings;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::CommandBuffer cb0(*m_device, m_command_pool);
+    vkt::CommandBuffer cb1(*m_device, m_command_pool);
+    vkt::CommandBuffer cb2(*m_device, m_command_pool);
+
+    vkt::Buffer buffer_a(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    vkt::Buffer buffer_b(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    vkt::Buffer buffer_c(*m_device, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    cb0.Begin();
+    cb0.Copy(buffer_a, buffer_b);
+    cb0.End();
+
+    cb1.Begin();
+    cb1.Copy(buffer_c, buffer_a);
+    cb1.End();
+
+    vkt::Semaphore semaphore(*m_device);
+
+    // Test that the signal mask is controlling the first scope
+    m_default_queue->Submit2(cb0, vkt::Signal(semaphore, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT));
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit2(cb1);
+    m_errorMonitor->VerifyFound();
+
+    // Since the last submit skipped, we need a wait that will succeed
     cb2.Begin();
     cb2.End();
     m_default_queue->Submit2(cb2, vkt::Wait(semaphore));
@@ -6961,6 +7645,59 @@ TEST_F(NegativeSyncVal, RacingHazardBetweenLayoutTransitions) {
 
     // c) The first queue again.
     // Submit layout transition on the first queue again without synchronization.
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-RACING-WRITE");
+    queue->Submit2(cb_next_transition);
+    m_errorMonitor->VerifyFound();
+
+    m_device->Wait();
+}
+
+TEST_F(NegativeSyncStream, RacingHazardBetweenLayoutTransitionsSubmitReplay) {
+    all_queue_count_ = true;
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::synchronization2);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    auto [queue, queue2] = GetTwoQueuesFromSameFamily(m_device->QueuesWithComputeCapability());
+    if (!queue) {
+        GTEST_SKIP() << "Test requires two queues with compute capabilities from the same queue family";
+    }
+
+    vkt::CommandPool command_pool(*m_device, queue->family_index);
+    vkt::Image image(*m_device, 64, 64, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT);
+    vkt::Semaphore semaphore(*m_device);
+
+    VkImageMemoryBarrier2 transition = vku::InitStructHelper();
+    transition.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    transition.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    transition.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    transition.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    transition.image = image;
+    transition.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    vkt::CommandBuffer cb_transition(*m_device, command_pool);
+    cb_transition.Begin();
+    cb_transition.Barrier(transition);
+    cb_transition.End();
+
+    vkt::CommandBuffer cb_next_transition(*m_device, command_pool);
+    cb_next_transition.Begin();
+    cb_next_transition.Barrier(transition);
+    cb_next_transition.End();
+
+    vkt::CommandBuffer cb2_transition(*m_device, command_pool);
+    cb2_transition.Begin();
+    cb2_transition.Barrier(transition);
+    cb2_transition.End();
+
+    queue->Submit2(cb_transition, vkt::Signal(semaphore, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT));
+    queue2->Submit2(cb2_transition, vkt::Wait(semaphore, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT));
+
     m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-RACING-WRITE");
     queue->Submit2(cb_next_transition);
     m_errorMonitor->VerifyFound();

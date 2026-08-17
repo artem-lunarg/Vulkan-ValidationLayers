@@ -215,7 +215,7 @@ struct ReadState {
     QueueId queue;
 
     void Set(VkPipelineStageFlagBits2 stage, SyncAccessIndex access_index, const AttachmentAccess& attachment_access,
-             ResourceUsageTagEx tag_ex);
+             ResourceUsageTagEx tag_ex, QueueId queue_id = kQueueIdInvalid);
 
     ResourceUsageTagEx TagEx() const { return {tag, handle_index}; }
     bool operator==(const ReadState& rhs) const {
@@ -266,7 +266,8 @@ struct WriteState {
 
     SyncFlags flags;
 
-    void Set(SyncAccessIndex access_index, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags);
+    void Set(SyncAccessIndex access_index, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
+             QueueId queue_id = kQueueIdInvalid);
     void SetQueueId(QueueId id);
     void MergeBarriers(const WriteState& other);
 
@@ -313,6 +314,7 @@ struct PendingWriteBarrier {
 struct PendingLayoutTransition {
     OrderingBarrier ordering;
     uint32_t handle_index;
+    QueueId queue_id;
 };
 
 // PendingBarriers stores the results of independent barrier applications, so the applied barriers
@@ -333,7 +335,7 @@ struct PendingBarriers {
     void AddReadBarrier(AccessState* access_state, uint32_t last_reads_index, const SyncBarrier& barrier);
     void AddWriteBarrier(AccessState* access_state, const SyncBarrier& barrier);
     void AddLayoutTransition(AccessState* access_state, const OrderingBarrier& layout_transition_ordering_barrier,
-                             uint32_t layout_transition_handle_index);
+                             uint32_t layout_transition_handle_index, QueueId queue_id = kQueueIdInvalid);
 
     // Update accesss state with collected barriers
     void Apply(const ResourceUsageTag exec_tag);
@@ -372,9 +374,9 @@ class AccessState {
                                      QueueId event_queue, ResourceUsageTag event_tag) const;
 
     void Update(const SyncAccessInfo& usage_info, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                SyncFlags flags = 0);
+                SyncFlags flags = 0, QueueId queue_id = kQueueIdInvalid);
     void SetWrite(SyncAccessIndex access_index, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                  SyncFlags flags = 0);
+                  SyncFlags flags = 0, QueueId queue_id = kQueueIdInvalid);
     void ClearWrite();
     void ClearRead();
     void ClearFirstUse();
@@ -383,13 +385,14 @@ class AccessState {
     // Apply a single barrier to the access state
     bool ApplyBarrier(const BarrierScope& barrier_scope, const SyncBarrier& barrier, bool layout_transition = false,
                       uint32_t layout_transition_handle_index = vvl::kNoIndex32,
-                      ResourceUsageTag layout_transition_tag = kInvalidTag);
+                      ResourceUsageTag layout_transition_tag = kInvalidTag, QueueId layout_transition_queue = kQueueIdInvalid);
 
     // Store the result of barrier application in PendingBarriers.
     // Does not update the access state (as ApplyBarrier does).
     // Used for applying multiple barriers independently.
     void CollectPendingBarriers(const BarrierScope& barrier_scope, const SyncBarrier& barrier, bool layout_transition,
-                                uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers);
+                                uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers,
+                                QueueId layout_transition_queue = kQueueIdInvalid);
 
     // Apply pending barriers to the access state.
     // Called after all barrier application results are collected in PendingBarriers.
@@ -577,7 +580,7 @@ bool AccessState::ClearPredicatedAccesses(Predicate& predicate) {
 // NOTE: That's for use cases when BarrierScope does not use queue id or tag (record time, not-event barriers).
 // This can be extended if necessary to provide BarrierScope for each barrier.
 void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& barriers, bool layout_transition = false,
-                   ResourceUsageTag layout_transition_tag = kInvalidTag);
+                   ResourceUsageTag layout_transition_tag = kInvalidTag, QueueId layout_transition_queue = kQueueIdInvalid);
 
 // Global registry of layout transition ordering barriers
 ThreadSafeLookupTable<OrderingBarrier>& GetLayoutOrderingBarrierLookup();

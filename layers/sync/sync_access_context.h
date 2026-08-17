@@ -63,7 +63,7 @@ struct ApplySingleBufferBarrierFunctor {
 struct ApplySingleImageBarrierFunctor {
     ApplySingleImageBarrierFunctor(const AccessContext& access_context, const BarrierScope& barrier_scope,
                                    const SyncBarrier& barrier, bool layout_transition, uint32_t layout_transition_handle_index,
-                                   ResourceUsageTag exec_tag);
+                                   ResourceUsageTag exec_tag, bool apply_layout_transition_on_queue = false);
 
     using Iterator = AccessMap::iterator;
     Iterator Infill(AccessMap* accesses, const Iterator& pos_hint, const AccessRange& range) const;
@@ -107,16 +107,15 @@ struct ApplyMarkupFunctor {
 // After this functor finished its work then PendingBarriers::Apply() can be used to update the access states.
 struct CollectBarriersFunctor {
     CollectBarriersFunctor(const AccessContext& access_context, const BarrierScope& barrier_scope, const SyncBarrier& barrier,
-                           bool layout_transition, uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers)
+                           bool layout_transition, uint32_t layout_transition_handle_index, PendingBarriers& pending_barriers,
+                           bool apply_layout_transition_on_queue = false)
         : access_context(access_context),
           barrier_scope(barrier_scope),
           barrier(barrier),
           layout_transition(layout_transition),
           layout_transition_handle_index(layout_transition_handle_index),
           pending_barriers(pending_barriers) {
-        // Suppress layout transition during submit time application.
-        // It add write access but this is necessary only during recording.
-        if (barrier_scope.scope_queue != kQueueIdInvalid) {
+        if (barrier_scope.scope_queue != kQueueIdInvalid && !apply_layout_transition_on_queue) {
             this->layout_transition = false;
             this->layout_transition_handle_index = vvl::kNoIndex32;
         }
@@ -174,11 +173,17 @@ struct ApplySubpassBarrierAction {
 };
 
 struct ApplySubpassTransitionBarrierAction {
-    ApplySubpassTransitionBarrierAction(const SubpassBarrier& subpass_barrier, ResourceUsageTag layout_transition_tag)
-        : subpass_barrier(subpass_barrier), layout_transition_tag(layout_transition_tag) {}
-    void operator()(AccessState* access) const { ApplyBarriers(*access, subpass_barrier.barriers, true, layout_transition_tag); }
+    ApplySubpassTransitionBarrierAction(const SubpassBarrier& subpass_barrier, ResourceUsageTag layout_transition_tag,
+                                        QueueId layout_transition_queue)
+        : subpass_barrier(subpass_barrier),
+          layout_transition_tag(layout_transition_tag),
+          layout_transition_queue(layout_transition_queue) {}
+    void operator()(AccessState* access) const {
+        ApplyBarriers(*access, subpass_barrier.barriers, true, layout_transition_tag, layout_transition_queue);
+    }
     const SubpassBarrier& subpass_barrier;
     const ResourceUsageTag layout_transition_tag;
+    const QueueId layout_transition_queue;
 };
 
 class AttachmentViewGen {
@@ -272,13 +277,15 @@ class AccessContext {
     void ResolveChildContexts(vvl::span<AccessContext> subpass_contexts);
 
     void UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex current_usage, const AccessRange& range,
-                           ResourceUsageTagEx tag_ex, SyncFlags flags = 0);
-    void UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage, ResourceUsageTagEx tag_ex, SyncFlags flags = 0);
+                           ResourceUsageTagEx tag_ex, SyncFlags flags = 0, QueueId queue_id = kQueueIdInvalid);
+    void UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage, ResourceUsageTagEx tag_ex, SyncFlags flags = 0,
+                           QueueId queue_id = kQueueIdInvalid);
     void UpdateAttachmentAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage,
-                                     const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex);
+                                     const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
+                                     QueueId queue_id = kQueueIdInvalid);
     void UpdateAttachmentAccessState(const AttachmentViewGen& view_gen, AttachmentViewGen::Gen gen_type,
                                      SyncAccessIndex current_usage, const AttachmentAccess& attachment_access,
-                                     ResourceUsageTagEx tag_ex, uint32_t view_mask = 0);
+                                     ResourceUsageTagEx tag_ex, uint32_t view_mask = 0, QueueId queue_id = kQueueIdInvalid);
 
     void ImportAsyncContexts(const AccessContext& from);
     void ClearAsyncContexts() { async_.clear(); }
@@ -360,16 +367,20 @@ class AccessContext {
     HazardResult DetectHazard(const vvl::ImageView& image_view, const VkOffset3D& offset, const VkExtent3D& extent,
                               SyncAccessIndex current_usage) const;
 
+    // The attachment ordering rules only apply to accesses on the same queue: pass the queue that
+    // stamped the applied accesses (invalid queue id at command buffer record time, the batch queue
+    // during submit time replay).
     HazardResult DetectAttachmentHazard(ImageRangeGen& range_gen, SyncAccessIndex current_usage,
-                                        const AttachmentAccess& attachment_access) const;
+                                        const AttachmentAccess& attachment_access, QueueId queue_id = kQueueIdInvalid) const;
     HazardResult DetectAttachmentHazard(const AttachmentViewGen& view_gen, AttachmentViewGen::Gen gen_type,
                                         SyncAccessIndex current_usage, const AttachmentAccess& attachment_access,
-                                        uint32_t view_mask) const;
+                                        uint32_t view_mask, QueueId queue_id = kQueueIdInvalid) const;
     HazardResult DetectAttachmentHazard(const vvl::Image& image, const VkImageSubresourceRange& subresource_range,
                                         bool is_depth_sliced, SyncAccessIndex current_usage,
                                         const AttachmentAccess& attachment_access) const;
     HazardResult DetectAttachmentHazard(const vvl::ImageView& image_view, const VkOffset3D& offset, const VkExtent3D& extent,
-                                        SyncAccessIndex current_usage, const AttachmentAccess& attachment_access) const;
+                                        SyncAccessIndex current_usage, const AttachmentAccess& attachment_access,
+                                        QueueId queue_id = kQueueIdInvalid) const;
 
     HazardResult DetectImageBarrierHazard(const vvl::Image& image, const VkImageSubresourceRange& subresource_range,
                                           VkPipelineStageFlags2 src_exec_scope, const SyncAccessFlags& src_access_scope,
@@ -377,11 +388,12 @@ class AccessContext {
                                           DetectOptions options) const;
     HazardResult DetectImageBarrierHazard(const vvl::Image& image, VkPipelineStageFlags2 src_exec_scope,
                                           const SyncAccessFlags& src_access_scope, const VkImageSubresourceRange& subresource_range,
-                                          bool is_depth_sliced, DetectOptions options) const;
-    HazardResult DetectImageBarrierHazard(const AttachmentViewGen& attachment_view, const SyncBarrier& barrier,
+                                          bool is_depth_sliced, DetectOptions options, QueueId queue_id = kQueueIdInvalid) const;
+    HazardResult DetectImageBarrierHazard(const AttachmentViewGen& attachment_view, const SyncBarrier& barrier, QueueId queue_id,
                                           DetectOptions options) const;
 
-    HazardResult DetectSubpassTransitionHazard(const SubpassBarrier& subpass_barrier, const AttachmentViewGen& attach_view) const;
+    HazardResult DetectSubpassTransitionHazard(const SubpassBarrier& subpass_barrier, const AttachmentViewGen& attach_view,
+                                               QueueId queue_id = kQueueIdInvalid) const;
 
     HazardResult DetectFirstUseHazard(QueueId queue_id, const ResourceUsageRange& tag_range,
                                       const AccessContext& destination_context) const;
@@ -420,7 +432,8 @@ class AccessContext {
     AccessMap::iterator ResolveGapRecursePrev(const AccessRange& gap_range, AccessMap::iterator pos_hint);
 
     AccessMap::iterator DoUpdateAccessState(AccessMap::iterator pos, const AccessRange& range, SyncAccessIndex access_index,
-                                            const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags);
+                                            const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
+                                            QueueId queue_id = kQueueIdInvalid);
 
     // A recursive range walkers for hazard detection, first for the current context
     // and then walks the DAG of the contexts for subpasses

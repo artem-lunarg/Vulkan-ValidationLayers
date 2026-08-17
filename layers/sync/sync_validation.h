@@ -170,8 +170,6 @@ class SyncValidator : public vvl::DeviceProxy {
     bool PreCallValidateCmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2* pCopyImageInfo,
                                       const ErrorObject& error_obj) const override;
 
-    bool ValidateCmdPipelineBarrier(const CommandBufferContext& cb_context, const BarrierSet& barrier_set,
-                                    const Location& loc) const;
     bool PreCallValidateCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
                                            VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags,
                                            uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers,
@@ -265,16 +263,6 @@ class SyncValidator : public vvl::DeviceProxy {
     bool PreCallValidateCmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2* pBlitImageInfo,
                                       const ErrorObject& error_obj) const override;
 
-    bool ValidateIndirectBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context,
-                                const VkDeviceSize struct_size, const VkBuffer buffer, const VkDeviceSize offset,
-                                const uint32_t drawCount, const uint32_t stride, const Location& loc) const;
-    void RecordIndirectBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, const VkDeviceSize struct_size,
-                              const VkBuffer buffer, const VkDeviceSize offset, const uint32_t drawCount, uint32_t stride);
-
-    bool ValidateCountBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context, VkBuffer buffer,
-                             VkDeviceSize offset, const Location& loc, const char* count_buffer_label = "draw count") const;
-    void RecordCountBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, VkBuffer buffer, VkDeviceSize offset);
-
     bool PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, uint32_t z,
                                     const ErrorObject& error_obj) const override;
     void PostCallRecordCmdDispatch(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, uint32_t z,
@@ -323,8 +311,6 @@ class SyncValidator : public vvl::DeviceProxy {
     bool PreCallValidateCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                                              VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
                                              uint32_t stride, const ErrorObject& error_obj) const override;
-    void RecordCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
-                                    VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride, Func command);
     void PostCallRecordCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                                             VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
                                             uint32_t stride, const RecordObject& record_obj) override;
@@ -344,9 +330,6 @@ class SyncValidator : public vvl::DeviceProxy {
     bool PreCallValidateCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                                                     VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
                                                     uint32_t stride, const ErrorObject& error_obj) const override;
-    void RecordCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-                                           VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
-                                           uint32_t stride, Func command);
     void PostCallRecordCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                                                    VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
                                                    uint32_t stride, const RecordObject& record_obj) override;
@@ -572,10 +555,19 @@ class SyncValidator : public vvl::DeviceProxy {
                                                                const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo,
                                                                const RecordObject& record_obj) override;
 
-    bool ValidateSbtBuffer(const CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                           const Location& loc, const char* sbt_buffer_label) const;
-    void RecordSbtBuffer(CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                         ResourceUsageTag tag);
+    void AddSbtBufferAccess(TraceRaysCommand& command, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
+                            const char* sbt_buffer_label) const;
+    void AddVideoDecodeAccesses(VideoCommand& command, const vvl::VideoSession& vs_state,
+                                const VkVideoDecodeInfoKHR& decode_info) const;
+    void AddVideoEncodeAccesses(VideoCommand& command, const vvl::VideoSession& vs_state,
+                                const VkVideoEncodeInfoKHR& encode_info) const;
+    void AddAccelerationStructureAccess(AccelerationStructureCommand& command, VkAccelerationStructureKHR accel,
+                                        SyncAccessIndex access_index, const Location& as_loc, bool apply = true) const;
+    void AddAccelerationStructureBuildAccesses(AccelerationStructureCommand& command,
+                                               const VkAccelerationStructureBuildGeometryInfoKHR& info,
+                                               const VkAccelerationStructureBuildRangeInfoKHR* p_range_infos,
+                                               const Location& info_loc) const;
+    void AddTraceRaysIndirectAccess(TraceRaysCommand& command, VkDeviceAddress indirect_address, VkDeviceSize struct_size) const;
     bool PreCallValidateCmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                                         const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
                                         const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,

@@ -17,8 +17,206 @@
 
 #include "sync_val_tests.h"
 #include "render_pass_helper.h"
+#include "sync/sync_settings.h"
 
 struct PositiveSyncValRenderPass : public VkSyncValTest {};
+
+TEST_F(PositiveSyncValRenderPass, RenderPassEventSubmitOnly) {
+    TEST_DESCRIPTION("In submit-only mode an event wait synchronizes the store op with a later copy during replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image image(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    vkt::Image dst_image(*m_device, width, height, color_format, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    dst_image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::ImageView image_view = image.CreateView();
+
+    RenderPassSingleSubpass render_pass(*this);
+    render_pass.AddAttachmentDescription(color_format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE);
+    render_pass.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    render_pass.CreateRenderPass();
+
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 1, &image_view.handle(), width, height);
+
+    vkt::Event event(*m_device);
+
+    VkMemoryBarrier barrier = vku::InitStructHelper();
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkImageCopy copy_region = {};
+    copy_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.extent = {width, height, 1};
+
+    // The event wait synchronizes the store op write with the copy read. All accesses and
+    // the event first scope are reconstructed during submit replay.
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.SetEvent(event, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    vk::CmdWaitEvents(m_command_buffer, 1, &event.handle(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &barrier, 0, nullptr, 0, nullptr);
+    vk::CmdCopyImage(m_command_buffer, image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+    m_command_buffer.End();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
+TEST_F(PositiveSyncValRenderPass, NextSubpassTransitionAndLoadSubmitOnly) {
+    TEST_DESCRIPTION("In submit-only mode the next subpass load op is ordered against the first-use layout transition");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image image_a(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    image_a.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::ImageView view_a = image_a.CreateView();
+    vkt::Image image_b(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    image_b.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::ImageView view_b = image_b.CreateView();
+
+    VkAttachmentDescription attachments[2] = {};
+    attachments[0].format = color_format;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    // First used in subpass 1: the layout transition happens at vkCmdNextSubpass, immediately
+    // followed by the load op that must be ordered against it during submit replay.
+    attachments[1] = attachments[0];
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    const VkAttachmentReference color_ref_0 = {0, VK_IMAGE_LAYOUT_GENERAL};
+    const VkAttachmentReference color_ref_1 = {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription subpasses[2] = {};
+    subpasses[0].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpasses[0].colorAttachmentCount = 1;
+    subpasses[0].pColorAttachments = &color_ref_0;
+    subpasses[1].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpasses[1].colorAttachmentCount = 1;
+    subpasses[1].pColorAttachments = &color_ref_1;
+
+    VkRenderPassCreateInfo render_pass_ci = vku::InitStructHelper();
+    render_pass_ci.attachmentCount = 2;
+    render_pass_ci.pAttachments = attachments;
+    render_pass_ci.subpassCount = 2;
+    render_pass_ci.pSubpasses = subpasses;
+
+    vkt::RenderPass render_pass(*m_device, render_pass_ci);
+
+    const VkImageView views[2] = {view_a, view_b};
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 2, views, width, height);
+
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_command_buffer.NextSubpass();
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.End();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
+TEST_F(PositiveSyncValRenderPass, FinalTransitionAfterStoreSubmitOnly) {
+    TEST_DESCRIPTION("In submit-only mode the external dependency orders the final layout transition after the store op");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image image(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    image.SetLayout(VK_IMAGE_LAYOUT_GENERAL);
+    vkt::ImageView image_view = image.CreateView();
+
+    VkSubpassDependency external_dependency = {};
+    external_dependency.srcSubpass = 0;
+    external_dependency.dstSubpass = VK_SUBPASS_EXTERNAL;
+    external_dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    external_dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    external_dependency.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    external_dependency.dstAccessMask = 0;
+
+    RenderPassSingleSubpass render_pass(*this);
+    render_pass.AddAttachmentDescription(color_format, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE);
+    render_pass.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    render_pass.AddSubpassDependency(external_dependency);
+    render_pass.CreateRenderPass();
+
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 1, &image_view.handle(), width, height);
+
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.End();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
+
+TEST_F(PositiveSyncValRenderPass, StoreOpAfterClearSubmitOnly) {
+    TEST_DESCRIPTION("In submit-only mode the store op is ordered against the attachment clear during replay");
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+    vkt::Image image(*m_device, width, height, color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    vkt::ImageView image_view = image.CreateView();
+
+    RenderPassSingleSubpass render_pass(*this);
+    render_pass.AddAttachmentDescription(color_format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE);
+    render_pass.AddColorAttachment(0, VK_IMAGE_LAYOUT_GENERAL);
+    render_pass.CreateRenderPass();
+
+    vkt::Framebuffer framebuffer(*m_device, render_pass, 1, &image_view.handle(), width, height);
+
+    const VkClearAttachment clear_attachment = {VK_IMAGE_ASPECT_COLOR_BIT, 0};
+    VkClearRect clear_rect = {};
+    clear_rect.rect = {{0, 0}, {width, height}};
+    clear_rect.baseArrayLayer = 0;
+    clear_rect.layerCount = 1;
+
+    // The store op write is raster ordered against the attachment clear within the render
+    // pass instance; the replayed accesses carry the batch queue, so the ordering check
+    // must use the same queue or this reports a false WAW.
+    m_command_buffer.Begin();
+    m_command_buffer.BeginRenderPass(render_pass, framebuffer, width, height);
+    vk::CmdClearAttachments(m_command_buffer, 1, &clear_attachment, 1, &clear_rect);
+    m_command_buffer.EndRenderPass();
+    m_command_buffer.End();
+
+    m_default_queue->Submit(m_command_buffer);
+    m_default_queue->Wait();
+}
 
 TEST_F(PositiveSyncValRenderPass, SyncStoreOpWriteWithPreviousRead) {
     TEST_DESCRIPTION("Synchronize StoreOp writes with previous copy reads");

@@ -243,7 +243,8 @@ void SyncEventState::AddReferencedTags(ResourceUsageTagSet& referenced) const {
 }
 
 bool ValidateCmdSetEvent(const SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event,
-                         const SyncExecScope& src_exec_scope, ResourceUsageTag base_tag, const Location& loc) {
+                         const SyncExecScope& src_exec_scope, ResourceUsageTag base_tag, const Location& loc,
+                         const ResourceUsageRange& record_time_validated_tags) {
     bool skip = false;
 
     const auto* sync_event = env.events_context.Get(event);
@@ -252,6 +253,9 @@ bool ValidateCmdSetEvent(const SyncEnvironment& env, const std::shared_ptr<const
     }
     if (sync_event->last_command_tag >= base_tag) {
         return skip;  // for replay we don't want to revalidate internal "last commmand"
+    }
+    if (record_time_validated_tags.includes(sync_event->last_command_tag)) {
+        return skip;  // the race against this event command was already reported at record time
     }
     if (!sync_event->HasBarrier(src_exec_scope.stage_mask, src_exec_scope.exec_scope)) {
         const std::string vuid_prefix = std::string("SYNC-") + vvl::String(loc.function);
@@ -281,7 +285,8 @@ bool ValidateCmdSetEvent(const SyncEnvironment& env, const std::shared_ptr<const
 }
 
 bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event,
-                           const SyncExecScope& exec_scope, ResourceUsageTag base_tag, const Location& loc) {
+                           const SyncExecScope& exec_scope, ResourceUsageTag base_tag, const Location& loc,
+                           const ResourceUsageRange& record_time_validated_tags) {
     bool skip = false;
     const auto* sync_event = env.events_context.Get(event);
     if (!sync_event) {
@@ -289,6 +294,9 @@ bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<con
     }
     if (sync_event->last_command_tag > base_tag) {
         return skip;  // if we validated this in recording of the secondary, don't repeat
+    }
+    if (record_time_validated_tags.includes(sync_event->last_command_tag)) {
+        return skip;  // the race against this event command was already reported at record time
     }
     if (IsValueIn(sync_event->last_command, {vvl::Func::vkCmdSetEvent, vvl::Func::vkCmdSetEvent2, vvl::Func::vkCmdSetEvent2KHR}) &&
         !sync_event->HasBarrier(exec_scope.stage_mask, exec_scope.exec_scope)) {
@@ -301,7 +309,8 @@ bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<con
 }
 
 bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::shared_ptr<const vvl::Event>>& events,
-                           const ResourceUsageTag base_tag, const Location& loc) {
+                           const ResourceUsageTag base_tag, const Location& loc,
+                           const ResourceUsageRange& record_time_validated_tags) {
     bool skip = false;
     for (const auto& event : events) {
         const auto* sync_event = env.events_context.Get(event);
@@ -311,6 +320,9 @@ bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::sh
         if (sync_event->last_command_tag >= base_tag) {
             // for replay calls, don't revalidate "same command buffer" events
             continue;
+        }
+        if (record_time_validated_tags.includes(sync_event->last_command_tag)) {
+            continue;  // the race against this event command was already reported at record time
         }
         if (sync_event->unsynchronized_set != vvl::Func::Empty) {
             skip |= env.validator.LogError("SYNC-vkCmdWaitEvents-unsynchronized-setops", sync_event->event->VkHandle(), loc,
@@ -325,7 +337,7 @@ bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::sh
 bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const AccessContext& access_context,
                                            const std::vector<std::shared_ptr<const vvl::Event>>& events,
                                            const vvl::span<const BarrierSet>& barrier_sets, ResourceUsageTag base_tag,
-                                           const Location& loc) {
+                                           const Location& loc, const ResourceUsageRange& record_time_validated_tags) {
     bool skip = false;
 
     size_t index = 0;
@@ -355,7 +367,10 @@ bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const Acc
                 *image, barrier.subresource_range, sync_event->scope.exec_scope, barrier.barrier.src_access_scope, env.queue_id,
                 sync_event->FirstScope(), sync_event->first_scope_tag, AccessContext::DetectOptions::kDetectAll);
 
-            if (hazard.IsHazard()) {
+            // The hazard is against a resource access, not against the preceding event command:
+            // during replay the set event's first scope also contains prior-submission accesses
+            // that record time validation could not see, so dedup tests the hazard's tag.
+            if (hazard.IsHazard() && !record_time_validated_tags.includes(hazard.Tag())) {
                 LogObjectList objlist(env.handle, image->Handle());
                 const auto& messages = env.validator.error_messages_;
                 const auto resource_description = env.validator.FormatHandle(image->Handle());
@@ -413,7 +428,7 @@ void ApplyCmdResetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::E
 
 void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
                         const std::vector<std::shared_ptr<const vvl::Event>>& events, vvl::span<const BarrierSet> barrier_sets,
-                        ResourceUsageTag tag, vvl::Func command) {
+                        ResourceUsageTag tag, vvl::Func command, bool replay_layout_transitions) {
     // Unlike PipelineBarrier, WaitEvent is *not* limited to accesses within the current subpass (if any) and thus needs to import
     // all accesses. Can instead import for all first_scopes, or a union of them, if this becomes a performance/memory issue,
     // but with no idea of the performance of the union, nor of whether it even matters... take the simplest approach here,
@@ -509,7 +524,7 @@ void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
             const SyncBarrier event_barrier = RestrictToEvent(barrier.barrier, *sync_event);
             const BarrierScope barrier_scope(event_barrier, env.queue_id, sync_event->first_scope_tag);
             CollectBarriersFunctor collect_barriers(access_context, barrier_scope, event_barrier, barrier.layout_transition,
-                                                    barrier.handle_index, pending_barriers);
+                                                    barrier.handle_index, pending_barriers, replay_layout_transitions);
 
             const auto& sub_state = SubState(*barrier.image);
             const bool can_transition_depth_slices =

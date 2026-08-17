@@ -17,6 +17,7 @@
 #pragma once
 
 #include "sync/sync_access_context.h"
+#include "sync/sync_event.h"
 #include "sync/sync_barrier.h"
 #include "error_message/error_location.h"
 #include <variant>
@@ -35,34 +36,6 @@ struct SyncEnvironment;
 struct PipelineBarrierReplay {
     PipelineBarrierReplay(BarrierSet&& barrier_set);
     BarrierSet barrier_set;
-};
-
-struct SetEventReplay {
-    SetEventReplay(std::shared_ptr<const vvl::Event>&& event, const SyncExecScope& src_exec_scope,
-                   std::shared_ptr<const AccessContext>&& src_access_context, const Location& loc);
-
-    vvl::Func command = vvl::Func::Empty;
-    std::shared_ptr<const vvl::Event> event;
-    // Snapshot of the command buffer's access context at set event time
-    std::shared_ptr<const AccessContext> recorded_context;
-    SyncExecScope src_exec_scope;
-};
-
-struct ResetEventReplay {
-    ResetEventReplay(std::shared_ptr<const vvl::Event>&& event, const SyncExecScope& exec_scope, const Location& loc);
-
-    vvl::Func command = vvl::Func::Empty;
-    std::shared_ptr<const vvl::Event> event;
-    SyncExecScope exec_scope;
-};
-
-struct WaitEventsReplay {
-    WaitEventsReplay(std::vector<std::shared_ptr<const vvl::Event>>&& events, std::vector<BarrierSet>&& barrier_sets,
-                     const Location& loc);
-
-    vvl::Func command = vvl::Func::Empty;
-    std::vector<std::shared_ptr<const vvl::Event>> events;
-    std::vector<BarrierSet> barrier_sets;
 };
 
 // Describes how replay changes its recorded and destination contexts.

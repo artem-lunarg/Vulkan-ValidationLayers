@@ -18,8 +18,10 @@
 #include "sync_val_tests.h"
 #include "pipeline_helper.h"
 #include "ray_tracing_objects.h"
+#include "sync/sync_settings.h"
 
 struct NegativeSyncValRayTracing : public VkSyncValTest {};
+struct NegativeSyncStreamRayTracing : public VkSyncValTest {};
 
 TEST_F(NegativeSyncValRayTracing, ScratchBufferHazard) {
     TEST_DESCRIPTION("Write to scratch buffer during acceleration structure build");
@@ -59,6 +61,37 @@ TEST_F(NegativeSyncValRayTracing, AccelerationStructureBufferHazard) {
     blas.VkCmdBuildAccelerationStructuresKHR(m_command_buffer);  // WRITE without proper barrier
     m_errorMonitor->VerifyFound();
     m_command_buffer.End();
+}
+
+TEST_F(NegativeSyncStreamRayTracing, AccelerationStructureBuildSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, acceleration structure hazards are reported by submit time replay");
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredExtensions(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    AddRequiredExtensions(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::bufferDeviceAddress);
+    AddRequiredFeature(vkt::Feature::accelerationStructure);
+    AddRequiredFeature(vkt::Feature::rayTracingPipeline);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    vkt::as::BuildGeometryInfoKHR blas = vkt::as::blueprint::BuildGeometryInfoSimpleOnDeviceBottomLevel(*m_device);
+    blas.GetDstAS()->SetBufferUsageFlags(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    blas.SetupBuild(true);
+
+    const vkt::Buffer& accel_buffer = blas.GetDstAS()->GetBuffer();
+    vkt::Buffer copy_buffer(*m_device, accel_buffer.CreateInfo().size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    m_command_buffer.Begin();
+    m_command_buffer.Copy(accel_buffer, copy_buffer);            // READ acceleration structure buffer
+    blas.VkCmdBuildAccelerationStructuresKHR(m_command_buffer);  // WRITE without proper barrier
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
 }
 
 TEST_F(NegativeSyncValRayTracing, SourceAccelerationStructureHazard) {
@@ -289,6 +322,42 @@ TEST_F(NegativeSyncValRayTracing, TraceAfterBuild) {
                         &trace_rays_sbt.callable_sbt, 1, 1, 1);
     m_errorMonitor->VerifyFound();
     m_command_buffer.End();
+}
+
+TEST_F(NegativeSyncStreamRayTracing, TraceRaysSubmitOnly) {
+    TEST_DESCRIPTION("With record time validation disabled, trace rays hazards are reported by submit time replay");
+    SetTargetApiVersion(VK_API_VERSION_1_2);
+    AddRequiredExtensions(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    AddRequiredExtensions(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::bufferDeviceAddress);
+    AddRequiredFeature(vkt::Feature::accelerationStructure);
+    AddRequiredFeature(vkt::Feature::rayTracingPipeline);
+    SyncValSettings settings;
+    settings.record_time_validation = false;
+    settings.full_validation = true;
+    settings.shader_accesses_heuristic = true;
+    RETURN_IF_SKIP(InitSyncVal(&settings));
+
+    std::unique_ptr<vkt::as::BuildGeometryInfoKHR> blas = BuildBLAS();
+    std::unique_ptr<vkt::as::BuildGeometryInfoKHR> tlas = BuildTLAS(*blas->GetDstAS());
+
+    std::unique_ptr<vkt::rt::Pipeline> pipeline = GetTraceRaysPipeline(tlas->GetDstAS()->handle());
+    const vkt::rt::TraceRaysSbt sbt = pipeline->GetTraceRaysSbt();
+
+    m_command_buffer.Begin();
+    vk::CmdBindDescriptorSets(m_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline->GetPipelineLayout(), 0, 1,
+                              &pipeline->GetDescriptorSet().set_, 0, nullptr);
+    vk::CmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, *pipeline);
+
+    // Write to the TLAS buffer, then trace rays that read the TLAS: RAW, not reported during recording
+    vk::CmdFillBuffer(m_command_buffer, tlas->GetDstAS()->GetBuffer(), 0, sizeof(uint32_t), 0);
+    vk::CmdTraceRaysKHR(m_command_buffer, &sbt.ray_gen_sbt, &sbt.miss_sbt, &sbt.hit_sbt, &sbt.callable_sbt, 1, 1, 1);
+    m_command_buffer.End();
+
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(m_command_buffer);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
 }
 
 TEST_F(NegativeSyncValRayTracing, TraceAfterBuildIndirect) {

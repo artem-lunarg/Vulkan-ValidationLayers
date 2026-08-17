@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "sync/sync_command.h"
 #include "sync/sync_event.h"
 #include "sync/sync_render_pass.h"
 #include "sync/sync_replay.h"
@@ -216,19 +217,25 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     void RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc);
     bool ValidateEndRendering(const ErrorObject& error_obj) const;
     void RecordEndRendering(const RecordObject& record_obj);
-    bool ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const Location& loc) const;
-    void RecordDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, ResourceUsageTag tag);
-    bool ValidateDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const Location& loc) const;
-    void RecordDrawVertex(uint32_t vertexCount, uint32_t firstVertex, ResourceUsageTag tag);
-    bool ValidateDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, const Location& loc) const;
-    void RecordDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, ResourceUsageTag tag);
-    bool ValidateDrawAttachment(const Location& loc) const;
-    bool ValidateDrawDynamicRenderingAttachment(const Location& loc) const;
-    void RecordDrawAttachment(ResourceUsageTag tag);
-    void RecordDrawDynamicRenderingAttachment(ResourceUsageTag tag);
-    bool ValidateClearAttachment(const Location& loc, const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
-                                 const VkClearRect& clear_rect) const;
-    void RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment, const VkClearRect& clear_rect);
+    // Resolve the shader accesses of the currently bound pipeline/descriptor sets.
+    // Fills the accesses and the reporting information of the owning command.
+    void CollectDescriptorAccesses(VkPipelineBindPoint pipeline_bind_point, std::vector<DescriptorAccess>& accesses,
+                                   std::shared_ptr<const vvl::Pipeline>& pipeline,
+                                   std::vector<std::shared_ptr<const vvl::DescriptorSet>>& descriptor_sets) const;
+
+    // Resolve the fixed function draw accesses of the currently bound graphics state
+    void CollectDrawVertexAccesses(uint32_t vertex_count, uint32_t first_vertex, DrawCommand& command) const;
+    void CollectDrawIndexAccess(uint32_t index_count, uint32_t first_index, DrawCommand& command) const;
+    void CollectDrawAttachmentAccesses(std::vector<DrawAttachmentAccess>& accesses) const;
+
+    // Resolve one attachment clear against the active render pass or dynamic rendering state
+    void CollectClearAttachmentAccesses(const VkClearAttachment& clear_attachment, uint32_t rect_index,
+                                        const VkClearRect& clear_rect, ClearAttachmentsCommand& command) const;
+
+    // Resolve the dynamic rendering attachment operations (loads for begin, resolves and stores for end)
+    void CollectBeginRenderingAccesses(const DynamicRenderingInfo& info, const Location& loc,
+                                       DynamicRenderingCommand& command) const;
+    void CollectEndRenderingAccesses(const Location& loc, DynamicRenderingCommand& command) const;
 
     ResourceUsageTag RecordNextSubpass(vvl::Func command);
     ResourceUsageTag RecordEndRenderPass(vvl::Func command);
@@ -265,6 +272,19 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     std::shared_ptr<CommandBufferSet> GetCBReferencesShared() const { return cbs_referenced_; }
     void ImportRecordedAccessLog(const CommandBufferContext& cb_context);
     const std::vector<ReplayEntry>& GetReplayEntries() const { return replay_entries_; }
+
+    template <typename Command>
+    void AddRecordedCommand(ResourceUsageTag tag, Command&& command, uint32_t tag_count = 1) {
+        recorded_commands_.emplace_back(tag, tag_count, std::forward<Command>(command));
+    }
+    const std::vector<RecordedCommandEntry>& GetRecordedCommands() const { return recorded_commands_; }
+    bool HasCompleteRecordedCommandStream() const;
+
+    // False in submit-only mode: recording only stores the command stream and the command
+    // buffer access context stays empty; validation and access state application happen
+    // during the queue submit replay. True otherwise, which also keeps the legacy access
+    // summary complete for command buffers that take the first-access submit fallback.
+    bool ApplyAccessesOnRecord() const;
 
     // DebugNameProvider
     std::string GetDebugRegionName(const ResourceUsageRecord& record) const override;
@@ -323,6 +343,7 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     std::vector<std::unique_ptr<RenderPassAccessContext>> render_pass_contexts_;
     RenderPassAccessContext* current_renderpass_context_;
     std::vector<ReplayEntry> replay_entries_;
+    std::vector<RecordedCommandEntry> recorded_commands_;
 
     // State during dynamic rendering (dynamic rendering rendering passes must be
     // contained within a single command buffer)
@@ -335,9 +356,11 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
 
     // Zero-based render pass instance id, incremented for each render pass instance.
     // Used to initialize the corresponding value in the access object during recording.
-    // At submit time, these ids are offset to ensure unique values among all submitted
-    // command buffers.
-    // TODO: add the above mentioned submit time behavior
+    // Submit replay does not rebase these ids even though submitted command buffers reuse
+    // the same values: hazard detection never compares render pass instance ids (ordering
+    // decisions are gated by queue, ordering scopes, access type and subpass), so the
+    // collisions are currently harmless. If detection ever starts using render pass
+    // instance identity, replay must offset the ids per submission.
     uint32_t current_render_pass_instance_id_ = 0;
 };
 

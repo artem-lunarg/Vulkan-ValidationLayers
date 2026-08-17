@@ -739,11 +739,39 @@ bool QueueBatchContext::ValidateSubmit(const std::vector<CommandBufferConstPtr>&
                                         ? submit_info_loc.dot(vvl::Field::pCommandBuffers, index)
                                         : submit_info_loc.dot(vvl::Field::pCommandBufferInfos, index);
 
-            skip |= ValidateFirstUseHazards(GetSyncEnvironment(), cb_context, GetAccessContext(), batch.base_tag, cb_loc);
+            const bool submit_only_mode = !sync_state_.syncval_settings.IsRecordTimeValidationEnabled();
+            if (sync_state_.syncval_settings.full_validation &&
+                (submit_only_mode || cb_context.HasCompleteRecordedCommandStream())) {
+                // Submit-only recording intentionally does not build the legacy access summary, so the
+                // recorded command stream is the only validation state and its completeness is an internal
+                // invariant: an incomplete stream means a conversion bug or a submitted command buffer
+                // whose executed secondary was invalidly re-recorded.
+                assert(!submit_only_mode || cb_context.HasCompleteRecordedCommandStream());
 
-            // The barriers have already been applied in ValidateFirstUseHazards
-            batch_log_.Import(batch, cb_context, current_label_stack);
-            ResolveSubmittedCommandBuffer(cb_context.GetCbAccessContext(), batch.base_tag);
+                // Submit-time command validation needs the current command buffer's log to resolve global tags
+                // when a hazard is found against an earlier command in this command buffer.
+                batch_log_.Import(batch, cb_context, current_label_stack);
+
+                // Record-time validation has already reported hazards against prior accesses in this command buffer. Suppress
+                // only those duplicates; hazards against prior submissions have tags outside this submission's range.
+                // Future submit-only access sources will need more precise tracking than this command-buffer-wide range.
+                const ResourceUsageRange record_time_validated_tags =
+                    sync_state_.syncval_settings.record_time_validation
+                        ? ResourceUsageRange(batch.base_tag, batch.base_tag + cb_context.GetTagCount())
+                        : ResourceUsageRange{};
+                skip |= ReplayRecordedCommands(GetSyncEnvironment(), GetAccessContext(), cb_context, batch.base_tag,
+                                               record_time_validated_tags, cb_loc);
+            } else {
+                // First access validation covers replay-disabled configurations and, with record time
+                // validation enabled, command buffers with incomplete streams (an invalidly re-recorded
+                // executed secondary). It relies on the legacy access summary that record time application
+                // builds; submit-only recording does not build it and never takes this path.
+                skip |= ValidateFirstUseHazards(GetSyncEnvironment(), cb_context, GetAccessContext(), batch.base_tag, cb_loc);
+
+                // The barriers have already been applied in ValidateFirstUseHazards
+                batch_log_.Import(batch, cb_context, current_label_stack);
+                ResolveSubmittedCommandBuffer(cb_context.GetCbAccessContext(), batch.base_tag);
+            }
             batch.base_tag += cb_context.GetTagCount();
         }
         // Apply debug label commands
