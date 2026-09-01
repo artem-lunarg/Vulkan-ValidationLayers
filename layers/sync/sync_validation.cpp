@@ -1791,6 +1791,7 @@ ResourceAccessCommand SyncValidator::MakeDecodeVideoAccessCommand(const vvl::Com
         access.offset = resource.GetEffectiveImageOffset(*vs_state);
         access.extent = resource.GetEffectiveImageExtent(*vs_state);
         access.tag_handle = resource.image_view_state->Handle();
+        access.legacy_register_handle = true;
         access.resource_description = std::move(resource_description);
         access.error_type = ResourceAccessCommand::ImageRangeAccess::ErrorType::kVideo;
         command.accesses.emplace_back(std::move(access));
@@ -1868,6 +1869,7 @@ ResourceAccessCommand SyncValidator::MakeEncodeVideoAccessCommand(const vvl::Com
         access.offset = resource.GetEffectiveImageOffset(*vs_state);
         access.extent = resource.GetEffectiveImageExtent(*vs_state);
         access.tag_handle = resource.image_view_state->Handle();
+        access.legacy_register_handle = true;
         access.resource_description = std::move(resource_description);
         access.error_type = ResourceAccessCommand::ImageRangeAccess::ErrorType::kVideo;
         command.accesses.emplace_back(std::move(access));
@@ -1925,6 +1927,7 @@ ResourceAccessCommand SyncValidator::MakeEncodeVideoAccessCommand(const vvl::Com
                 access.extent = {quantization_map_info->quantizationMapExtent.width,
                                  quantization_map_info->quantizationMapExtent.height, 1};
                 access.tag_handle = image_view->Handle();
+                access.legacy_register_handle = true;
                 std::ostringstream ss;
                 ss << "quantization map ";
                 ss << Location(Func::Empty, Field::pEncodeInfo).dot(Field::quantizationMap).Fields() << " ";

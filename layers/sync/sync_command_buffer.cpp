@@ -291,10 +291,16 @@ CommandBufferContext::~CommandBufferContext() {
 }
 
 void CommandBufferContext::RecordResourceAccesses(ResourceUsageTag tag, ResourceAccessCommand command, bool apply_accesses) {
+    const bool full_validation = sync_state_.syncval_settings.full_validation;
     for (ResourceAccessCommand::Access& access : command.accesses.Mutable()) {
         std::visit(
             [&](auto& value) {
-                if (value.tag_handle != NullVulkanTypedHandle) {
+                using AccessType = std::decay_t<decltype(value)>;
+                bool legacy_register_handle = true;
+                if constexpr (!std::is_same_v<AccessType, ResourceAccessCommand::BufferAccess>) {
+                    legacy_register_handle = value.legacy_register_handle;
+                }
+                if (value.tag_handle != NullVulkanTypedHandle && (full_validation || legacy_register_handle)) {
                     value.handle_index = AddCommandHandle(tag, value.tag_handle).handle_index;
                 }
             },
@@ -777,6 +783,7 @@ ResourceAccessCommand CommandBufferContext::MakeDispatchDrawDescriptorAccessComm
                     access.image_view = image_view;
                     access.access_index = sync_index;
                     access.tag_handle = image_view->image_state->Handle();
+                    access.legacy_register_handle = true;
                     access.descriptor_info = make_descriptor_info(ResourceAccessCommand::DescriptorResourceType::kImage,
                                                                   image_view->Handle(), image_descriptor->GetImageLayout());
                     if (sync_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {

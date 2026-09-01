@@ -245,6 +245,7 @@ struct ResourceAccessCommand {
         std::optional<DescriptorInfo> descriptor_info;
         std::string resource_description;
         const char* message_type = "ImageAccessError";
+        bool legacy_register_handle = false;
         ErrorLocation error_location = ErrorLocation::kNone;
         uint32_t attachment_index = vvl::kNoIndex32;
         uint32_t handle_index = vvl::kNoIndex32;
@@ -267,6 +268,7 @@ struct ResourceAccessCommand {
         VkImageAspectFlags clear_aspects = 0;
         uint32_t clear_rect_index = 0;
         VkClearRect clear_rect{};
+        bool legacy_register_handle = false;
         uint32_t handle_index = vvl::kNoIndex32;
     };
 

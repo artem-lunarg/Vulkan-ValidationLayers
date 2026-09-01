@@ -75,8 +75,8 @@ static LogObjectList BaseObjectList(const SyncEnvironment& env, const CommandBuf
     }
 
     objlist.add(cb_handle);
-    objlist.add(related_object);
     objlist.add(resource);
+    objlist.add(related_object);
     return objlist;
 }
 
@@ -332,7 +332,8 @@ bool BufferAccessCommand::Validate(const SyncEnvironment& env, const AccessConte
     } else {
         const VulkanTypedHandle query_pool_handle =
             query_pool != VK_NULL_HANDLE ? VulkanTypedHandle(query_pool, kVulkanObjectTypeQueryPool) : NullVulkanTypedHandle;
-        objlist = BaseObjectList(env, cb_context, buffer.Handle(), query_pool_handle);
+        objlist = query_pool_handle != NullVulkanTypedHandle ? BaseObjectList(env, cb_context, query_pool_handle, buffer.Handle())
+                                                             : BaseObjectList(env, cb_context, buffer.Handle());
     }
     const std::string resource_description = resource_name + validator.FormatHandle(buffer.Handle());
     const std::string error =
