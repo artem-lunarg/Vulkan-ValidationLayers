@@ -835,43 +835,16 @@ template <typename RegionType>
 bool SyncValidator::ValidateCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage,
                                                  VkImageLayout dstImageLayout, uint32_t regionCount, const RegionType* pRegions,
                                                  const Location& loc) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto src_buffer = Get<vvl::Buffer>(srcBuffer);
     auto dst_image = Get<vvl::Image>(dstImage);
-
-    for (const auto [region_index, copy_region] : vvl::enumerate(pRegions, regionCount)) {
-        HazardResult hazard;
-        if (dst_image) {
-            if (src_buffer) {
-                AccessRange src_range = MakeRange(copy_region.bufferOffset, dst_image->GetBufferSizeFromCopyImage(copy_region));
-                hazard = access_context.DetectHazard(*src_buffer, SYNC_COPY_TRANSFER_READ, src_range);
-                if (hazard.IsHazard()) {
-                    // PHASE1 TODO -- add tag information to log msg when useful.
-                    const LogObjectList objlist(commandBuffer, srcBuffer);
-                    const std::string error = error_messages_.BufferCopyError(cb_context.GetSyncEnvironment(), hazard, loc.function,
-                                                                              FormatHandle(srcBuffer), region_index, src_range);
-                    skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-                }
-            }
-
-            hazard = access_context.DetectHazard(*dst_image, RangeFromLayers(copy_region.imageSubresource), copy_region.imageOffset,
-                                                 copy_region.imageExtent, SYNC_COPY_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, dstImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, loc.function, FormatHandle(dstImage), region_index,
-                    copy_region.imageOffset, copy_region.imageExtent, copy_region.imageSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-            }
-            if (skip) break;
-        }
-        if (skip) break;
-    }
-    return skip;
+    const ImageTransferCommand command =
+        MakeBufferToImageCopyCommand(src_buffer.get(), dst_image.get(), regionCount, pRegions);
+    return command.Validate(cb_context, loc);
 }
 
 bool SyncValidator::PreCallValidateCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage,
@@ -899,39 +872,18 @@ template <typename RegionType>
 bool SyncValidator::ValidateCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                                                  VkBuffer dstBuffer, uint32_t regionCount, const RegionType* pRegions,
                                                  const Location& loc) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto src_image = Get<vvl::Image>(srcImage);
     auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
     const VkDeviceMemory dst_memory = (dst_buffer && !dst_buffer->sparse) ? dst_buffer->MemoryState()->VkHandle() : VK_NULL_HANDLE;
-    for (const auto [region_index, copy_region] : vvl::enumerate(pRegions, regionCount)) {
-        if (src_image) {
-            auto hazard = access_context.DetectHazard(*src_image, RangeFromLayers(copy_region.imageSubresource),
-                                                      copy_region.imageOffset, copy_region.imageExtent, SYNC_COPY_TRANSFER_READ);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, srcImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, loc.function, FormatHandle(srcImage), region_index,
-                    copy_region.imageOffset, copy_region.imageExtent, copy_region.imageSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-            }
-            if (dst_memory != VK_NULL_HANDLE) {
-                AccessRange dst_range = MakeRange(copy_region.bufferOffset, src_image->GetBufferSizeFromCopyImage(copy_region));
-                hazard = access_context.DetectHazard(*dst_buffer, SYNC_COPY_TRANSFER_WRITE, dst_range);
-                if (hazard.IsHazard()) {
-                    const LogObjectList objlist(commandBuffer, dstBuffer);
-                    const std::string error = error_messages_.BufferCopyError(cb_context.GetSyncEnvironment(), hazard, loc.function,
-                                                                              FormatHandle(dstBuffer), region_index, dst_range);
-                    skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-                }
-            }
-        }
-        if (skip) break;
-    }
-    return skip;
+    const vvl::Buffer* dst_buffer_access = dst_memory != VK_NULL_HANDLE ? dst_buffer.get() : nullptr;
+    const ImageTransferCommand command =
+        MakeImageToBufferCopyCommand(src_image.get(), dst_buffer_access, regionCount, pRegions);
+    return command.Validate(cb_context, loc);
 }
 
 bool SyncValidator::PreCallValidateCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
@@ -959,53 +911,15 @@ template <typename RegionType>
 bool SyncValidator::ValidateCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                                          VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
                                          const RegionType* pRegions, VkFilter filter, const Location& loc) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto src_image = Get<vvl::Image>(srcImage);
     auto dst_image = Get<vvl::Image>(dstImage);
-
-    for (const auto [region_index, blit_region] : vvl::enumerate(pRegions, regionCount)) {
-        if (src_image) {
-            VkOffset3D offset = {std::min(blit_region.srcOffsets[0].x, blit_region.srcOffsets[1].x),
-                                 std::min(blit_region.srcOffsets[0].y, blit_region.srcOffsets[1].y),
-                                 std::min(blit_region.srcOffsets[0].z, blit_region.srcOffsets[1].z)};
-            VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.srcOffsets[1].x - blit_region.srcOffsets[0].x)),
-                                 static_cast<uint32_t>(abs(blit_region.srcOffsets[1].y - blit_region.srcOffsets[0].y)),
-                                 static_cast<uint32_t>(abs(blit_region.srcOffsets[1].z - blit_region.srcOffsets[0].z))};
-            auto hazard = access_context.DetectHazard(*src_image, RangeFromLayers(blit_region.srcSubresource), offset, extent,
-                                                      SYNC_BLIT_TRANSFER_READ);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, srcImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, loc.function, FormatHandle(srcImage), region_index, offset, extent,
-                    blit_region.srcSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-            }
-        }
-
-        if (dst_image) {
-            VkOffset3D offset = {std::min(blit_region.dstOffsets[0].x, blit_region.dstOffsets[1].x),
-                                 std::min(blit_region.dstOffsets[0].y, blit_region.dstOffsets[1].y),
-                                 std::min(blit_region.dstOffsets[0].z, blit_region.dstOffsets[1].z)};
-            VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.dstOffsets[1].x - blit_region.dstOffsets[0].x)),
-                                 static_cast<uint32_t>(abs(blit_region.dstOffsets[1].y - blit_region.dstOffsets[0].y)),
-                                 static_cast<uint32_t>(abs(blit_region.dstOffsets[1].z - blit_region.dstOffsets[0].z))};
-            auto hazard = access_context.DetectHazard(*dst_image, RangeFromLayers(blit_region.dstSubresource), offset, extent,
-                                                      SYNC_BLIT_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, dstImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, loc.function, FormatHandle(dstImage), region_index, offset, extent,
-                    blit_region.dstSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, loc, error);
-            }
-            if (skip) break;
-        }
-    }
-    return skip;
+    const ImageTransferCommand command = MakeImageBlitCommand(src_image.get(), dst_image.get(), regionCount, pRegions);
+    return command.Validate(cb_context, loc);
 }
 
 bool SyncValidator::PreCallValidateCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
@@ -1639,23 +1553,14 @@ void SyncValidator::PostCallRecordCmdDrawIndirectByteCountEXT(VkCommandBuffer co
 bool SyncValidator::PreCallValidateCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout,
                                                       const VkClearColorValue* pColor, uint32_t rangeCount,
                                                       const VkImageSubresourceRange* pRanges, const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
-    if (auto image_state = Get<vvl::Image>(image)) {
-        for (const auto [range_index, range] : vvl::enumerate(pRanges, rangeCount)) {
-            auto hazard = access_context.DetectHazard(*image_state, range, SYNC_CLEAR_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, image);
-                const auto error = error_messages_.ImageClearError(hazard, cb_context, error_obj.location.function,
-                                                                   FormatHandle(image), range_index, range);
-                skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-            }
-        }
-    }
-    return skip;
+    auto image_state = Get<vvl::Image>(image);
+    const ImageTransferCommand command = MakeImageClearCommand(image_state.get(), rangeCount, pRanges);
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
@@ -1663,23 +1568,14 @@ bool SyncValidator::PreCallValidateCmdClearDepthStencilImage(VkCommandBuffer com
                                                              const VkClearDepthStencilValue* pDepthStencil, uint32_t rangeCount,
                                                              const VkImageSubresourceRange* pRanges,
                                                              const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
-    if (auto image_state = Get<vvl::Image>(image)) {
-        for (const auto [range_index, range] : vvl::enumerate(pRanges, rangeCount)) {
-            auto hazard = access_context.DetectHazard(*image_state, range, SYNC_CLEAR_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, image);
-                const auto error = error_messages_.ImageClearError(hazard, cb_context, error_obj.location.function,
-                                                                   FormatHandle(image), range_index, range);
-                skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-            }
-        }
-    }
-    return skip;
+    auto image_state = Get<vvl::Image>(image);
+    const ImageTransferCommand command = MakeImageClearCommand(image_state.get(), rangeCount, pRanges);
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
@@ -1736,84 +1632,29 @@ bool SyncValidator::PreCallValidateCmdFillBuffer(VkCommandBuffer commandBuffer, 
 bool SyncValidator::PreCallValidateCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                                                    VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
                                                    const VkImageResolve* pRegions, const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto src_image = Get<vvl::Image>(srcImage);
     auto dst_image = Get<vvl::Image>(dstImage);
-
-    for (const auto [region_index, resolve_region] : vvl::enumerate(pRegions, regionCount)) {
-        if (src_image) {
-            auto hazard = access_context.DetectHazard(*src_image, RangeFromLayers(resolve_region.srcSubresource),
-                                                      resolve_region.srcOffset, resolve_region.extent, SYNC_RESOLVE_TRANSFER_READ);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, srcImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, error_obj.location.function, FormatHandle(srcImage), region_index,
-                    resolve_region.srcOffset, resolve_region.extent, resolve_region.srcSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-            }
-        }
-
-        if (dst_image) {
-            auto hazard = access_context.DetectHazard(*dst_image, RangeFromLayers(resolve_region.dstSubresource),
-                                                      resolve_region.dstOffset, resolve_region.extent, SYNC_RESOLVE_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, dstImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, error_obj.location.function, FormatHandle(dstImage), region_index,
-                    resolve_region.dstOffset, resolve_region.extent, resolve_region.dstSubresource);
-                skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-            }
-            if (skip) break;
-        }
-    }
-    return skip;
+    const ImageTransferCommand command = MakeImageResolveCommand(src_image.get(), dst_image.get(), regionCount, pRegions);
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2* pResolveImageInfo,
                                                     const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled() || !pResolveImageInfo) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
-    const Location image_info_loc = error_obj.location.dot(Field::pResolveImageInfo);
     auto src_image = Get<vvl::Image>(pResolveImageInfo->srcImage);
     auto dst_image = Get<vvl::Image>(pResolveImageInfo->dstImage);
-
-    for (const auto [region_index, resolve_region] : vvl::enumerate(pResolveImageInfo->pRegions, pResolveImageInfo->regionCount)) {
-        const Location region_loc = image_info_loc.dot(Field::pRegions, region_index);
-        if (src_image) {
-            auto hazard = access_context.DetectHazard(*src_image, RangeFromLayers(resolve_region.srcSubresource),
-                                                      resolve_region.srcOffset, resolve_region.extent, SYNC_RESOLVE_TRANSFER_READ);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, pResolveImageInfo->srcImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, error_obj.location.function, FormatHandle(pResolveImageInfo->srcImage),
-                    region_index, resolve_region.srcOffset, resolve_region.extent, resolve_region.srcSubresource);
-                // TODO: this error is not covered by the test
-                skip |= SyncError(hazard.Hazard(), objlist, region_loc, error);
-            }
-        }
-
-        if (dst_image) {
-            auto hazard = access_context.DetectHazard(*dst_image, RangeFromLayers(resolve_region.dstSubresource),
-                                                      resolve_region.dstOffset, resolve_region.extent, SYNC_RESOLVE_TRANSFER_WRITE);
-            if (hazard.IsHazard()) {
-                const LogObjectList objlist(commandBuffer, pResolveImageInfo->dstImage);
-                const std::string error = error_messages_.ImageCopyResolveBlitError(
-                    cb_context.GetSyncEnvironment(), hazard, error_obj.location.function, FormatHandle(pResolveImageInfo->dstImage),
-                    region_index, resolve_region.dstOffset, resolve_region.extent, resolve_region.dstSubresource);
-                // TODO: this error is not covered by the test
-                skip |= SyncError(hazard.Hazard(), objlist, region_loc, error);
-            }
-            if (skip) break;
-        }
-    }
-    return skip;
+    const ImageTransferCommand command = MakeImageResolveCommand(src_image.get(), dst_image.get(), pResolveImageInfo->regionCount,
+                                                                 pResolveImageInfo->pRegions);
+    return command.Validate(cb_context, error_obj.location.dot(Field::pResolveImageInfo));
 }
 
 bool SyncValidator::PreCallValidateCmdResolveImage2KHR(VkCommandBuffer commandBuffer,

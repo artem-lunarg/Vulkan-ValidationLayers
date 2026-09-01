@@ -42,6 +42,46 @@ struct BufferCopyRegion {
     VkDeviceSize size;
 };
 
+// Owns elements while a command is assembled and becomes a view when reconstructed from CommandData.
+template <typename T>
+class CommandList {
+  public:
+    CommandList() = default;
+    explicit CommandList(vvl::span<const T> view) : view_(view) {}
+
+    const T* begin() const { return Data().begin(); }
+    const T* end() const { return Data().end(); }
+    size_t size() const { return Data().size(); }
+    bool empty() const { return Data().empty(); }
+
+    void reserve(size_t capacity) {
+        assert(!view_.data());
+        owned_.reserve(capacity);
+    }
+
+    template <typename... Args>
+    T& emplace_back(Args&&... args) {
+        assert(!view_.data());
+        return owned_.emplace_back(std::forward<Args>(args)...);
+    }
+
+    std::vector<T>& Mutable() {
+        assert(!view_.data());
+        return owned_;
+    }
+
+    void AppendTo(std::vector<T>& destination) const {
+        const auto data = Data();
+        destination.insert(destination.end(), data.begin(), data.end());
+    }
+
+  private:
+    vvl::span<const T> Data() const { return view_.data() ? view_ : vvl::make_span(owned_); }
+
+    std::vector<T> owned_;
+    vvl::span<const T> view_;
+};
+
 struct BufferCopyCommand {
     const vvl::Buffer& src_buffer;
     const vvl::Buffer& dst_buffer;
@@ -114,6 +154,68 @@ struct ImageCopyCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+struct ImageTransferCommand {
+    struct BufferAccess {
+        const vvl::Buffer* buffer;
+        SyncAccessIndex access_index;
+        AccessRange range;
+        uint32_t region_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageAccess {
+        const vvl::Image* image;
+        SyncAccessIndex access_index;
+        VkImageSubresourceLayers subresource;
+        VkOffset3D offset;
+        VkExtent3D extent;
+        uint32_t region_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageRangeAccess {
+        const vvl::Image* image;
+        SyncAccessIndex access_index;
+        VkImageSubresourceRange subresource_range;
+        uint32_t range_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    using Access = std::variant<BufferAccess, ImageAccess, ImageRangeAccess>;
+
+    CommandList<Access> accesses;
+
+    struct Storage {
+        uint32_t first_access;
+        uint32_t access_count;
+        ImageTransferCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+ImageTransferCommand MakeBufferToImageCopyCommand(const vvl::Buffer* src_buffer, const vvl::Image* dst_image,
+                                                  uint32_t region_count, const VkBufferImageCopy* regions);
+ImageTransferCommand MakeBufferToImageCopyCommand(const vvl::Buffer* src_buffer, const vvl::Image* dst_image,
+                                                  uint32_t region_count, const VkBufferImageCopy2* regions);
+ImageTransferCommand MakeImageToBufferCopyCommand(const vvl::Image* src_image, const vvl::Buffer* dst_buffer,
+                                                  uint32_t region_count, const VkBufferImageCopy* regions);
+ImageTransferCommand MakeImageToBufferCopyCommand(const vvl::Image* src_image, const vvl::Buffer* dst_buffer,
+                                                  uint32_t region_count, const VkBufferImageCopy2* regions);
+ImageTransferCommand MakeImageBlitCommand(const vvl::Image* src_image, const vvl::Image* dst_image, uint32_t region_count,
+                                          const VkImageBlit* regions);
+ImageTransferCommand MakeImageBlitCommand(const vvl::Image* src_image, const vvl::Image* dst_image, uint32_t region_count,
+                                          const VkImageBlit2* regions);
+ImageTransferCommand MakeImageResolveCommand(const vvl::Image* src_image, const vvl::Image* dst_image, uint32_t region_count,
+                                             const VkImageResolve* regions);
+ImageTransferCommand MakeImageResolveCommand(const vvl::Image* src_image, const vvl::Image* dst_image, uint32_t region_count,
+                                             const VkImageResolve2* regions);
+ImageTransferCommand MakeImageClearCommand(const vvl::Image* image, uint32_t range_count,
+                                           const VkImageSubresourceRange* ranges);
+
 struct BarrierCommand {
     const BarrierSet& barrier_set;
 
@@ -129,13 +231,15 @@ struct BarrierCommand {
 };
 
 using CommandStorage =
-    std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage, BarrierCommand::Storage>;
+    std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage,
+                 ImageTransferCommand::Storage, BarrierCommand::Storage>;
 
 struct CommandData {
     std::vector<std::shared_ptr<const vvl::Buffer>> buffers;
     std::vector<std::shared_ptr<const vvl::Image>> images;
     std::vector<BufferCopyRegion> buffer_copy_regions;
     std::vector<VkImageCopy> image_copy_regions;
+    std::vector<ImageTransferCommand::Access> image_transfer_accesses;
     std::vector<BarrierSet> barrier_sets;
 
     uint32_t AddBuffer(const vvl::Buffer& buffer);

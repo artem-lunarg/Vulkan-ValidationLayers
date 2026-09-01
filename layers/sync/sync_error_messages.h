@@ -87,6 +87,16 @@ class ErrorMessages {
                                 const std::string& resource_description, uint32_t subresource_range_index,
                                 const VkImageSubresourceRange& subresource_range) const;
 
+    std::string ImageClearError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                const std::string& resource_description, uint32_t subresource_range_index,
+                                const VkImageSubresourceRange& subresource_range,
+                                AdditionalMessageInfo additional_info = {}) const;
+
+    std::string ImageClearError(const SyncEnvironment& env, const HazardResult& hazard,
+                                const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
+                                const std::string& resource_description, uint32_t subresource_range_index,
+                                const VkImageSubresourceRange& subresource_range) const;
+
     std::string BufferDescriptorError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                       const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
                                       const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,

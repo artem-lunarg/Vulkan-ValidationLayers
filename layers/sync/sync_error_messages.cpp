@@ -212,17 +212,34 @@ std::string ErrorMessages::ImageCopyResolveBlitError(const SyncEnvironment& env,
 std::string ErrorMessages::ImageClearError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                            const std::string& resource_description, uint32_t subresource_range_index,
                                            const VkImageSubresourceRange& subresource_range) const {
+    return ImageClearError(cb_context.GetSyncEnvironment(), hazard, command, resource_description, subresource_range_index,
+                           subresource_range);
+}
+
+std::string ErrorMessages::ImageClearError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                           const std::string& resource_description, uint32_t subresource_range_index,
+                                           const VkImageSubresourceRange& subresource_range,
+                                           AdditionalMessageInfo additional_info) const {
     std::ostringstream ss;
     ss << "\nImage clear subresource range " << subresource_range_index << ": {\n";
     ss << "  " << string_VkImageSubresourceRange(subresource_range) << "\n";
     ss << "}\n";
 
-    AdditionalMessageInfo additional_info;
-    additional_info.message_end_text = ss.str();
+    additional_info.message_end_text += ss.str();
     additional_info.properties.Add(kPropertyRegionIndex, subresource_range_index);
 
-    return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "ImageSubresourceRangeError",
-                 additional_info);
+    return Error(env, hazard, command, resource_description, "ImageSubresourceRangeError", additional_info);
+}
+
+std::string ErrorMessages::ImageClearError(const SyncEnvironment& env, const HazardResult& hazard,
+                                           const CommandBufferContext& cb_context, ResourceUsageTag replay_tag,
+                                           const Location& loc, const std::string& resource_description,
+                                           uint32_t subresource_range_index,
+                                           const VkImageSubresourceRange& subresource_range) const {
+    AdditionalMessageInfo additional_info;
+    const vvl::Func command = AddReplayInfo(env, hazard.TagEx(), cb_context, replay_tag, loc, additional_info);
+    return ImageClearError(env, hazard, command, resource_description, subresource_range_index, subresource_range,
+                           std::move(additional_info));
 }
 
 static void PrepareCommonDescriptorMessage(Logger& logger, const vvl::Pipeline& pipeline, uint32_t descriptor_set_number,

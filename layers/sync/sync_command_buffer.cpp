@@ -230,21 +230,6 @@ static SyncAccessIndex GetSyncStageAccessIndexsByDescriptorSet(VkDescriptorType 
     }
 }
 
-static void UpdateImageAccessState(AccessContext& access_context, const vvl::Image& image, SyncAccessIndex current_usage,
-                                   const VkImageSubresourceRange& subresource_range, const ResourceUsageTag& tag) {
-    const auto& sub_state = SubState(image);
-    ImageRangeGen range_gen = sub_state.MakeImageRangeGen(subresource_range, false);
-    access_context.UpdateAccessState(range_gen, current_usage, ResourceUsageTagEx{tag});
-}
-
-static void UpdateImageAccessState(AccessContext& access_context, const vvl::Image& image, SyncAccessIndex current_usage,
-                                   const VkImageSubresourceRange& subresource_range, const VkOffset3D& offset,
-                                   const VkExtent3D& extent, ResourceUsageTagEx tag_ex) {
-    const auto& sub_state = SubState(image);
-    ImageRangeGen range_gen = sub_state.MakeImageRangeGen(subresource_range, offset, extent, false);
-    access_context.UpdateAccessState(range_gen, current_usage, tag_ex);
-}
-
 static void UpdateVideoAccessState(AccessContext& access_context, const vvl::VideoSession& vs_state,
                                    const vvl::VideoPictureResource& resource, SyncAccessIndex current_usage, ResourceUsageTag tag) {
     const auto image = static_cast<const vvl::Image*>(resource.image_state.get());
@@ -1698,197 +1683,117 @@ void CommandBufferSubState::RecordCopyImage2(vvl::Image& src_image_state, vvl::I
     }
 }
 
+static void RecordImageTransferCommand(CommandBufferContext& cb_context, ResourceUsageTag tag,
+                                       ImageTransferCommand& command) {
+    small_vector<std::pair<VulkanTypedHandle, uint32_t>, 4> command_handles;
+    for (ImageTransferCommand::Access& access : command.accesses.Mutable()) {
+        std::visit(
+            [&](auto& value) {
+                using AccessType = std::decay_t<decltype(value)>;
+                const VulkanTypedHandle handle =
+                    [&]() -> VulkanTypedHandle {
+                    if constexpr (std::is_same_v<AccessType, ImageTransferCommand::BufferAccess>) {
+                        return value.buffer->Handle();
+                    } else {
+                        return value.image->Handle();
+                    }
+                }();
+                const auto found = std::find_if(command_handles.begin(), command_handles.end(),
+                                                [&](const auto& entry) { return entry.first == handle; });
+                if (found != command_handles.end()) {
+                    value.handle_index = found->second;
+                } else {
+                    value.handle_index = cb_context.AddCommandHandle(tag, handle).handle_index;
+                    command_handles.emplace_back(handle, value.handle_index);
+                }
+            },
+            access);
+    }
+
+    const auto& settings = cb_context.GetSyncState().syncval_settings;
+    if (settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCbAccessContext());
+    }
+    if (settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
+}
+
 void CommandBufferSubState::RecordCopyBufferToImage(vvl::Buffer& src_buffer_state, vvl::Image& dst_image_state, VkImageLayout,
                                                     uint32_t region_count, const VkBufferImageCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        AccessRange src_range = MakeRange(copy_region.bufferOffset, dst_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, dst_tag_ex);
-    }
+    auto command = MakeBufferToImageCopyCommand(&src_buffer_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordCopyBufferToImage2(vvl::Buffer& src_buffer_state, vvl::Image& dst_image_state, VkImageLayout,
                                                      uint32_t region_count, const VkBufferImageCopy2* regions,
                                                      const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        AccessRange src_range = MakeRange(copy_region.bufferOffset, dst_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(src_buffer_state, SYNC_COPY_TRANSFER_READ, src_range, src_tag_ex);
-
-        UpdateImageAccessState(context, dst_image_state, SYNC_COPY_TRANSFER_WRITE, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, dst_tag_ex);
-    }
+    auto command = MakeBufferToImageCopyCommand(&src_buffer_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordCopyImageToBuffer(vvl::Image& src_image_state, vvl::Buffer& dst_buffer_state,
                                                     VkImageLayout src_image_layout, uint32_t region_count,
                                                     const VkBufferImageCopy* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, src_tag_ex);
-
-        AccessRange dst_range = MakeRange(copy_region.bufferOffset, src_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
-    }
+    auto command = MakeImageToBufferCopyCommand(&src_image_state, &dst_buffer_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordCopyImageToBuffer2(vvl::Image& src_image_state, vvl::Buffer& dst_buffer_state,
                                                      VkImageLayout src_image_layout, uint32_t region_count,
                                                      const VkBufferImageCopy2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-
-    for (const auto& copy_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_COPY_TRANSFER_READ, RangeFromLayers(copy_region.imageSubresource),
-                               copy_region.imageOffset, copy_region.imageExtent, src_tag_ex);
-
-        AccessRange dst_range = MakeRange(copy_region.bufferOffset, src_image_state.GetBufferSizeFromCopyImage(copy_region));
-        context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, dst_range, dst_tag_ex);
-    }
+    auto command = MakeImageToBufferCopyCommand(&src_image_state, &dst_buffer_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordBlitImage(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                             VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                             const VkImageBlit* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& blit_region : vvl::make_span(regions, region_count)) {
-        VkOffset3D offset = {std::min(blit_region.srcOffsets[0].x, blit_region.srcOffsets[1].x),
-                             std::min(blit_region.srcOffsets[0].y, blit_region.srcOffsets[1].y),
-                             std::min(blit_region.srcOffsets[0].z, blit_region.srcOffsets[1].z)};
-        VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.srcOffsets[1].x - blit_region.srcOffsets[0].x)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].y - blit_region.srcOffsets[0].y)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].z - blit_region.srcOffsets[0].z))};
-        UpdateImageAccessState(context, src_image_state, SYNC_BLIT_TRANSFER_READ, RangeFromLayers(blit_region.srcSubresource),
-                               offset, extent, src_tag_ex);
-
-        offset = {std::min(blit_region.dstOffsets[0].x, blit_region.dstOffsets[1].x),
-                  std::min(blit_region.dstOffsets[0].y, blit_region.dstOffsets[1].y),
-                  std::min(blit_region.dstOffsets[0].z, blit_region.dstOffsets[1].z)};
-        extent = {static_cast<uint32_t>(abs(blit_region.dstOffsets[1].x - blit_region.dstOffsets[0].x)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].y - blit_region.dstOffsets[0].y)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].z - blit_region.dstOffsets[0].z))};
-        UpdateImageAccessState(context, dst_image_state, SYNC_BLIT_TRANSFER_WRITE, RangeFromLayers(blit_region.dstSubresource),
-                               offset, extent, dst_tag_ex);
-    }
+    auto command = MakeImageBlitCommand(&src_image_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordBlitImage2(vvl::Image& src_image_state, vvl::Image& dst_image_state,
                                              VkImageLayout src_image_layout, VkImageLayout dst_image_layout, uint32_t region_count,
                                              const VkImageBlit2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& blit_region : vvl::make_span(regions, region_count)) {
-        VkOffset3D offset = {std::min(blit_region.srcOffsets[0].x, blit_region.srcOffsets[1].x),
-                             std::min(blit_region.srcOffsets[0].y, blit_region.srcOffsets[1].y),
-                             std::min(blit_region.srcOffsets[0].z, blit_region.srcOffsets[1].z)};
-        VkExtent3D extent = {static_cast<uint32_t>(abs(blit_region.srcOffsets[1].x - blit_region.srcOffsets[0].x)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].y - blit_region.srcOffsets[0].y)),
-                             static_cast<uint32_t>(abs(blit_region.srcOffsets[1].z - blit_region.srcOffsets[0].z))};
-        UpdateImageAccessState(context, src_image_state, SYNC_BLIT_TRANSFER_READ, RangeFromLayers(blit_region.srcSubresource),
-                               offset, extent, src_tag_ex);
-
-        offset = {std::min(blit_region.dstOffsets[0].x, blit_region.dstOffsets[1].x),
-                  std::min(blit_region.dstOffsets[0].y, blit_region.dstOffsets[1].y),
-                  std::min(blit_region.dstOffsets[0].z, blit_region.dstOffsets[1].z)};
-        extent = {static_cast<uint32_t>(abs(blit_region.dstOffsets[1].x - blit_region.dstOffsets[0].x)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].y - blit_region.dstOffsets[0].y)),
-                  static_cast<uint32_t>(abs(blit_region.dstOffsets[1].z - blit_region.dstOffsets[0].z))};
-        UpdateImageAccessState(context, dst_image_state, SYNC_BLIT_TRANSFER_WRITE, RangeFromLayers(blit_region.dstSubresource),
-                               offset, extent, dst_tag_ex);
-    }
+    auto command = MakeImageBlitCommand(&src_image_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordResolveImage(vvl::Image& src_image_state, vvl::Image& dst_image_state, uint32_t region_count,
                                                const VkImageResolve* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& resolve_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_RESOLVE_TRANSFER_READ, RangeFromLayers(resolve_region.srcSubresource),
-                               resolve_region.srcOffset, resolve_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_RESOLVE_TRANSFER_WRITE,
-                               RangeFromLayers(resolve_region.dstSubresource), resolve_region.dstOffset, resolve_region.extent,
-                               dst_tag_ex);
-    }
+    auto command = MakeImageResolveCommand(&src_image_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordResolveImage2(vvl::Image& src_image_state, vvl::Image& dst_image_state, uint32_t region_count,
                                                 const VkImageResolve2* regions, const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    auto src_tag_ex = cb_context.AddCommandHandle(tag, src_image_state.Handle());
-    auto dst_tag_ex = cb_context.AddCommandHandle(tag, dst_image_state.Handle());
-
-    for (const auto& resolve_region : vvl::make_span(regions, region_count)) {
-        UpdateImageAccessState(context, src_image_state, SYNC_RESOLVE_TRANSFER_READ, RangeFromLayers(resolve_region.srcSubresource),
-                               resolve_region.srcOffset, resolve_region.extent, src_tag_ex);
-        UpdateImageAccessState(context, dst_image_state, SYNC_RESOLVE_TRANSFER_WRITE,
-                               RangeFromLayers(resolve_region.dstSubresource), resolve_region.dstOffset, resolve_region.extent,
-                               dst_tag_ex);
-    }
+    auto command = MakeImageResolveCommand(&src_image_state, &dst_image_state, region_count, regions);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordClearColorImage(vvl::Image& image_state, VkImageLayout, const VkClearColorValue*,
                                                   uint32_t range_count, const VkImageSubresourceRange* ranges,
                                                   const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    cb_context.AddCommandHandle(tag, image_state.Handle());
-
-    for (uint32_t index = 0; index < range_count; index++) {
-        const auto& range = ranges[index];
-        UpdateImageAccessState(context, image_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag);
-    }
+    auto command = MakeImageClearCommand(&image_state, range_count, ranges);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordClearDepthStencilImage(vvl::Image& image_state, VkImageLayout, const VkClearDepthStencilValue*,
                                                          uint32_t range_count, const VkImageSubresourceRange* ranges,
                                                          const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    cb_context.AddCommandHandle(tag, image_state.Handle());
-
-    for (uint32_t index = 0; index < range_count; index++) {
-        const auto& range = ranges[index];
-        UpdateImageAccessState(context, image_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag);
-    }
+    auto command = MakeImageClearCommand(&image_state, range_count, ranges);
+    RecordImageTransferCommand(cb_context, tag, command);
 }
 
 void CommandBufferSubState::RecordClearAttachments(uint32_t attachment_count, const VkClearAttachment* pAttachments,
