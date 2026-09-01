@@ -28,6 +28,7 @@ class Buffer;
 class Image;
 class ImageView;
 class RenderPass;
+class Event;
 enum class Func;
 }  // namespace vvl
 
@@ -61,6 +62,7 @@ class CommandList {
     const T* end() const { return Data().end(); }
     size_t size() const { return Data().size(); }
     bool empty() const { return Data().empty(); }
+    const T& front() const { return Data().front(); }
     operator vvl::span<const T>() const { return Data(); }
 
     void reserve(size_t capacity) {
@@ -239,6 +241,32 @@ struct BarrierCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+struct EventCommand {
+    enum class Type { kSet, kReset, kWait };
+
+    Type type = Type::kSet;
+    CommandList<std::shared_ptr<const vvl::Event>> events;
+    SyncExecScope exec_scope;
+    CommandList<BarrierSet> barrier_sets;
+    vvl::Func command{};
+
+    struct Storage {
+        Type type;
+        uint32_t first_event;
+        uint32_t event_count;
+        SyncExecScope exec_scope;
+        uint32_t first_barrier_set;
+        uint32_t barrier_set_count;
+        vvl::Func command;
+        EventCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
 struct RenderPassCommand {
     enum class Type { kBegin, kNext, kEnd };
 
@@ -267,7 +295,7 @@ struct RenderPassCommand {
 
 using CommandStorage =
     std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage,
-                 ImageTransferCommand::Storage, BarrierCommand::Storage, RenderPassCommand::Storage>;
+                 ImageTransferCommand::Storage, BarrierCommand::Storage, EventCommand::Storage, RenderPassCommand::Storage>;
 
 struct CommandData {
     std::vector<std::shared_ptr<const vvl::Buffer>> buffers;
@@ -276,6 +304,8 @@ struct CommandData {
     std::vector<VkImageCopy> image_copy_regions;
     std::vector<ImageTransferCommand::Access> image_transfer_accesses;
     std::vector<BarrierSet> barrier_sets;
+    std::vector<std::shared_ptr<const vvl::Event>> events;
+    std::vector<BarrierSet> event_barrier_sets;
     std::vector<std::shared_ptr<const vvl::RenderPass>> render_passes;
     std::vector<std::shared_ptr<const vvl::ImageView>> render_pass_attachments;
 

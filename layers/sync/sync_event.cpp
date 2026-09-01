@@ -300,7 +300,7 @@ bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<con
     return skip;
 }
 
-bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::shared_ptr<const vvl::Event>>& events,
+bool ValidateCmdWaitEvents(const SyncEnvironment& env, vvl::span<const std::shared_ptr<const vvl::Event>> events,
                            const ResourceUsageTag base_tag, const Location& loc) {
     bool skip = false;
     for (const auto& event : events) {
@@ -323,7 +323,7 @@ bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::sh
 }
 
 bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const AccessContext& access_context,
-                                           const std::vector<std::shared_ptr<const vvl::Event>>& events,
+                                            vvl::span<const std::shared_ptr<const vvl::Event>> events,
                                            const vvl::span<const BarrierSet>& barrier_sets, ResourceUsageTag base_tag,
                                            const Location& loc) {
     bool skip = false;
@@ -412,7 +412,7 @@ void ApplyCmdResetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::E
 }
 
 void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
-                        const std::vector<std::shared_ptr<const vvl::Event>>& events, vvl::span<const BarrierSet> barrier_sets,
+                         vvl::span<const std::shared_ptr<const vvl::Event>> events, vvl::span<const BarrierSet> barrier_sets,
                         ResourceUsageTag tag, vvl::Func command) {
     // Unlike PipelineBarrier, WaitEvent is *not* limited to accesses within the current subpass (if any) and thus needs to import
     // all accesses. Can instead import for all first_scopes, or a union of them, if this becomes a performance/memory issue,

@@ -117,11 +117,11 @@ bool ValidateCmdSetEvent(const SyncEnvironment& env, const std::shared_ptr<const
 bool ValidateCmdResetEvent(const SyncEnvironment& env, const std::shared_ptr<const vvl::Event>& event,
                            const SyncExecScope& exec_scope, ResourceUsageTag base_tag, const Location& loc);
 
-bool ValidateCmdWaitEvents(const SyncEnvironment& env, const std::vector<std::shared_ptr<const vvl::Event>>& events,
+bool ValidateCmdWaitEvents(const SyncEnvironment& env, vvl::span<const std::shared_ptr<const vvl::Event>> events,
                            const ResourceUsageTag base_tag, const Location& loc);
 
 bool DetectCmdWaitEventsImageBarrierHazard(const SyncEnvironment& env, const AccessContext& access_context,
-                                           const std::vector<std::shared_ptr<const vvl::Event>>& events,
+                                            vvl::span<const std::shared_ptr<const vvl::Event>> events,
                                            const vvl::span<const BarrierSet>& barrier_sets, ResourceUsageTag base_tag,
                                            const Location& loc);
 
@@ -133,7 +133,7 @@ void ApplyCmdResetEvent(SyncEnvironment& env, const std::shared_ptr<const vvl::E
                         vvl::Func command);
 
 void ApplyCmdWaitEvents(SyncEnvironment& env, AccessContext& access_context,
-                        const std::vector<std::shared_ptr<const vvl::Event>>& events, vvl::span<const BarrierSet> barrier_sets,
+                         vvl::span<const std::shared_ptr<const vvl::Event>> events, vvl::span<const BarrierSet> barrier_sets,
                         ResourceUsageTag tag, vvl::Func command);
 
 }  // namespace syncval
