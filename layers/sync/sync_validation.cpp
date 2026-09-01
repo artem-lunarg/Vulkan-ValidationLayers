@@ -1700,51 +1700,37 @@ bool SyncValidator::PreCallValidateCmdCopyQueryPoolResults(VkCommandBuffer comma
                                                            uint32_t firstQuery, uint32_t queryCount, VkBuffer dstBuffer,
                                                            VkDeviceSize dstOffset, VkDeviceSize stride, VkQueryResultFlags flags,
                                                            const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled() || queryCount == 0) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
-
-    if (dst_buffer && queryCount > 0) {
-        const uint32_t query_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
-        const VkDeviceSize range_size = (queryCount - 1) * stride + query_size;
-        const AccessRange range = MakeRange(dstOffset, range_size);
-        auto hazard = access_context.DetectHazard(*dst_buffer, SYNC_COPY_TRANSFER_WRITE, range);
-        if (hazard.IsHazard()) {
-            const LogObjectList objlist(commandBuffer, queryPool, dstBuffer);
-            const std::string resource_description = "dstBuffer " + FormatHandle(dstBuffer);
-            const auto error =
-                error_messages_.BufferError(hazard, cb_context, error_obj.location.function, resource_description, range);
-            skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-        }
+    if (!dst_buffer) {
+        return false;
     }
+    const uint32_t query_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+    const VkDeviceSize range_size = (queryCount - 1) * stride + query_size;
+    const BufferAccessCommand command{*dst_buffer, SYNC_COPY_TRANSFER_WRITE, MakeRange(dstOffset, range_size), 0, queryPool,
+                                      "dstBuffer "};
     // TODO:Track VkQueryPool
-    return skip;
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSize dstOffset,
                                                  VkDeviceSize size, uint32_t data, const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
-
-    if (dst_buffer) {
-        const AccessRange range = MakeRange(*dst_buffer, dstOffset, size);
-        auto hazard = access_context.DetectHazard(*dst_buffer, SYNC_CLEAR_TRANSFER_WRITE, range);
-        if (hazard.IsHazard()) {
-            const LogObjectList objlist(commandBuffer, dstBuffer);
-            const std::string resource_description = "dstBuffer " + FormatHandle(dstBuffer);
-            const auto error =
-                error_messages_.BufferError(hazard, cb_context, error_obj.location.function, resource_description, range);
-            skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-        }
+    if (!dst_buffer) {
+        return false;
     }
-    return skip;
+    const BufferAccessCommand command{*dst_buffer, SYNC_CLEAR_TRANSFER_WRITE, MakeRange(*dst_buffer, dstOffset, size), 0,
+                                      VK_NULL_HANDLE, "dstBuffer "};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
@@ -1838,47 +1824,36 @@ bool SyncValidator::PreCallValidateCmdResolveImage2KHR(VkCommandBuffer commandBu
 
 bool SyncValidator::PreCallValidateCmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSize dstOffset,
                                                    VkDeviceSize dataSize, const void* pData, const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCbAccessContext();
-
     auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
-
-    if (dst_buffer) {
-        // VK_WHOLE_SIZE not allowed
-        const AccessRange range = MakeRange(dstOffset, dataSize);
-        auto hazard = access_context.DetectHazard(*dst_buffer, SYNC_CLEAR_TRANSFER_WRITE, range);
-        if (hazard.IsHazard()) {
-            const LogObjectList objlist(commandBuffer, dstBuffer);
-            const std::string resource_description = "dstBuffer " + FormatHandle(dstBuffer);
-            const auto error =
-                error_messages_.BufferError(hazard, cb_context, error_obj.location.function, resource_description, range);
-            skip |= SyncError(hazard.Hazard(), objlist, error_obj.location, error);
-        }
+    if (!dst_buffer) {
+        return false;
     }
-    return skip;
+    // VK_WHOLE_SIZE not allowed
+    const BufferAccessCommand command{*dst_buffer, SYNC_CLEAR_TRANSFER_WRITE, MakeRange(dstOffset, dataSize), 0,
+                                      VK_NULL_HANDLE, "dstBuffer "};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 bool SyncValidator::PreCallValidateCmdWriteBufferMarkerAMD(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage,
                                                            VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker,
                                                            const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCurrentAccessContext();
-
-    if (auto dst_buffer = Get<vvl::Buffer>(dstBuffer)) {
-        const AccessRange range = MakeRange(dstOffset, 4);
-        auto hazard = access_context.DetectMarkerHazard(*dst_buffer, range);
-        if (hazard.IsHazard()) {
-            const std::string resource_description = "dstBuffer " + FormatHandle(dstBuffer);
-            const auto error =
-                error_messages_.BufferError(hazard, cb_context, error_obj.location.function, resource_description, range);
-            skip |= SyncError(hazard.Hazard(), dstBuffer, error_obj.location, error);
-        }
+    auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
+    if (!dst_buffer) {
+        return false;
     }
-    return skip;
+    const BufferAccessCommand command{*dst_buffer, SYNC_COPY_TRANSFER_WRITE, MakeRange(dstOffset, 4), SyncFlag::kMarker,
+                                      VK_NULL_HANDLE, "dstBuffer "};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 void SyncValidator::PostCallRecordCmdWriteBufferMarkerAMD(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage,
@@ -1887,12 +1862,18 @@ void SyncValidator::PostCallRecordCmdWriteBufferMarkerAMD(VkCommandBuffer comman
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
     const ResourceUsageTag tag = cb_context.NextCommandTag(record_obj.location.function);
-    AccessContext& access_context = cb_context.GetCurrentAccessContext();
-
-    if (auto dst_buffer = Get<vvl::Buffer>(dstBuffer)) {
-        const AccessRange range = MakeRange(dstOffset, 4);
-        const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer->Handle());
-        access_context.UpdateAccessState(*dst_buffer, SYNC_COPY_TRANSFER_WRITE, range, tag_ex, SyncFlag::kMarker);
+    auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
+    if (!dst_buffer) {
+        return;
+    }
+    const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer->Handle());
+    const BufferAccessCommand command{*dst_buffer, SYNC_COPY_TRANSFER_WRITE, MakeRange(dstOffset, 4), SyncFlag::kMarker,
+                                      VK_NULL_HANDLE, "dstBuffer ", tag_ex.handle_index};
+    if (syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCurrentAccessContext());
+    }
+    if (syncval_settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
     }
 }
 
@@ -2377,22 +2358,18 @@ void SyncValidator::PostCallRecordCmdWaitEvents2(VkCommandBuffer commandBuffer, 
 bool SyncValidator::PreCallValidateCmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer, VkPipelineStageFlags2KHR pipelineStage,
                                                             VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker,
                                                             const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const AccessContext& access_context = cb_context.GetCurrentAccessContext();
-
-    if (auto dst_buffer = Get<vvl::Buffer>(dstBuffer)) {
-        const AccessRange range = MakeRange(dstOffset, 4);
-        auto hazard = access_context.DetectMarkerHazard(*dst_buffer, range);
-        if (hazard.IsHazard()) {
-            const std::string resource_description = "dstBuffer " + FormatHandle(dstBuffer);
-            const auto error =
-                error_messages_.BufferError(hazard, cb_context, error_obj.location.function, resource_description, range);
-            skip |= SyncError(hazard.Hazard(), dstBuffer, error_obj.location, error);
-        }
+    auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
+    if (!dst_buffer) {
+        return false;
     }
-    return skip;
+    const BufferAccessCommand command{*dst_buffer, SYNC_COPY_TRANSFER_WRITE, MakeRange(dstOffset, 4), SyncFlag::kMarker,
+                                      VK_NULL_HANDLE, "dstBuffer "};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 void SyncValidator::PostCallRecordCmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer, VkPipelineStageFlags2KHR pipelineStage,
@@ -2401,12 +2378,18 @@ void SyncValidator::PostCallRecordCmdWriteBufferMarker2AMD(VkCommandBuffer comma
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
     const ResourceUsageTag tag = cb_context.NextCommandTag(record_obj.location.function);
-    AccessContext& access_context = cb_context.GetCurrentAccessContext();
-
-    if (auto dst_buffer = Get<vvl::Buffer>(dstBuffer)) {
-        const AccessRange range = MakeRange(dstOffset, 4);
-        const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer->Handle());
-        access_context.UpdateAccessState(*dst_buffer, SYNC_COPY_TRANSFER_WRITE, range, tag_ex, SyncFlag::kMarker);
+    auto dst_buffer = Get<vvl::Buffer>(dstBuffer);
+    if (!dst_buffer) {
+        return;
+    }
+    const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer->Handle());
+    const BufferAccessCommand command{*dst_buffer, SYNC_COPY_TRANSFER_WRITE, MakeRange(dstOffset, 4), SyncFlag::kMarker,
+                                      VK_NULL_HANDLE, "dstBuffer ", tag_ex.handle_index};
+    if (syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCurrentAccessContext());
+    }
+    if (syncval_settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
     }
 }
 

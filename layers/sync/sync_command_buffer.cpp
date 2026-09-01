@@ -1905,22 +1905,34 @@ void CommandBufferSubState::RecordClearAttachments(uint32_t attachment_count, co
 void CommandBufferSubState::RecordFillBuffer(vvl::Buffer& buffer_state, VkDeviceSize offset, VkDeviceSize size,
                                              const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     const AccessRange range = MakeRange(buffer_state, offset, size);
     const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
-    context.UpdateAccessState(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command{buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, 0, VK_NULL_HANDLE, "dstBuffer ",
+                                      tag_ex.handle_index};
+    const auto& settings = cb_context.GetSyncState().syncval_settings;
+    if (settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCbAccessContext());
+    }
+    if (settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
 }
 
 void CommandBufferSubState::RecordUpdateBuffer(vvl::Buffer& buffer_state, VkDeviceSize offset, VkDeviceSize size,
                                                const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     // VK_WHOLE_SIZE not allowed
     const AccessRange range = MakeRange(offset, size);
     const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, buffer_state.Handle());
-    context.UpdateAccessState(buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command{buffer_state, SYNC_CLEAR_TRANSFER_WRITE, range, 0, VK_NULL_HANDLE, "dstBuffer ",
+                                      tag_ex.handle_index};
+    const auto& settings = cb_context.GetSyncState().syncval_settings;
+    if (settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCbAccessContext());
+    }
+    if (settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
 }
 
 void CommandBufferSubState::RecordDecodeVideo(vvl::VideoSession& vs_state, const VkVideoDecodeInfoKHR& decode_info,
@@ -2012,13 +2024,19 @@ void CommandBufferSubState::RecordCopyQueryPoolResults(vvl::QueryPool& pool_stat
         return;
     }
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
     const uint32_t query_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
     const VkDeviceSize range_size = (query_count - 1) * stride + query_size;
     const AccessRange range = MakeRange(dst_offset, range_size);
     const ResourceUsageTagEx tag_ex = cb_context.AddCommandHandle(tag, dst_buffer_state.Handle());
-    context.UpdateAccessState(dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, range, tag_ex);
+    const BufferAccessCommand command{dst_buffer_state, SYNC_COPY_TRANSFER_WRITE, range, 0, pool_state.VkHandle(), "dstBuffer ",
+                                      tag_ex.handle_index};
+    const auto& settings = cb_context.GetSyncState().syncval_settings;
+    if (settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCbAccessContext());
+    }
+    if (settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
 
     // TODO:Track VkQueryPool
 }

@@ -65,6 +65,32 @@ struct BufferCopyCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+struct BufferAccessCommand {
+    const vvl::Buffer& buffer;
+    SyncAccessIndex access_index;
+    AccessRange range;
+    uint8_t flags = 0;
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    const char* resource_name = "buffer ";
+    uint32_t handle_index = vvl::kNoIndex32;
+
+    struct Storage {
+        uint32_t buffer_index;
+        SyncAccessIndex access_index;
+        AccessRange range;
+        uint8_t flags;
+        VkQueryPool query_pool;
+        const char* resource_name;
+        uint32_t handle_index;
+        BufferAccessCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
 struct ImageCopyCommand {
     const vvl::Image& src_image;
     const vvl::Image& dst_image;
@@ -102,7 +128,8 @@ struct BarrierCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
-using CommandStorage = std::variant<BufferCopyCommand::Storage, ImageCopyCommand::Storage, BarrierCommand::Storage>;
+using CommandStorage =
+    std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage, BarrierCommand::Storage>;
 
 struct CommandData {
     std::vector<std::shared_ptr<const vvl::Buffer>> buffers;

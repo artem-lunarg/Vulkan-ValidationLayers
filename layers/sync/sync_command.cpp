@@ -28,7 +28,7 @@
 namespace syncval {
 
 static LogObjectList BaseObjectList(const SyncEnvironment& env, const CommandBufferContext& cb_context,
-                                    const VulkanTypedHandle& resource) {
+                                    const VulkanTypedHandle& resource, const VulkanTypedHandle& related_object = {}) {
     LogObjectList objlist;
     const VulkanTypedHandle& cb_handle = cb_context.GetCBState().Handle();
 
@@ -39,6 +39,7 @@ static LogObjectList BaseObjectList(const SyncEnvironment& env, const CommandBuf
     }
 
     objlist.add(cb_handle);
+    objlist.add(related_object);
     objlist.add(resource);
     return objlist;
 }
@@ -95,6 +96,48 @@ BufferCopyCommand::Storage BufferCopyCommand::MakeStorage(CommandData& command_d
     command_data.buffer_copy_regions.insert(command_data.buffer_copy_regions.end(), regions.begin(), regions.end());
 
     return {src_buffer_index, dst_buffer_index, first_region, region_count, src_handle_index, dst_handle_index};
+}
+
+BufferAccessCommand BufferAccessCommand::Storage::MakeCommand(const CommandData& command_data) const {
+    return {*command_data.buffers[buffer_index], access_index, range, flags, query_pool, resource_name, handle_index};
+}
+
+BufferAccessCommand::Storage BufferAccessCommand::MakeStorage(CommandData& command_data) const {
+    return {command_data.AddBuffer(buffer), access_index, range, flags, query_pool, resource_name, handle_index};
+}
+
+bool BufferAccessCommand::Validate(const CommandBufferContext& cb_context, const Location& loc) const {
+    const bool is_marker = (flags & SyncFlag::kMarker) != 0;
+    const AccessContext& access_context = is_marker ? cb_context.GetCurrentAccessContext() : cb_context.GetCbAccessContext();
+    return Validate(cb_context.GetSyncEnvironment(), access_context, cb_context, kInvalidTag, loc);
+}
+
+bool BufferAccessCommand::Validate(const SyncEnvironment& env, const AccessContext& access_context,
+                                   const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc) const {
+    const bool is_marker = (flags & SyncFlag::kMarker) != 0;
+    const HazardResult hazard =
+        is_marker ? access_context.DetectMarkerHazard(buffer, range) : access_context.DetectHazard(buffer, access_index, range);
+    if (!hazard.IsHazard()) {
+        return false;
+    }
+
+    const SyncValidator& validator = env.validator;
+    LogObjectList objlist;
+    if (replay_tag == kInvalidTag && is_marker) {
+        objlist.add(buffer.Handle());
+    } else {
+        const VulkanTypedHandle query_pool_handle =
+            query_pool != VK_NULL_HANDLE ? VulkanTypedHandle(query_pool, kVulkanObjectTypeQueryPool) : NullVulkanTypedHandle;
+        objlist = BaseObjectList(env, cb_context, buffer.Handle(), query_pool_handle);
+    }
+    const std::string resource_description = resource_name + validator.FormatHandle(buffer.Handle());
+    const std::string error =
+        validator.error_messages_.BufferError(env, hazard, cb_context, replay_tag, loc, resource_description, range);
+    return validator.SyncError(hazard.Hazard(), objlist, loc, error);
+}
+
+void BufferAccessCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const {
+    access_context.UpdateAccessState(buffer, access_index, range, ResourceUsageTagEx{tag, handle_index}, flags, env.queue_id);
 }
 
 bool BufferCopyCommand::Validate(const CommandBufferContext& cb_context, const Location& loc) const {

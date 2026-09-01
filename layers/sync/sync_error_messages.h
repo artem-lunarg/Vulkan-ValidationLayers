@@ -50,6 +50,14 @@ class ErrorMessages {
                             const std::string& resource_description, const AccessRange range,
                             AdditionalMessageInfo additional_info = {}) const;
 
+    std::string BufferError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                            const std::string& resource_description, AccessRange range,
+                            AdditionalMessageInfo additional_info = {}) const;
+
+    std::string BufferError(const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+                            ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description,
+                            AccessRange range) const;
+
     // TODO: temp legacy version
     std::string BufferCopyError(const SyncEnvironment& env, const HazardResult& hazard, const vvl::Func command,
                                 const std::string& resouce_description, uint32_t region_index, AccessRange range,

@@ -96,6 +96,12 @@ std::string ErrorMessages::Error(const SyncEnvironment& env, const HazardResult&
 std::string ErrorMessages::BufferError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                        const std::string& resource_description, const AccessRange range,
                                        AdditionalMessageInfo additional_info) const {
+    return BufferError(cb_context.GetSyncEnvironment(), hazard, command, resource_description, range, std::move(additional_info));
+}
+
+std::string ErrorMessages::BufferError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                       const std::string& resource_description, AccessRange range,
+                                       AdditionalMessageInfo additional_info) const {
     std::ostringstream ss;
     ss << "\nBuffer access region: {\n";
     ss << "  offset = " << range.begin << "\n";
@@ -103,7 +109,15 @@ std::string ErrorMessages::BufferError(const HazardResult& hazard, const Command
     ss << "}\n";
     additional_info.message_end_text += ss.str();
 
-    return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "BufferError", additional_info);
+    return Error(env, hazard, command, resource_description, "BufferError", additional_info);
+}
+
+std::string ErrorMessages::BufferError(const SyncEnvironment& env, const HazardResult& hazard,
+                                       const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
+                                       const std::string& resource_description, AccessRange range) const {
+    AdditionalMessageInfo additional_info;
+    const vvl::Func command = AddReplayInfo(env, hazard.TagEx(), cb_context, replay_tag, loc, additional_info);
+    return BufferError(env, hazard, command, resource_description, range, std::move(additional_info));
 }
 
 std::string ErrorMessages::BufferCopyError(const SyncEnvironment& env, const HazardResult& hazard, const vvl::Func command,
