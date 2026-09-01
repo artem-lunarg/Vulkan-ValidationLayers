@@ -215,21 +215,29 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
                                            bool apply_command);
 
     bool ValidateBeginRendering(const ErrorObject& error_obj, BeginRenderingCmdState& cmd_state) const;
+    ResourceAccessCommand MakeBeginRenderingAccessCommand(const DynamicRenderingInfo& rendering_info) const;
     void RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc);
     bool ValidateEndRendering(const ErrorObject& error_obj) const;
+    ResourceAccessCommand MakeEndRenderingAccessCommand() const;
     void RecordEndRendering(const RecordObject& record_obj);
     bool ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const Location& loc) const;
+    ResourceAccessCommand MakeDispatchDrawDescriptorAccessCommand(VkPipelineBindPoint pipelineBindPoint) const;
     void RecordDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, ResourceUsageTag tag);
     bool ValidateDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const Location& loc) const;
+    ResourceAccessCommand MakeDrawVertexAccessCommand(uint32_t vertex_count, uint32_t first_vertex) const;
     void RecordDrawVertex(uint32_t vertexCount, uint32_t firstVertex, ResourceUsageTag tag);
     bool ValidateDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, const Location& loc) const;
+    ResourceAccessCommand MakeDrawVertexIndexAccessCommand(uint32_t index_count, uint32_t first_index) const;
     void RecordDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, ResourceUsageTag tag);
     bool ValidateDrawAttachment(const Location& loc) const;
     bool ValidateDrawDynamicRenderingAttachment(const Location& loc) const;
+    ResourceAccessCommand MakeDrawAttachmentAccessCommand() const;
     void RecordDrawAttachment(ResourceUsageTag tag);
     void RecordDrawDynamicRenderingAttachment(ResourceUsageTag tag);
     bool ValidateClearAttachment(const Location& loc, const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
                                  const VkClearRect& clear_rect) const;
+    ResourceAccessCommand MakeClearAttachmentAccessCommand(const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
+                                                           const VkClearRect& clear_rect) const;
     void RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment, const VkClearRect& clear_rect);
 
     ResourceUsageTag RecordNextSubpass(vvl::Func command, bool apply_command);
@@ -263,6 +271,8 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
         auto storage = command.MakeStorage(command_data_);
         commands_.push_back(CommandEntry{tag, tag_count, std::move(storage)});
     }
+
+    void RecordResourceAccesses(ResourceUsageTag tag, ResourceAccessCommand command, bool apply_accesses);
 
     const std::vector<HandleRecord>& GetHandleRecords() const { return handles_; }
 

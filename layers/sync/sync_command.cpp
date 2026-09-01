@@ -23,7 +23,10 @@
 #include "sync/sync_render_pass.h"
 #include "sync/sync_validation.h"
 #include "state_tracker/buffer_state.h"
+#include "state_tracker/descriptor_sets.h"
 #include "state_tracker/image_state.h"
+#include "state_tracker/pipeline_state.h"
+#include "state_tracker/ray_tracing_state.h"
 #include "error_message/logging.h"
 #include "utils/image_utils.h"
 
@@ -220,6 +223,64 @@ uint32_t CommandData::AddImage(const vvl::Image& image) {
     return index;
 }
 
+void CommandData::AddImageView(const vvl::ImageView& image_view) {
+    image_views.emplace_back(std::static_pointer_cast<const vvl::ImageView>(image_view.shared_from_this()));
+}
+
+void CommandData::AddPipeline(const vvl::Pipeline& pipeline) {
+    pipelines.emplace_back(std::static_pointer_cast<const vvl::Pipeline>(pipeline.shared_from_this()));
+}
+
+void CommandData::AddDescriptorSet(const vvl::DescriptorSet& descriptor_set) {
+    descriptor_sets.emplace_back(std::static_pointer_cast<const vvl::DescriptorSet>(descriptor_set.shared_from_this()));
+}
+
+void CommandData::AddAccelerationStructure(const vvl::AccelerationStructureKHR& acceleration_structure) {
+    acceleration_structures.emplace_back(
+        std::static_pointer_cast<const vvl::AccelerationStructureKHR>(acceleration_structure.shared_from_this()));
+}
+
+ResourceAccessCommand ResourceAccessCommand::Storage::MakeCommand(const CommandData& command_data) const {
+    vvl::span<const Access> access_span;
+    if (access_count != 0) {
+        access_span = vvl::make_span(&command_data.resource_accesses[first_access], access_count);
+    }
+    return {CommandList<Access>(access_span)};
+}
+
+ResourceAccessCommand::Storage ResourceAccessCommand::MakeStorage(CommandData& command_data) const {
+    for (const Access& access : accesses) {
+        std::visit(
+            [&](const auto& value) {
+                using AccessType = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    if (value.buffer) command_data.AddBuffer(*value.buffer);
+                    if (value.pipeline) command_data.AddPipeline(*value.pipeline);
+                    if (value.acceleration_structure_info && value.acceleration_structure_info->acceleration_structure) {
+                        command_data.AddAccelerationStructure(*value.acceleration_structure_info->acceleration_structure);
+                    }
+                } else if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    if (value.image_view) command_data.AddImageView(*value.image_view);
+                } else if constexpr (std::is_same_v<AccessType, ImageRangeAccess>) {
+                    if (value.image) command_data.AddImage(*value.image);
+                }
+                if constexpr (std::is_same_v<AccessType, BufferAccess> || std::is_same_v<AccessType, ImageViewAccess>) {
+                    if (value.descriptor_info) {
+                        if (value.descriptor_info->pipeline) command_data.AddPipeline(*value.descriptor_info->pipeline);
+                        if (value.descriptor_info->descriptor_set) {
+                            command_data.AddDescriptorSet(*value.descriptor_info->descriptor_set);
+                        }
+                    }
+                }
+            },
+            access);
+    }
+    const uint32_t first_access = uint32_t(command_data.resource_accesses.size());
+    const uint32_t access_count = uint32_t(accesses.size());
+    accesses.AppendTo(command_data.resource_accesses);
+    return {first_access, access_count};
+}
+
 BufferCopyCommand BufferCopyCommand::Storage::MakeCommand(const CommandData& command_data) const {
     const vvl::Buffer& src_buffer = *command_data.buffers[src_buffer_index];
     const vvl::Buffer& dst_buffer = *command_data.buffers[dst_buffer_index];
@@ -408,6 +469,243 @@ void ImageCopyCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessC
                                region.dstOffset, region.extent, dst_tag_ex, env.queue_id);
     }
 }
+
+bool ResourceAccessCommand::Validate(const CommandBufferContext& cb_context, const Location& loc) const {
+    return Validate(cb_context.GetSyncEnvironment(), cb_context.GetCurrentAccessContext(), cb_context, kInvalidTag, loc);
+}
+
+bool ResourceAccessCommand::Validate(const SyncEnvironment& env, const AccessContext& access_context,
+                                     const CommandBufferContext& cb_context, ResourceUsageTag replay_tag,
+                                     const Location& loc) const {
+    bool skip = false;
+    const SyncValidator& validator = env.validator;
+
+    for (const Access& access : accesses) {
+        std::visit(
+            [&](const auto& value) {
+                using AccessType = std::decay_t<decltype(value)>;
+                HazardResult hazard;
+                if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    if (!value.buffer) return;
+                    hazard = (value.flags & SyncFlag::kMarker)
+                                 ? access_context.DetectMarkerHazard(*value.buffer, value.range)
+                                 : access_context.DetectHazard(*value.buffer, value.access_index, value.range);
+                } else if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    if (!value.image_view) return;
+                    if (value.use_render_area || value.view_mask != 0) {
+                        ImageRangeGen range_gen;
+                        if (value.view_mask != 0) {
+                            range_gen = MakeImageRangeGen(*value.image_view, value.view_mask, value.aspect_mask);
+                        } else {
+                            range_gen = MakeImageRangeGen(*value.image_view, value.offset, value.extent, value.aspect_mask);
+                        }
+                        hazard = access_context.DetectAttachmentHazard(range_gen, value.access_index, value.attachment_access,
+                                                                       env.queue_id);
+                    } else {
+                        hazard = access_context.DetectHazard(*value.image_view, value.access_index);
+                    }
+                } else {
+                    if (!value.image) return;
+                    const auto& sub_state = SubState(*value.image);
+                    ImageRangeGen range_gen =
+                        value.use_offset_extent
+                            ? sub_state.MakeImageRangeGen(value.subresource_range, value.offset, value.extent, value.is_depth_sliced)
+                            : sub_state.MakeImageRangeGen(value.subresource_range, value.is_depth_sliced);
+                    if (value.attachment_access.type == AttachmentAccessType::Empty) {
+                        hazard = access_context.DetectHazard(range_gen, value.access_index);
+                    } else {
+                        hazard = access_context.DetectAttachmentHazard(range_gen, value.access_index, value.attachment_access,
+                                                                       env.queue_id);
+                    }
+                }
+                if (!hazard.IsHazard()) return;
+
+                const DescriptorInfo* descriptor_info = nullptr;
+                if constexpr (std::is_same_v<AccessType, BufferAccess> || std::is_same_v<AccessType, ImageViewAccess>) {
+                    descriptor_info = value.descriptor_info ? &*value.descriptor_info : nullptr;
+                }
+
+                VulkanTypedHandle resource_handle;
+                VulkanTypedHandle object_handle;
+                if (descriptor_info) {
+                    resource_handle = descriptor_info->resource_handle;
+                    if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                        object_handle = descriptor_info->resource_type == DescriptorResourceType::kAccelerationStructure
+                                            ? value.buffer->Handle()
+                                            : resource_handle;
+                    } else {
+                        object_handle = resource_handle;
+                    }
+                } else if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    resource_handle = value.buffer->Handle();
+                    object_handle = resource_handle;
+                } else if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    resource_handle = value.image_view->Handle();
+                    object_handle = resource_handle;
+                } else {
+                    resource_handle = value.tag_handle;
+                    object_handle = resource_handle;
+                }
+
+                LogObjectList objlist;
+                if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    if (replay_tag == kInvalidTag && value.legacy_record_time_object_only) {
+                        objlist = LogObjectList(object_handle);
+                    } else {
+                        objlist = BaseObjectList(env, cb_context, object_handle);
+                    }
+                    if (value.pipeline) objlist.add(value.pipeline->Handle());
+                } else if constexpr (std::is_same_v<AccessType, ImageRangeAccess>) {
+                    if (replay_tag == kInvalidTag && value.error_type == ImageRangeAccess::ErrorType::kVideo) {
+                        objlist = LogObjectList(object_handle);
+                    } else {
+                        objlist = BaseObjectList(env, cb_context, object_handle);
+                    }
+                } else {
+                    objlist = BaseObjectList(env, cb_context, object_handle, value.additional_object);
+                }
+
+                std::string error;
+                if (descriptor_info && descriptor_info->pipeline && descriptor_info->descriptor_set) {
+                    objlist.add(descriptor_info->pipeline->Handle());
+                    const std::string resource_description = validator.FormatHandle(resource_handle);
+                    switch (descriptor_info->resource_type) {
+                        case DescriptorResourceType::kBuffer:
+                            error = validator.error_messages_.BufferDescriptorError(
+                                env, hazard, cb_context, replay_tag, loc, resource_description, *descriptor_info->pipeline,
+                                descriptor_info->set, *descriptor_info->descriptor_set, descriptor_info->descriptor_type,
+                                descriptor_info->binding, descriptor_info->array_element, descriptor_info->stage);
+                            break;
+                        case DescriptorResourceType::kImage:
+                            error = validator.error_messages_.ImageDescriptorError(
+                                env, hazard, cb_context, replay_tag, loc, resource_description, *descriptor_info->pipeline,
+                                descriptor_info->set, *descriptor_info->descriptor_set, descriptor_info->descriptor_type,
+                                descriptor_info->binding, descriptor_info->array_element, descriptor_info->stage,
+                                descriptor_info->image_layout);
+                            break;
+                        case DescriptorResourceType::kAccelerationStructure:
+                            error = validator.error_messages_.AccelerationStructureDescriptorError(
+                                env, hazard, cb_context, replay_tag, loc, resource_description, *descriptor_info->pipeline,
+                                descriptor_info->set, *descriptor_info->descriptor_set, descriptor_info->descriptor_type,
+                                descriptor_info->binding, descriptor_info->array_element, descriptor_info->stage);
+                            break;
+                    }
+                } else if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    const std::string resource_description = value.resource_name + validator.FormatHandle(resource_handle);
+                    if (value.acceleration_structure_info && value.acceleration_structure_info->acceleration_structure) {
+                        const auto& acceleration_structure = *value.acceleration_structure_info->acceleration_structure;
+                        objlist.add(acceleration_structure.Handle());
+                        error = validator.error_messages_.AccelerationStructureError(
+                            env, hazard, cb_context, replay_tag, loc, resource_description, value.range,
+                            acceleration_structure.VkHandle(), value.acceleration_structure_info->location);
+                    } else {
+                        error = validator.error_messages_.BufferError(env, hazard, cb_context, replay_tag, loc,
+                                                                      resource_description, value.range);
+                    }
+                } else if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    std::string resource_description =
+                        value.resource_description.empty() ? validator.FormatHandle(resource_handle) : value.resource_description;
+                    if (!value.resource_description.empty() && value.additional_object != NullVulkanTypedHandle) {
+                        resource_description += " (" + validator.FormatHandle(resource_handle) + ", " +
+                                                validator.FormatHandle(value.additional_object) + ")";
+                    }
+                    error = validator.error_messages_.Error(env, hazard, cb_context, replay_tag, loc, resource_description,
+                                                            value.message_type);
+                } else {
+                    switch (value.error_type) {
+                        case ImageRangeAccess::ErrorType::kClearAttachment:
+                            error = validator.error_messages_.ClearAttachmentError(
+                                env, hazard, cb_context, replay_tag, loc, value.resource_description, value.clear_aspects,
+                                value.clear_rect_index, value.clear_rect);
+                            break;
+                        case ImageRangeAccess::ErrorType::kVideo:
+                            error = validator.error_messages_.VideoError(env, hazard, cb_context, replay_tag, loc,
+                                                                         value.resource_description);
+                            break;
+                        case ImageRangeAccess::ErrorType::kGeneric:
+                            error = validator.error_messages_.Error(env, hazard, cb_context, replay_tag, loc,
+                                                                    value.resource_description, "ImageRangeAccessError");
+                            break;
+                    }
+                }
+
+                auto report_error = [&](const Location& error_loc) {
+                    skip |= validator.SyncError(hazard.Hazard(), objlist, error_loc, error);
+                };
+                if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    if (replay_tag == kInvalidTag) {
+                        switch (value.error_location) {
+                            case ImageViewAccess::ErrorLocation::kColorAttachment:
+                                report_error(loc.dot(vvl::Struct::VkRenderingAttachmentInfo, vvl::Field::pColorAttachments,
+                                                     value.attachment_index)
+                                                 .dot(vvl::Field::imageView));
+                                return;
+                            case ImageViewAccess::ErrorLocation::kDepthAttachment:
+                                report_error(loc.dot(vvl::Struct::VkRenderingAttachmentInfo, vvl::Field::pDepthAttachment)
+                                                 .dot(vvl::Field::imageView));
+                                return;
+                            case ImageViewAccess::ErrorLocation::kStencilAttachment:
+                                report_error(loc.dot(vvl::Struct::VkRenderingAttachmentInfo, vvl::Field::pStencilAttachment)
+                                                 .dot(vvl::Field::imageView));
+                                return;
+                            case ImageViewAccess::ErrorLocation::kNone:
+                                break;
+                        }
+                    }
+                }
+                report_error(loc);
+            },
+            access);
+    }
+    return skip;
+}
+
+void ResourceAccessCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const {
+    for (const Access& access : accesses) {
+        std::visit(
+            [&](const auto& value) {
+                using AccessType = std::decay_t<decltype(value)>;
+                const ResourceUsageTagEx tag_ex{tag, value.handle_index};
+                if constexpr (std::is_same_v<AccessType, BufferAccess>) {
+                    if (value.buffer && value.apply_access) {
+                        access_context.UpdateAccessState(*value.buffer, value.access_index, value.range, tag_ex, value.flags,
+                                                         env.queue_id);
+                    }
+                } else if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                    if (!value.image_view) return;
+                    if (value.use_render_area || value.view_mask != 0) {
+                        ImageRangeGen range_gen;
+                        if (value.view_mask != 0) {
+                            range_gen = MakeImageRangeGen(*value.image_view, value.view_mask, value.aspect_mask);
+                        } else {
+                            range_gen = MakeImageRangeGen(*value.image_view, value.offset, value.extent, value.aspect_mask);
+                        }
+                        access_context.UpdateAttachmentAccessState(range_gen, value.access_index, value.attachment_access, tag_ex,
+                                                                   env.queue_id);
+                    } else {
+                        ImageRangeGen range_gen = MakeImageRangeGen(*value.image_view);
+                        access_context.UpdateAccessState(range_gen, value.access_index, tag_ex, 0, env.queue_id);
+                    }
+                } else {
+                    if (!value.image) return;
+                    const auto& sub_state = SubState(*value.image);
+                    ImageRangeGen range_gen =
+                        value.use_offset_extent
+                            ? sub_state.MakeImageRangeGen(value.subresource_range, value.offset, value.extent, value.is_depth_sliced)
+                            : sub_state.MakeImageRangeGen(value.subresource_range, value.is_depth_sliced);
+                    if (value.attachment_access.type == AttachmentAccessType::Empty) {
+                        access_context.UpdateAccessState(range_gen, value.access_index, tag_ex, 0, env.queue_id);
+                    } else {
+                        access_context.UpdateAttachmentAccessState(range_gen, value.access_index, value.attachment_access, tag_ex,
+                                                                   env.queue_id);
+                    }
+                }
+            },
+            access);
+    }
+}
+
+void ResourceAccessCommand::Append(ResourceAccessCommand&& other) { accesses.Append(std::move(other.accesses)); }
 
 ImageTransferCommand ImageTransferCommand::Storage::MakeCommand(const CommandData& command_data) const {
     vvl::span<const Access> accesses;

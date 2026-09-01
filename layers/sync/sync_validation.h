@@ -266,11 +266,15 @@ class SyncValidator : public vvl::DeviceProxy {
     bool ValidateIndirectBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context,
                                 const VkDeviceSize struct_size, const VkBuffer buffer, const VkDeviceSize offset,
                                 const uint32_t drawCount, const uint32_t stride, const Location& loc) const;
+    ResourceAccessCommand MakeIndirectBufferAccessCommand(VkDeviceSize struct_size, VkBuffer buffer, VkDeviceSize offset,
+                                                          uint32_t draw_count, uint32_t stride) const;
     void RecordIndirectBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, const VkDeviceSize struct_size,
                               const VkBuffer buffer, const VkDeviceSize offset, const uint32_t drawCount, uint32_t stride);
 
     bool ValidateCountBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context, VkBuffer buffer,
                              VkDeviceSize offset, const Location& loc, const char* count_buffer_label = "draw count") const;
+    ResourceAccessCommand MakeCountBufferAccessCommand(VkBuffer buffer, VkDeviceSize offset,
+                                                       const char* label = "draw count") const;
     void RecordCountBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, VkBuffer buffer, VkDeviceSize offset);
 
     bool PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, uint32_t z,

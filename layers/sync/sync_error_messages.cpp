@@ -93,6 +93,14 @@ std::string ErrorMessages::Error(const SyncEnvironment& env, const HazardResult&
     return message;
 }
 
+std::string ErrorMessages::Error(const SyncEnvironment& env, const HazardResult& hazard,
+                                 const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
+                                 const std::string& resource_description, const char* message_type,
+                                 AdditionalMessageInfo additional_info) const {
+    const vvl::Func command = AddReplayInfo(env, hazard.TagEx(), cb_context, replay_tag, loc, additional_info);
+    return Error(env, hazard, command, resource_description, message_type, additional_info);
+}
+
 std::string ErrorMessages::BufferError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                        const std::string& resource_description, const AccessRange range,
                                        AdditionalMessageInfo additional_info) const {
@@ -165,6 +173,26 @@ std::string ErrorMessages::AccelerationStructureError(const HazardResult& hazard
 
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "AccelerationStructureError",
                  additional_info);
+}
+
+std::string ErrorMessages::AccelerationStructureError(
+    const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+    ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description, AccessRange range,
+    VkAccelerationStructureKHR acceleration_structure, std::string_view acceleration_structure_location) const {
+    AdditionalMessageInfo additional_info;
+    std::ostringstream ss;
+    ss << "The buffer backs " << acceleration_structure_location << " (";
+    ss << validator_.FormatHandle(acceleration_structure) << "). ";
+    additional_info.pre_synchronization_text = ss.str();
+
+    std::ostringstream ss2;
+    ss2 << "\nBuffer access region: {\n";
+    ss2 << "  offset = " << range.begin << "\n";
+    ss2 << "  size = " << range.end - range.begin << "\n";
+    ss2 << "}\n";
+    additional_info.message_end_text = ss2.str();
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "AccelerationStructureError",
+                 std::move(additional_info));
 }
 
 std::string ErrorMessages::ImageCopyResolveBlitError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
@@ -279,6 +307,21 @@ std::string ErrorMessages::BufferDescriptorError(const HazardResult& hazard, con
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "BufferDescriptorError", additional_info);
 }
 
+std::string ErrorMessages::BufferDescriptorError(
+    const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+    ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description, const vvl::Pipeline& pipeline,
+    uint32_t set_number, const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+    uint32_t descriptor_binding, uint32_t descriptor_array_element, VkShaderStageFlagBits shader_stage) const {
+    AdditionalMessageInfo additional_info;
+    std::ostringstream ss;
+    PrepareCommonDescriptorMessage(validator_, pipeline, set_number, descriptor_set, descriptor_type, descriptor_binding,
+                                   descriptor_array_element, shader_stage, "buffer", additional_info, ss);
+    ss << ".";
+    additional_info.pre_synchronization_text = ss.str();
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "BufferDescriptorError",
+                 std::move(additional_info));
+}
+
 std::string ErrorMessages::ImageDescriptorError(const HazardResult& hazard, const CommandBufferContext& cb_context,
                                                 vvl::Func command, const std::string& resource_description,
                                                 const vvl::Pipeline& pipeline, uint32_t set_number,
@@ -296,6 +339,23 @@ std::string ErrorMessages::ImageDescriptorError(const HazardResult& hazard, cons
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "ImageDescriptorError", additional_info);
 }
 
+std::string ErrorMessages::ImageDescriptorError(
+    const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+    ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description, const vvl::Pipeline& pipeline,
+    uint32_t set_number, const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+    uint32_t descriptor_binding, uint32_t descriptor_array_element, VkShaderStageFlagBits shader_stage,
+    VkImageLayout image_layout) const {
+    AdditionalMessageInfo additional_info;
+    std::ostringstream ss;
+    PrepareCommonDescriptorMessage(validator_, pipeline, set_number, descriptor_set, descriptor_type, descriptor_binding,
+                                   descriptor_array_element, shader_stage, "image", additional_info, ss);
+    ss << ", image layout " << string_VkImageLayout(image_layout) << ".";
+    additional_info.pre_synchronization_text = ss.str();
+    additional_info.properties.Add(kPropertyImageLayout, string_VkImageLayout(image_layout));
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "ImageDescriptorError",
+                 std::move(additional_info));
+}
+
 std::string ErrorMessages::AccelerationStructureDescriptorError(
     const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command, const std::string& resource_description,
     const vvl::Pipeline& pipeline, uint32_t set_number, const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
@@ -311,6 +371,22 @@ std::string ErrorMessages::AccelerationStructureDescriptorError(
 
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "AccelerationStructureDescriptorError",
                  additional_info);
+}
+
+std::string ErrorMessages::AccelerationStructureDescriptorError(
+    const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+    ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description, const vvl::Pipeline& pipeline,
+    uint32_t set_number, const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+    uint32_t descriptor_binding, uint32_t descriptor_array_element, VkShaderStageFlagBits shader_stage) const {
+    AdditionalMessageInfo additional_info;
+    additional_info.access_action = "traces rays against";
+    std::ostringstream ss;
+    PrepareCommonDescriptorMessage(validator_, pipeline, set_number, descriptor_set, descriptor_type, descriptor_binding,
+                                   descriptor_array_element, shader_stage, "acceleration structure", additional_info, ss);
+    ss << ".";
+    additional_info.pre_synchronization_text = ss.str();
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "AccelerationStructureDescriptorError",
+                 std::move(additional_info));
 }
 
 std::string ErrorMessages::ClearAttachmentError(const HazardResult& hazard, const CommandBufferContext& cb_context,
@@ -331,6 +407,27 @@ std::string ErrorMessages::ClearAttachmentError(const HazardResult& hazard, cons
     additional_info.message_end_text = ss.str();
 
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "ClearAttachmentError", additional_info);
+}
+
+std::string ErrorMessages::ClearAttachmentError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                const CommandBufferContext& cb_context, ResourceUsageTag replay_tag,
+                                                const Location& loc, const std::string& resource_description,
+                                                VkImageAspectFlags clear_aspects, uint32_t clear_rect_index,
+                                                const VkClearRect& clear_rect) const {
+    std::ostringstream ss;
+    ss << "\nClear region: {\n";
+    ss << "  region_index = " << clear_rect_index << ",\n";
+    ss << "  rect = {" << string_VkRect2D(clear_rect.rect) << "},\n";
+    ss << "  baseArrayLayer = " << clear_rect.baseArrayLayer << ",\n";
+    ss << "  layerCount = " << clear_rect.layerCount << "\n";
+    ss << "}\n";
+
+    AdditionalMessageInfo additional_info;
+    additional_info.properties.Add(kPropertyImageAspects, string_VkImageAspectFlags(clear_aspects));
+    additional_info.access_action = "clears";
+    additional_info.message_end_text = ss.str();
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "ClearAttachmentError",
+                 std::move(additional_info));
 }
 
 std::string ErrorMessages::RenderPassAttachmentError(const HazardResult& hazard, const CommandBufferContext& cb_context,
@@ -590,6 +687,12 @@ std::string ErrorMessages::PresentError(const HazardResult& hazard, const QueueB
 std::string ErrorMessages::VideoError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                       const std::string& resource_description) const {
     return Error(cb_context.GetSyncEnvironment(), hazard, command, resource_description, "VideoError");
+}
+
+std::string ErrorMessages::VideoError(const SyncEnvironment& env, const HazardResult& hazard,
+                                      const CommandBufferContext& cb_context, ResourceUsageTag replay_tag,
+                                      const Location& loc, const std::string& resource_description) const {
+    return Error(env, hazard, cb_context, replay_tag, loc, resource_description, "VideoError");
 }
 
 }  // namespace syncval

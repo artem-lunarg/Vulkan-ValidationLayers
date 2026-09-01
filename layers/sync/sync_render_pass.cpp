@@ -16,6 +16,7 @@
  */
 
 #include <vulkan/utility/vk_format_utils.h>
+#include "sync/sync_command.h"
 #include "sync/sync_render_pass.h"
 #include "sync/sync_validation.h"
 #include "sync/sync_replay.h"
@@ -597,6 +598,71 @@ static uint32_t GetSubpassDepthStencilAttachmentIndex(const vku::safe_VkPipeline
     return (pipe_ds_ci && depth_stencil_ref) ? depth_stencil_ref->attachment : VK_ATTACHMENT_UNUSED;
 }
 
+ResourceAccessCommand RenderPassAccessContext::MakeDrawSubpassAttachmentAccessCommand(
+    const vvl::CommandBuffer& cmd_buffer) const {
+    ResourceAccessCommand command;
+    const auto& last_bound_state = cmd_buffer.GetLastBoundGraphics();
+    const auto* pipeline = last_bound_state.pipeline_state;
+    if (!pipeline || pipeline->RasterizationDisabled()) return command;
+
+    const auto& subpass = rp_state_->create_info.pSubpasses[current_subpass_];
+    auto add_attachment = [&](uint32_t attachment_index, SyncAccessIndex access_index, SyncOrdering ordering,
+                              VkImageAspectFlags aspect_mask, std::string resource_description) {
+        if (attachment_index >= attachment_views_.size()) return;
+        const vvl::ImageView* image_view = attachment_views_[attachment_index].GetViewState();
+        if (!image_view) return;
+        ResourceAccessCommand::ImageViewAccess access;
+        access.image_view = image_view;
+        access.access_index = access_index;
+        access.use_render_area = subpass.viewMask == 0;
+        access.offset = CastTo3D(render_area_.offset);
+        access.extent = CastTo3D(render_area_.extent);
+        access.view_mask = subpass.viewMask;
+        access.aspect_mask = aspect_mask;
+        access.attachment_access = GetAttachmentAccess(ordering);
+        access.tag_handle = image_view->Handle();
+        access.additional_object = image_view->image_state->Handle();
+        access.resource_description = std::move(resource_description);
+        access.message_type = "RenderPassAttachmentError";
+        command.accesses.emplace_back(std::move(access));
+    };
+
+    if (subpass.pColorAttachments && subpass.colorAttachmentCount) {
+        for (const uint32_t location : pipeline->fs_writable_output_location_list) {
+            if (location >= subpass.colorAttachmentCount) continue;
+            const uint32_t attachment_index = subpass.pColorAttachments[location].attachment;
+            if (attachment_index == VK_ATTACHMENT_UNUSED) continue;
+            std::ostringstream ss;
+            ss << "color attachment " << location << " in subpass " << current_subpass_;
+            add_attachment(attachment_index, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
+                           SyncOrdering::kColorAttachment, 0, ss.str());
+        }
+    }
+
+    const auto* depth_stencil_state = pipeline->DepthStencilState();
+    const uint32_t attachment_index =
+        GetSubpassDepthStencilAttachmentIndex(depth_stencil_state, subpass.pDepthStencilAttachment);
+    if (attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < attachment_views_.size()) {
+        const vvl::ImageView* image_view = attachment_views_[attachment_index].GetViewState();
+        if (image_view) {
+            const VkFormat format = image_view->create_info.format;
+            if (IsDepthAttachmentWriteable(last_bound_state, format)) {
+                std::ostringstream ss;
+                ss << "depth aspect of depth-stencil attachment in subpass " << current_subpass_;
+                add_attachment(attachment_index, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
+                               SyncOrdering::kDepthStencilAttachment, VK_IMAGE_ASPECT_DEPTH_BIT, ss.str());
+            }
+            if (IsStencilAttachmentWriteable(last_bound_state, format)) {
+                std::ostringstream ss;
+                ss << "stencil aspect of depth-stencil attachment in subpass " << current_subpass_;
+                add_attachment(attachment_index, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
+                               SyncOrdering::kDepthStencilAttachment, VK_IMAGE_ASPECT_STENCIL_BIT, ss.str());
+            }
+        }
+    }
+    return command;
+}
+
 bool RenderPassAccessContext::ValidateDrawSubpassAttachment(const CommandBufferContext& cb_context, vvl::Func command) const {
     bool skip = false;
     const vvl::CommandBuffer& cmd_buffer = cb_context.GetCBState();
@@ -941,6 +1007,7 @@ RenderPassAccessContext::RenderPassAccessContext(const vvl::RenderPass& rp_state
                                                  vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views,
                                                  const AccessContext& external_context, uint32_t render_pass_instance_id)
     : rp_state_(&rp_state),
+      render_area_(render_area),
       attachment_views_(CreateAttachmentViewGen(render_area, attachment_views)),
       external_context_(&external_context),
       subpass_contexts_(InitSubpassContexts(queue_flags, rp_state, external_context)),

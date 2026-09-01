@@ -46,6 +46,10 @@ class ErrorMessages {
                       const std::string& resource_description, const char* message_type,
                       const AdditionalMessageInfo& additional_info = {}) const;
 
+    std::string Error(const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+                      ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description,
+                      const char* message_type, AdditionalMessageInfo additional_info = {}) const;
+
     std::string BufferError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                             const std::string& resource_description, const AccessRange range,
                             AdditionalMessageInfo additional_info = {}) const;
@@ -71,6 +75,11 @@ class ErrorMessages {
                                            const vvl::Func command, const std::string& resource_description,
                                            const AccessRange range, VkAccelerationStructureKHR as,
                                            const Location& as_location) const;
+    std::string AccelerationStructureError(const SyncEnvironment& env, const HazardResult& hazard,
+                                           const CommandBufferContext& cb_context, ResourceUsageTag replay_tag,
+                                           const Location& loc, const std::string& resource_description, AccessRange range,
+                                           VkAccelerationStructureKHR acceleration_structure,
+                                           std::string_view acceleration_structure_location) const;
 
     // TODO: temp legacy version
     std::string ImageCopyResolveBlitError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
@@ -102,8 +111,20 @@ class ErrorMessages {
                                       const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                       uint32_t descriptor_binding, uint32_t descriptor_array_element,
                                       VkShaderStageFlagBits shader_stage) const;
+    std::string BufferDescriptorError(const SyncEnvironment& env, const HazardResult& hazard,
+                                      const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
+                                      const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
+                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
+                                      VkShaderStageFlagBits shader_stage) const;
 
     std::string ImageDescriptorError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                                     const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
+                                     const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
+                                     uint32_t descriptor_binding, uint32_t descriptor_array_element,
+                                     VkShaderStageFlagBits shader_stage, VkImageLayout image_layout) const;
+    std::string ImageDescriptorError(const SyncEnvironment& env, const HazardResult& hazard,
+                                     const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
                                      const std::string& resource_description, const vvl::Pipeline& pipeline, uint32_t set_number,
                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
@@ -115,8 +136,18 @@ class ErrorMessages {
                                                      const vvl::DescriptorSet& descriptor_set, VkDescriptorType descriptor_type,
                                                      uint32_t descriptor_binding, uint32_t descriptor_array_element,
                                                      VkShaderStageFlagBits shader_stage) const;
+    std::string AccelerationStructureDescriptorError(
+        const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+        ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description,
+        const vvl::Pipeline& pipeline, uint32_t set_number, const vvl::DescriptorSet& descriptor_set,
+        VkDescriptorType descriptor_type, uint32_t descriptor_binding, uint32_t descriptor_array_element,
+        VkShaderStageFlagBits shader_stage) const;
 
     std::string ClearAttachmentError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+                                     const std::string& resource_description, VkImageAspectFlags clear_aspects,
+                                     uint32_t clear_rect_index, const VkClearRect& clear_rect) const;
+    std::string ClearAttachmentError(const SyncEnvironment& env, const HazardResult& hazard,
+                                     const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc,
                                      const std::string& resource_description, VkImageAspectFlags clear_aspects,
                                      uint32_t clear_rect_index, const VkClearRect& clear_rect) const;
 
@@ -180,6 +211,8 @@ class ErrorMessages {
 
     std::string VideoError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                            const std::string& resource_description) const;
+    std::string VideoError(const SyncEnvironment& env, const HazardResult& hazard, const CommandBufferContext& cb_context,
+                           ResourceUsageTag replay_tag, const Location& loc, const std::string& resource_description) const;
 
   private:
     vvl::Func AddReplayInfo(const SyncEnvironment& env, ResourceUsageTagEx prior_tag_ex, const CommandBufferContext& cb_context,

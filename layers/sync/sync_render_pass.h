@@ -34,6 +34,7 @@ class RenderPass;
 namespace syncval {
 
 class CommandBufferContext;
+struct ResourceAccessCommand;
 
 enum class AttachmentType { kColor, kDepth, kStencil };
 
@@ -126,6 +127,7 @@ class RenderPassAccessContext {
                                         AccessContext& access_context, QueueId queue_id = kQueueIdInvalid);
 
     bool ValidateDrawSubpassAttachment(const CommandBufferContext& cb_context, vvl::Func command) const;
+    ResourceAccessCommand MakeDrawSubpassAttachmentAccessCommand(const vvl::CommandBuffer& cmd_buffer) const;
     void RecordDrawSubpassAttachment(const vvl::CommandBuffer& cmd_buffer, ResourceUsageTag tag);
 
     const vvl::ImageView* GetClearAttachmentView(const VkClearAttachment& clear_attachment) const;
@@ -157,6 +159,7 @@ class RenderPassAccessContext {
 
   private:
     const vvl::RenderPass* rp_state_;
+    const VkRect2D render_area_{};
     const AttachmentViewGenVector attachment_views_;
     const AccessContext* external_context_;
     const std::unique_ptr<AccessContext[]> subpass_contexts_;
