@@ -569,7 +569,13 @@ bool ResourceAccessCommand::Validate(const SyncEnvironment& env, const AccessCon
                 std::string error;
                 if (descriptor_info && descriptor_info->pipeline && descriptor_info->descriptor_set) {
                     objlist.add(descriptor_info->pipeline->Handle());
-                    const std::string resource_description = validator.FormatHandle(resource_handle);
+                    std::string resource_description = validator.FormatHandle(resource_handle);
+                    if constexpr (std::is_same_v<AccessType, ImageViewAccess>) {
+                        if (replay_tag != kInvalidTag && descriptor_info->resource_type == DescriptorResourceType::kImage &&
+                            value.image_view && value.image_view->image_state) {
+                            resource_description += " (" + validator.FormatHandle(value.image_view->image_state->Handle()) + ")";
+                        }
+                    }
                     switch (descriptor_info->resource_type) {
                         case DescriptorResourceType::kBuffer:
                             error = validator.error_messages_.BufferDescriptorError(
