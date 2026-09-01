@@ -579,7 +579,8 @@ bool AccessState::ClearPredicatedAccesses(Predicate& predicate) {
 // NOTE: That's for use cases when BarrierScope does not use queue id or tag (record time, not-event barriers).
 // This can be extended if necessary to provide BarrierScope for each barrier.
 void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& barriers, bool layout_transition = false,
-                   ResourceUsageTag layout_transition_tag = kInvalidTag);
+                   ResourceUsageTag layout_transition_tag = kInvalidTag,
+                   QueueId layout_transition_queue = kQueueIdInvalid);
 
 // Global registry of layout transition ordering barriers
 ThreadSafeLookupTable<OrderingBarrier>& GetLayoutOrderingBarrierLookup();

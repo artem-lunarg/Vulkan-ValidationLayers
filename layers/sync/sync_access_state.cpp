@@ -785,12 +785,12 @@ void PendingBarriers::Apply(const ResourceUsageTag exec_tag) {
 }
 
 void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& barriers, bool layout_transition,
-                   ResourceUsageTag layout_transition_tag) {
+                   ResourceUsageTag layout_transition_tag, QueueId layout_transition_queue) {
     // The common case of a single barrier.
     // The pending barrier helper is unnecessary because there are no independent barriers to track.
     // The barrier can be applied directly to the access state.
     if (barriers.size() == 1) {
-        access_state.ApplyBarrier(BarrierScope(barriers[0]), barriers[0], layout_transition, vvl::kNoIndex32,
+        access_state.ApplyBarrier(BarrierScope(barriers[0], layout_transition_queue), barriers[0], layout_transition, vvl::kNoIndex32,
                                   layout_transition_tag);
         return;
     }
@@ -808,7 +808,7 @@ void ApplyBarriers(AccessState& access_state, const std::vector<SyncBarrier>& ba
             layout_ordering_barrier.exec_scope |= barrier.src_exec_scope.exec_scope;
             layout_ordering_barrier.access_scope |= barrier.src_access_scope;
         }
-        pending_barriers.AddLayoutTransition(&access_state, layout_ordering_barrier, vvl::kNoIndex32);
+        pending_barriers.AddLayoutTransition(&access_state, layout_ordering_barrier, vvl::kNoIndex32, layout_transition_queue);
 
         for (const SyncBarrier& barrier : barriers) {
             pending_barriers.AddWriteBarrier(&access_state, barrier);

@@ -161,15 +161,16 @@ void RenderPassCommand::Apply(CommandReplayContext& replay_context, ResourceUsag
     if (!rp_context) {
         return;
     }
+    const QueueId queue_id = replay_context.GetSyncEnvironment().queue_id;
     switch (type) {
         case Type::kBegin:
-            rp_context->RecordBeginRenderPass(tag, tag + 1);
+            rp_context->RecordBeginRenderPass(tag, tag + 1, queue_id);
             break;
         case Type::kNext:
-            rp_context->RecordNextSubpass(tag, tag + 1, tag + 2, tag + 3);
+            rp_context->RecordNextSubpass(tag, tag + 1, tag + 2, tag + 3, queue_id);
             break;
         case Type::kEnd:
-            rp_context->RecordEndRenderPass(&replay_context.ExternalAccessContext(), tag, tag + 1);
+            rp_context->RecordEndRenderPass(&replay_context.ExternalAccessContext(), tag, tag + 1, queue_id);
             replay_context.EndRenderPass();
             break;
     }
