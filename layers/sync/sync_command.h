@@ -108,8 +108,12 @@ class CommandList {
 
     void Append(CommandList&& other) {
         assert(!view_.data());
-        const auto values = other.Data();
-        owned_.insert(owned_.end(), std::make_move_iterator(values.begin()), std::make_move_iterator(values.end()));
+        if (other.view_.data()) {
+            owned_.insert(owned_.end(), other.view_.begin(), other.view_.end());
+        } else {
+            owned_.insert(owned_.end(), std::make_move_iterator(other.owned_.begin()),
+                          std::make_move_iterator(other.owned_.end()));
+        }
     }
 
   private:
