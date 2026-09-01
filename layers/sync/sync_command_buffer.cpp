@@ -230,16 +230,6 @@ static SyncAccessIndex GetSyncStageAccessIndexsByDescriptorSet(VkDescriptorType 
     }
 }
 
-static void UpdateVideoAccessState(AccessContext& access_context, const vvl::VideoSession& vs_state,
-                                   const vvl::VideoPictureResource& resource, SyncAccessIndex current_usage, ResourceUsageTag tag) {
-    const auto image = static_cast<const vvl::Image*>(resource.image_state.get());
-    const auto offset = resource.GetEffectiveImageOffset(vs_state);
-    const auto extent = resource.GetEffectiveImageExtent(vs_state);
-    const auto& sub_state = SubState(*image);
-    ImageRangeGen range_gen(sub_state.MakeImageRangeGen(resource.range, offset, extent, false));
-    access_context.UpdateAccessState(range_gen, current_usage, ResourceUsageTagEx{tag});
-}
-
 SyncEnvironment::SyncEnvironment(const SyncValidator& validator, VkQueueFlags queue_flags, QueueId queue_id,
                                  VulkanTypedHandle handle, SyncEventsContext& events_context,
                                  const ResourceUsageInfoProvider& usage_info_provider)
@@ -313,7 +303,9 @@ void CommandBufferContext::RecordResourceAccesses(ResourceUsageTag tag, Resource
     if (apply_accesses) {
         command.Apply(GetSyncEnvironment(), tag, GetCurrentAccessContext());
     }
-    StoreCommand(tag, command);
+    if (sync_state_.syncval_settings.full_validation) {
+        StoreCommand(tag, command);
+    }
 }
 
 void CommandBufferContext::Reset() {
@@ -2152,7 +2144,8 @@ void CommandBufferSubState::RecordClearAttachments(uint32_t attachment_count, co
             command.Append(cb_context.MakeClearAttachmentAccessCommand(attachment, rect_index, rect));
         }
     }
-    cb_context.RecordResourceAccesses(tag, std::move(command), cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
+    cb_context.RecordResourceAccesses(tag, std::move(command),
+                                      cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
 }
 
 void CommandBufferSubState::RecordFillBuffer(vvl::Buffer& buffer_state, VkDeviceSize offset, VkDeviceSize size,
@@ -2191,83 +2184,17 @@ void CommandBufferSubState::RecordUpdateBuffer(vvl::Buffer& buffer_state, VkDevi
 void CommandBufferSubState::RecordDecodeVideo(vvl::VideoSession& vs_state, const VkVideoDecodeInfoKHR& decode_info,
                                               const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    if (auto src_buffer = base.dev_data.Get<vvl::Buffer>(decode_info.srcBuffer)) {
-        const AccessRange src_range = MakeRange(*src_buffer, decode_info.srcBufferOffset, decode_info.srcBufferRange);
-        const ResourceUsageTagEx src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer->Handle());
-        context.UpdateAccessState(*src_buffer, SYNC_VIDEO_DECODE_VIDEO_DECODE_READ, src_range, src_tag_ex);
-    }
-
-    const vvl::DeviceState* device_state = cb_context.GetSyncState().device_state;
-    auto dst_resource = vvl::VideoPictureResource(*device_state, decode_info.dstPictureResource);
-    if (dst_resource) {
-        UpdateVideoAccessState(context, vs_state, dst_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_WRITE, tag);
-    }
-
-    if (decode_info.pSetupReferenceSlot != nullptr && decode_info.pSetupReferenceSlot->pPictureResource != nullptr) {
-        auto setup_resource = vvl::VideoPictureResource(*device_state, *decode_info.pSetupReferenceSlot->pPictureResource);
-        if (setup_resource && (setup_resource != dst_resource)) {
-            UpdateVideoAccessState(context, vs_state, setup_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_WRITE, tag);
-        }
-    }
-
-    for (uint32_t i = 0; i < decode_info.referenceSlotCount; ++i) {
-        if (decode_info.pReferenceSlots[i].pPictureResource != nullptr) {
-            auto reference_resource = vvl::VideoPictureResource(*device_state, *decode_info.pReferenceSlots[i].pPictureResource);
-            if (reference_resource) {
-                UpdateVideoAccessState(context, vs_state, reference_resource, SYNC_VIDEO_DECODE_VIDEO_DECODE_READ, tag);
-            }
-        }
-    }
+    auto command = cb_context.GetSyncState().MakeDecodeVideoAccessCommand(cb_context.GetCBState(), decode_info);
+    cb_context.RecordResourceAccesses(tag, std::move(command),
+                                      cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
 }
 
 void CommandBufferSubState::RecordEncodeVideo(vvl::VideoSession& vs_state, const VkVideoEncodeInfoKHR& encode_info,
                                               const Location& loc) {
     const auto tag = cb_context.NextCommandTag(loc.function);
-    AccessContext& context = cb_context.GetCbAccessContext();
-
-    if (auto src_buffer = base.dev_data.Get<vvl::Buffer>(encode_info.dstBuffer)) {
-        const AccessRange src_range = MakeRange(*src_buffer, encode_info.dstBufferOffset, encode_info.dstBufferRange);
-        const ResourceUsageTagEx src_tag_ex = cb_context.AddCommandHandle(tag, src_buffer->Handle());
-        context.UpdateAccessState(*src_buffer, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_WRITE, src_range, src_tag_ex);
-    }
-
-    const vvl::DeviceState* device_state = cb_context.GetSyncState().device_state;
-    auto src_resource = vvl::VideoPictureResource(*device_state, encode_info.srcPictureResource);
-    if (src_resource) {
-        UpdateVideoAccessState(context, vs_state, src_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, tag);
-    }
-
-    if (encode_info.pSetupReferenceSlot != nullptr && encode_info.pSetupReferenceSlot->pPictureResource != nullptr) {
-        auto setup_resource = vvl::VideoPictureResource(*device_state, *encode_info.pSetupReferenceSlot->pPictureResource);
-        if (setup_resource) {
-            UpdateVideoAccessState(context, vs_state, setup_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_WRITE, tag);
-        }
-    }
-
-    for (uint32_t i = 0; i < encode_info.referenceSlotCount; ++i) {
-        if (encode_info.pReferenceSlots[i].pPictureResource != nullptr) {
-            auto reference_resource = vvl::VideoPictureResource(*device_state, *encode_info.pReferenceSlots[i].pPictureResource);
-            if (reference_resource) {
-                UpdateVideoAccessState(context, vs_state, reference_resource, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, tag);
-            }
-        }
-    }
-
-    if (encode_info.flags & (VK_VIDEO_ENCODE_WITH_QUANTIZATION_DELTA_MAP_BIT_KHR | VK_VIDEO_ENCODE_WITH_EMPHASIS_MAP_BIT_KHR)) {
-        auto quantization_map_info = vku::FindStructInPNextChain<VkVideoEncodeQuantizationMapInfoKHR>(encode_info.pNext);
-        if (quantization_map_info) {
-            auto image_view_state = base.dev_data.Get<vvl::ImageView>(quantization_map_info->quantizationMap);
-            if (image_view_state) {
-                VkOffset3D offset = {0, 0, 0};
-                VkExtent3D extent = {quantization_map_info->quantizationMapExtent.width,
-                                     quantization_map_info->quantizationMapExtent.height, 1};
-                ImageRangeGen range_gen(MakeImageRangeGen(*image_view_state, offset, extent));
-                context.UpdateAccessState(range_gen, SYNC_VIDEO_ENCODE_VIDEO_ENCODE_READ, ResourceUsageTagEx{tag});
-            }
-        }
-    }
+    auto command = cb_context.GetSyncState().MakeEncodeVideoAccessCommand(cb_context.GetCBState(), encode_info);
+    cb_context.RecordResourceAccesses(tag, std::move(command),
+                                      cb_context.GetSyncState().syncval_settings.IsRecordTimeValidationEnabled());
 }
 
 void CommandBufferSubState::RecordCopyQueryPoolResults(vvl::QueryPool& pool_state, vvl::Buffer& dst_buffer_state,

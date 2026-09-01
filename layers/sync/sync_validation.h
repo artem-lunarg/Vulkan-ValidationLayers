@@ -442,8 +442,12 @@ class SyncValidator : public vvl::DeviceProxy {
 
     bool PreCallValidateCmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoDecodeInfoKHR* pDecodeInfo,
                                           const ErrorObject& error_obj) const override;
+    ResourceAccessCommand MakeDecodeVideoAccessCommand(const vvl::CommandBuffer& cb_state,
+                                                       const VkVideoDecodeInfoKHR& decode_info) const;
     bool PreCallValidateCmdEncodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoEncodeInfoKHR* pEncodeInfo,
                                           const ErrorObject& error_obj) const override;
+    ResourceAccessCommand MakeEncodeVideoAccessCommand(const vvl::CommandBuffer& cb_state,
+                                                       const VkVideoEncodeInfoKHR& encode_info) const;
 
     void PostCallRecordResetEvent(VkDevice device, VkEvent event, const RecordObject& record_obj) override;
     bool PreCallValidateCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask,
@@ -551,6 +555,11 @@ class SyncValidator : public vvl::DeviceProxy {
                                                           const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
                                                           const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos,
                                                           const ErrorObject& error_obj) const override;
+    ResourceAccessCommand MakeBuildAccelerationStructuresAccessCommand(
+        uint32_t info_count, const VkAccelerationStructureBuildGeometryInfoKHR* infos,
+        const VkAccelerationStructureBuildRangeInfoKHR* const* build_range_infos, const Location& loc) const;
+    ResourceAccessCommand MakeAccelerationStructureAccessCommand(VkAccelerationStructureKHR acceleration_structure,
+                                                                 SyncAccessIndex access_index, const Location& loc) const;
     void PostCallRecordCmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount,
                                                          const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
                                                          const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos,
@@ -574,10 +583,8 @@ class SyncValidator : public vvl::DeviceProxy {
                                                                const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo,
                                                                const RecordObject& record_obj) override;
 
-    bool ValidateSbtBuffer(const CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                           const Location& loc, const char* sbt_buffer_label) const;
-    void RecordSbtBuffer(CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                         ResourceUsageTag tag);
+    ResourceAccessCommand MakeSbtBufferAccessCommand(const VkStridedDeviceAddressRegionKHR* sbt_address_region,
+                                                     const char* sbt_buffer_label) const;
     bool PreCallValidateCmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                                         const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
                                         const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,

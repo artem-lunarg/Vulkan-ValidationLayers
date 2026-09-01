@@ -73,7 +73,16 @@ class CommandList {
     const T* end() const { return Data().end(); }
     size_t size() const { return Data().size(); }
     bool empty() const { return Data().empty(); }
+    T& front() {
+        assert(!view_.data());
+        return owned_.front();
+    }
     const T& front() const { return Data().front(); }
+    T& back() {
+        assert(!view_.data());
+        return owned_.back();
+    }
+    const T& back() const { return Data().back(); }
     operator vvl::span<const T>() const { return Data(); }
 
     void reserve(size_t capacity) {
