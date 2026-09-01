@@ -131,29 +131,30 @@ class ErrorMessages {
     std::string EndRenderingStoreError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
                                        const std::string& resource_description, VkAttachmentStoreOp store_op) const;
 
-    std::string RenderPassLoadOpError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLoadOpError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                       const std::string& resource_description, uint32_t subpass, uint32_t attachment,
                                       VkAttachmentLoadOp load_op, bool is_color) const;
-    std::string RenderPassLoadOpVsLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                        vvl::Func command, const std::string& resource_description,
-                                                        VkAttachmentLoadOp load_op, bool is_color) const;
-    std::string RenderPassResolveError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLoadOpVsLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                                        const std::string& resource_description, VkAttachmentLoadOp load_op,
+                                                        bool is_color) const;
+    std::string RenderPassResolveError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                        const std::string& resource_description) const;
-    std::string RenderPassStoreOpError(const HazardResult& hazard, const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassStoreOpError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
                                        const std::string& resource_description, VkAttachmentStoreOp store_op) const;
 
-    std::string RenderPassLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                vvl::Func command, const std::string& resource_description,
-                                                VkImageLayout old_layout, VkImageLayout new_layout) const;
-    std::string RenderPassLayoutTransitionVsResolveError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                         vvl::Func command, const std::string& resource_description,
-                                                         VkImageLayout old_layout, VkImageLayout new_layout,
-                                                         uint32_t resolve_subpass) const;
-    std::string RenderPassFinalLayoutTransitionError(const HazardResult& hazard, const CommandBufferContext& cb_context,
-                                                     vvl::Func command, const std::string& resource_description,
-                                                     VkImageLayout old_layout, VkImageLayout new_layout) const;
-    std::string RenderPassFinalLayoutTransitionVsStoreOrResolveError(const HazardResult& hazard,
-                                                                     const CommandBufferContext& cb_context, vvl::Func command,
+    std::string RenderPassLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard, vvl::Func command,
+                                                const std::string& resource_description, VkImageLayout old_layout,
+                                                VkImageLayout new_layout) const;
+    std::string RenderPassLayoutTransitionVsResolveError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                         VkRenderPass render_pass, vvl::Func command,
+                                                         const std::string& resource_description, VkImageLayout old_layout,
+                                                         VkImageLayout new_layout, uint32_t resolve_subpass) const;
+    std::string RenderPassFinalLayoutTransitionError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                     VkRenderPass render_pass, vvl::Func command,
+                                                     const std::string& resource_description, VkImageLayout old_layout,
+                                                     VkImageLayout new_layout) const;
+    std::string RenderPassFinalLayoutTransitionVsStoreOrResolveError(const SyncEnvironment& env, const HazardResult& hazard,
+                                                                     VkRenderPass render_pass, vvl::Func command,
                                                                      const std::string& resource_description,
                                                                      VkImageLayout old_layout, VkImageLayout new_layout,
                                                                      uint32_t store_resolve_subpass) const;

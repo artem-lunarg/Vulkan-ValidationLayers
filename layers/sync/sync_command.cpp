@@ -19,6 +19,7 @@
 #include "sync/sync_access_context.h"
 #include "sync/sync_command_buffer.h"
 #include "sync/sync_image.h"
+#include "sync/sync_render_pass.h"
 #include "sync/sync_validation.h"
 #include "state_tracker/buffer_state.h"
 #include "state_tracker/image_state.h"
@@ -26,6 +27,37 @@
 #include "utils/image_utils.h"
 
 namespace syncval {
+
+class CommandReplayContext {
+  public:
+    CommandReplayContext(SyncEnvironment& env, AccessContext& access_context, ResourceUsageTag base_tag)
+        : env_(env), access_context_(access_context), render_pass_instance_offset_(uint32_t(base_tag)) {}
+
+    AccessContext& CurrentAccessContext() {
+        return render_pass_context_ ? render_pass_context_->CurrentContext() : access_context_;
+    }
+
+    RenderPassAccessContext* BeginRenderPass(const RenderPassCommand& command) {
+        if (!command.render_pass) {
+            return nullptr;
+        }
+        render_pass_context_ = std::make_unique<RenderPassAccessContext>(
+            *command.render_pass, command.render_area, env_.queue_flags, command.attachments, access_context_,
+            command.render_pass_instance_id + render_pass_instance_offset_);
+        return render_pass_context_.get();
+    }
+
+    RenderPassAccessContext* GetRenderPassContext() { return render_pass_context_.get(); }
+    void EndRenderPass() { render_pass_context_.reset(); }
+    AccessContext& ExternalAccessContext() { return access_context_; }
+    SyncEnvironment& GetSyncEnvironment() { return env_; }
+
+  private:
+    SyncEnvironment& env_;
+    AccessContext& access_context_;
+    uint32_t render_pass_instance_offset_;
+    std::unique_ptr<RenderPassAccessContext> render_pass_context_;
+};
 
 static LogObjectList BaseObjectList(const SyncEnvironment& env, const CommandBufferContext& cb_context,
                                     const VulkanTypedHandle& resource, const VulkanTypedHandle& related_object = {}) {
@@ -47,6 +79,7 @@ static LogObjectList BaseObjectList(const SyncEnvironment& env, const CommandBuf
 bool ReplayCommands(SyncEnvironment& env, AccessContext& access_context, const CommandBufferContext& cb_context,
                     ResourceUsageTag base_tag, const Location& loc) {
     bool skip = false;
+    CommandReplayContext replay_context(env, access_context, base_tag);
     const CommandData& command_data = cb_context.GetCommandData();
 
     for (const CommandEntry& entry : cb_context.GetCommands()) {
@@ -54,15 +87,92 @@ bool ReplayCommands(SyncEnvironment& env, AccessContext& access_context, const C
         std::visit(
             [&](const auto& storage) {
                 const auto& command = storage.MakeCommand(command_data);
-                const bool command_skip = command.Validate(env, access_context, cb_context, entry.tag, loc);
-                if (!command_skip) {
-                    command.Apply(env, tag, access_context);
+                using CommandType = std::decay_t<decltype(command)>;
+                bool command_skip = false;
+                if constexpr (std::is_same_v<CommandType, RenderPassCommand>) {
+                    command_skip = command.Validate(replay_context, cb_context, entry.tag, loc);
+                    if (!command_skip) {
+                        command.Apply(replay_context, tag);
+                    }
+                } else {
+                    AccessContext& current_access_context = replay_context.CurrentAccessContext();
+                    command_skip = command.Validate(env, current_access_context, cb_context, entry.tag, loc);
+                    if (!command_skip) {
+                        command.Apply(env, tag, current_access_context);
+                    }
                 }
                 skip |= command_skip;
             },
             entry.storage);
     }
     return skip;
+}
+
+RenderPassCommand RenderPassCommand::Storage::MakeCommand(const CommandData& command_data) const {
+    std::shared_ptr<const vvl::RenderPass> render_pass;
+    if (render_pass_index != vvl::kNoIndex32) {
+        render_pass = command_data.render_passes[render_pass_index];
+    }
+    vvl::span<const std::shared_ptr<const vvl::ImageView>> attachments;
+    if (attachment_count != 0) {
+        attachments = vvl::make_span(&command_data.render_pass_attachments[first_attachment], attachment_count);
+    }
+    return {type, std::move(render_pass), CommandList<std::shared_ptr<const vvl::ImageView>>(attachments), render_area,
+            render_pass_instance_id, command};
+}
+
+RenderPassCommand::Storage RenderPassCommand::MakeStorage(CommandData& command_data) const {
+    uint32_t render_pass_index = vvl::kNoIndex32;
+    if (render_pass) {
+        render_pass_index = uint32_t(command_data.render_passes.size());
+        command_data.render_passes.emplace_back(render_pass);
+    }
+    const uint32_t first_attachment = uint32_t(command_data.render_pass_attachments.size());
+    const uint32_t attachment_count = uint32_t(attachments.size());
+    attachments.AppendTo(command_data.render_pass_attachments);
+    return {type, render_pass_index, first_attachment, attachment_count, render_area, render_pass_instance_id, command};
+}
+
+bool RenderPassCommand::Validate(CommandReplayContext& replay_context, const CommandBufferContext& cb_context,
+                                 ResourceUsageTag replay_tag, const Location& loc) const {
+    switch (type) {
+        case Type::kBegin: {
+            RenderPassAccessContext* rp_context = replay_context.BeginRenderPass(*this);
+            return rp_context ? rp_context->ValidateBeginRenderPass(cb_context, replay_context.GetSyncEnvironment(), command)
+                              : false;
+        }
+        case Type::kNext: {
+            const RenderPassAccessContext* rp_context = replay_context.GetRenderPassContext();
+            return rp_context ? rp_context->ValidateNextSubpass(cb_context, replay_context.GetSyncEnvironment(), command) : false;
+        }
+        case Type::kEnd: {
+            const RenderPassAccessContext* rp_context = replay_context.GetRenderPassContext();
+            return rp_context ? rp_context->ValidateEndRenderPass(cb_context, replay_context.GetSyncEnvironment(), command) : false;
+        }
+    }
+    return false;
+}
+
+void RenderPassCommand::Apply(CommandReplayContext& replay_context, ResourceUsageTag tag) const {
+    RenderPassAccessContext* rp_context = replay_context.GetRenderPassContext();
+    if (!rp_context && type == Type::kBegin) {
+        rp_context = replay_context.BeginRenderPass(*this);
+    }
+    if (!rp_context) {
+        return;
+    }
+    switch (type) {
+        case Type::kBegin:
+            rp_context->RecordBeginRenderPass(tag, tag + 1);
+            break;
+        case Type::kNext:
+            rp_context->RecordNextSubpass(tag, tag + 1, tag + 2, tag + 3);
+            break;
+        case Type::kEnd:
+            rp_context->RecordEndRenderPass(&replay_context.ExternalAccessContext(), tag, tag + 1);
+            replay_context.EndRenderPass();
+            break;
+    }
 }
 
 uint32_t CommandData::AddBuffer(const vvl::Buffer& buffer) {

@@ -211,7 +211,8 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     const RenderPassAccessContext* GetCurrentRenderPassContext() const { return current_renderpass_context_; }
     uint32_t GetCurrentRenderPassInstanceId() const { return current_render_pass_instance_id_; }
     ResourceUsageTag RecordBeginRenderPass(vvl::Func command, const vvl::RenderPass& rp_state, const VkRect2D& render_area,
-                                           const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views);
+                                           const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
+                                           bool apply_command);
 
     bool ValidateBeginRendering(const ErrorObject& error_obj, BeginRenderingCmdState& cmd_state) const;
     void RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc);
@@ -231,8 +232,8 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
                                  const VkClearRect& clear_rect) const;
     void RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment, const VkClearRect& clear_rect);
 
-    ResourceUsageTag RecordNextSubpass(vvl::Func command);
-    ResourceUsageTag RecordEndRenderPass(vvl::Func command);
+    ResourceUsageTag RecordNextSubpass(vvl::Func command, bool apply_command);
+    ResourceUsageTag RecordEndRenderPass(vvl::Func command, bool apply_command);
     void RecordDestroyEvent(vvl::Event* event_state);
 
     void RecordExecutedCommandBuffer(const CommandBufferContext& recorded_context);
@@ -258,9 +259,9 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
     }
 
     template <typename Command>
-    void StoreCommand(ResourceUsageTag tag, const Command& command) {
+    void StoreCommand(ResourceUsageTag tag, const Command& command, uint32_t tag_count = 1) {
         auto storage = command.MakeStorage(command_data_);
-        commands_.push_back(CommandEntry{tag, std::move(storage)});
+        commands_.push_back(CommandEntry{tag, tag_count, std::move(storage)});
     }
 
     const std::vector<HandleRecord>& GetHandleRecords() const { return handles_; }
@@ -280,6 +281,7 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
         size_t command_index = 0;
         for (ResourceUsageTag tag = 0; tag < access_log_->size(); tag++) {
             if (command_index < commands_.size() && commands_[command_index].tag == tag) {
+                tag += commands_[command_index].tag_count - 1;
                 command_index++;
                 continue;
             }

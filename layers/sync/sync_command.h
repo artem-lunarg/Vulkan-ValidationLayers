@@ -26,6 +26,8 @@ struct VulkanTypedHandle;
 namespace vvl {
 class Buffer;
 class Image;
+class ImageView;
+class RenderPass;
 enum class Func;
 }  // namespace vvl
 
@@ -33,6 +35,7 @@ namespace syncval {
 
 class AccessContext;
 class CommandBufferContext;
+class CommandReplayContext;
 struct CommandData;
 struct SyncEnvironment;
 
@@ -48,11 +51,17 @@ class CommandList {
   public:
     CommandList() = default;
     explicit CommandList(vvl::span<const T> view) : view_(view) {}
+    CommandList& operator=(const std::vector<T>& values) {
+        assert(!view_.data());
+        owned_ = values;
+        return *this;
+    }
 
     const T* begin() const { return Data().begin(); }
     const T* end() const { return Data().end(); }
     size_t size() const { return Data().size(); }
     bool empty() const { return Data().empty(); }
+    operator vvl::span<const T>() const { return Data(); }
 
     void reserve(size_t capacity) {
         assert(!view_.data());
@@ -230,9 +239,35 @@ struct BarrierCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+struct RenderPassCommand {
+    enum class Type { kBegin, kNext, kEnd };
+
+    Type type;
+    std::shared_ptr<const vvl::RenderPass> render_pass;
+    CommandList<std::shared_ptr<const vvl::ImageView>> attachments;
+    VkRect2D render_area{};
+    uint32_t render_pass_instance_id = 0;
+    vvl::Func command{};
+
+    struct Storage {
+        Type type;
+        uint32_t render_pass_index;
+        uint32_t first_attachment;
+        uint32_t attachment_count;
+        VkRect2D render_area;
+        uint32_t render_pass_instance_id;
+        vvl::Func command;
+        RenderPassCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(CommandReplayContext& replay_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(CommandReplayContext& replay_context, ResourceUsageTag tag) const;
+};
+
 using CommandStorage =
     std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage,
-                 ImageTransferCommand::Storage, BarrierCommand::Storage>;
+                 ImageTransferCommand::Storage, BarrierCommand::Storage, RenderPassCommand::Storage>;
 
 struct CommandData {
     std::vector<std::shared_ptr<const vvl::Buffer>> buffers;
@@ -241,6 +276,8 @@ struct CommandData {
     std::vector<VkImageCopy> image_copy_regions;
     std::vector<ImageTransferCommand::Access> image_transfer_accesses;
     std::vector<BarrierSet> barrier_sets;
+    std::vector<std::shared_ptr<const vvl::RenderPass>> render_passes;
+    std::vector<std::shared_ptr<const vvl::ImageView>> render_pass_attachments;
 
     uint32_t AddBuffer(const vvl::Buffer& buffer);
     uint32_t AddImage(const vvl::Image& image);
@@ -251,6 +288,7 @@ struct CommandData {
 // use array of commands instead.
 struct CommandEntry {
     ResourceUsageTag tag;
+    uint32_t tag_count;
     CommandStorage storage;
 };
 

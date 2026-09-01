@@ -29,12 +29,13 @@ namespace syncval {
 class ValidateResolveAction {
   public:
     ValidateResolveAction(VkRenderPass render_pass, uint32_t subpass, uint32_t view_mask, const AccessContext& access_context,
-                          const CommandBufferContext& cb_context, vvl::Func command)
+                          const CommandBufferContext& cb_context, const SyncEnvironment& env, vvl::Func command)
         : render_pass_(render_pass),
           subpass_(subpass),
           view_mask_(view_mask),
           context_(access_context),
           cb_context_(cb_context),
+          env_(env),
           command_(command),
           skip_(false) {}
 
@@ -53,8 +54,7 @@ class ValidateResolveAction {
             ss << " (" << resolve_action_name << " of " << aspect_name << " multisample attachment " << src_at;
             ss << " in subpass " << subpass_ << " of " << validator.FormatHandle(render_pass_) << ")";
             const std::string resource_description = ss.str();
-            const auto error =
-                validator.error_messages_.RenderPassResolveError(hazard, cb_context_, command_, resource_description);
+            const auto error = validator.error_messages_.RenderPassResolveError(env_, hazard, command_, resource_description);
             skip_ |= validator.SyncError(hazard.Hazard(), render_pass_, loc, error);
         }
     }
@@ -67,6 +67,7 @@ class ValidateResolveAction {
     const uint32_t view_mask_;
     const AccessContext& context_;
     const CommandBufferContext& cb_context_;
+    const SyncEnvironment& env_;
     vvl::Func command_;
     bool skip_;
 };
@@ -163,9 +164,9 @@ static AccessContext* CreateStoreResolveProxyContext(const AccessContext& contex
 }
 
 // Layout transitions are handled as if the were occuring in the beginning of the next subpass
-bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferContext& cb_context, const AccessContext& access_context,
-                                                        const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id,
-                                                        uint32_t subpass, uint32_t view_mask,
+bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                        const AccessContext& access_context, const vvl::RenderPass& rp_state,
+                                                        uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
                                                         const AttachmentViewGenVector& attachment_views, vvl::Func command) {
     bool skip = false;
     // As validation methods are const and precede the record/update phase, for any tranistions from the immediately
@@ -216,12 +217,12 @@ bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferConte
 
             if (hazard.Tag() == kInvalidTag) {
                 const auto error = sync_state.error_messages_.RenderPassLayoutTransitionVsResolveError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout,
+                    env, hazard, rp_state.VkHandle(), command, resource_description, transition.old_layout, transition.new_layout,
                     transition.src_subpass);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
             } else {
                 const auto error = sync_state.error_messages_.RenderPassLayoutTransitionError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout);
+                    env, hazard, command, resource_description, transition.old_layout, transition.new_layout);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
             }
         }
@@ -229,9 +230,9 @@ bool RenderPassAccessContext::ValidateLayoutTransitions(const CommandBufferConte
     return skip;
 }
 
-bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& cb_context, const AccessContext& access_context,
-                                                    const vvl::RenderPass& rp_state, uint32_t render_pass_instance_id,
-                                                    uint32_t subpass, uint32_t view_mask,
+bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                    const AccessContext& access_context, const vvl::RenderPass& rp_state,
+                                                    uint32_t render_pass_instance_id, uint32_t subpass, uint32_t view_mask,
                                                     const AttachmentViewGenVector& attachment_views, vvl::Func command) {
     bool skip = false;
 
@@ -298,11 +299,11 @@ bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& 
 
                 if (hazard.Tag() == kInvalidTag) {  // Hazard vs. ILT
                     const auto error = sync_state.error_messages_.RenderPassLoadOpVsLayoutTransitionError(
-                        hazard, cb_context, command, resource_description, load_op, is_color);
+                        env, hazard, command, resource_description, load_op, is_color);
                     skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
                 } else {
                     const std::string error = sync_state.error_messages_.RenderPassLoadOpError(
-                        hazard, cb_context, command, resource_description, subpass, i, load_op, is_color);
+                        env, hazard, command, resource_description, subpass, i, load_op, is_color);
                     skip |= sync_state.SyncError(hazard.Hazard(), rp_state.Handle(), loc, error);
                 }
             }
@@ -311,11 +312,28 @@ bool RenderPassAccessContext::ValidateLoadOperation(const CommandBufferContext& 
     return skip;
 }
 
+bool RenderPassAccessContext::ValidateBeginRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                      vvl::Func command) const {
+    assert(current_subpass_ == 0);
+    const uint32_t view_mask = rp_state_->create_info.pSubpasses[0].viewMask;
+    bool skip = ValidateLayoutTransitions(cb_context, env, CurrentContext(), *rp_state_, render_pass_instance_id_, 0, view_mask,
+                                          attachment_views_, command);
+    if (!skip) {
+        AccessContext temp_context(cb_context.GetSyncState());
+        temp_context.InitFrom(CurrentContext());
+        RecordLayoutTransitions(*rp_state_, 0, attachment_views_, kInvalidTag, temp_context);
+        skip |= ValidateLoadOperation(cb_context, env, temp_context, *rp_state_, render_pass_instance_id_, 0, view_mask,
+                                      attachment_views_, command);
+    }
+    return skip;
+}
+
 // Store operation validation can ignore resolve (before it) and layout tranistions after it.  The first is ignored
 // because of the ordering guarantees w.r.t. sample access and that the resolve validation hasn't altered the state, because
 // store is part of the same Next/End operation.
 // The latter is handled in layout transistion validation directly
-bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                     vvl::Func command) const {
     bool skip = false;
 
     const AttachmentAccess attachment_access = GetAttachmentAccess(SyncOrdering::kRaster, AttachmentAccessType::StoreOp);
@@ -375,7 +393,7 @@ bool RenderPassAccessContext::ValidateStoreOperation(const CommandBufferContext&
                 const std::string resource_description = ss.str();
 
                 const std::string error =
-                    sync_state.error_messages_.RenderPassStoreOpError(hazard, cb_context, command, resource_description, store_op);
+                    sync_state.error_messages_.RenderPassStoreOpError(env, hazard, command, resource_description, store_op);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             }
         }
@@ -493,9 +511,10 @@ void ResolveOperation(Action& action, const vvl::RenderPass& rp_state, const Att
     }
 }
 
-bool RenderPassAccessContext::ValidateResolveOperations(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateResolveOperations(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                        vvl::Func command) const {
     const uint32_t view_mask = rp_state_->create_info.pSubpasses[current_subpass_].viewMask;
-    ValidateResolveAction validate_action(rp_state_->VkHandle(), current_subpass_, view_mask, CurrentContext(), cb_context,
+    ValidateResolveAction validate_action(rp_state_->VkHandle(), current_subpass_, view_mask, CurrentContext(), cb_context, env,
                                           command);
     ResolveOperation(validate_action, *rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_);
     return validate_action.GetSkip();
@@ -729,11 +748,12 @@ const vvl::ImageView* RenderPassAccessContext::GetClearAttachmentView(const VkCl
     return attachment_views_[attachment_index].GetViewState();
 }
 
-bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                  vvl::Func command) const {
     // PHASE1 TODO: Add Validate Preserve attachments
     bool skip = false;
-    skip |= ValidateResolveOperations(cb_context, command);
-    skip |= ValidateStoreOperation(cb_context, command);
+    skip |= ValidateResolveOperations(cb_context, env, command);
+    skip |= ValidateStoreOperation(cb_context, env, command);
 
     const auto next_subpass = current_subpass_ + 1;
     if (next_subpass >= rp_state_->create_info.subpassCount) {
@@ -741,7 +761,7 @@ bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb
     }
     const uint32_t next_subpass_view_mask = rp_state_->create_info.pSubpasses[next_subpass].viewMask;
     const auto& next_context = subpass_contexts_[next_subpass];
-    skip |= ValidateLayoutTransitions(cb_context, next_context, *rp_state_, render_pass_instance_id_, next_subpass,
+    skip |= ValidateLayoutTransitions(cb_context, env, next_context, *rp_state_, render_pass_instance_id_, next_subpass,
                                       next_subpass_view_mask, attachment_views_, command);
     if (!skip) {
         // To avoid complex (and buggy) duplication of the affect of layout transitions on load operations, we'll record them
@@ -750,17 +770,18 @@ bool RenderPassAccessContext::ValidateNextSubpass(const CommandBufferContext& cb
         AccessContext temp_context(cb_context.GetSyncState());
         temp_context.InitFrom(next_context);
         RecordLayoutTransitions(*rp_state_, next_subpass, attachment_views_, kInvalidTag, temp_context);
-        skip |= ValidateLoadOperation(cb_context, temp_context, *rp_state_, render_pass_instance_id_, next_subpass,
+        skip |= ValidateLoadOperation(cb_context, env, temp_context, *rp_state_, render_pass_instance_id_, next_subpass,
                                       next_subpass_view_mask, attachment_views_, command);
     }
     return skip;
 }
-bool RenderPassAccessContext::ValidateEndRenderPass(const CommandBufferContext& cb_context, vvl::Func command) const {
+bool RenderPassAccessContext::ValidateEndRenderPass(const CommandBufferContext& cb_context, const SyncEnvironment& env,
+                                                    vvl::Func command) const {
     // PHASE1 TODO: Validate Preserve
     bool skip = false;
-    skip |= ValidateResolveOperations(cb_context, command);
-    skip |= ValidateStoreOperation(cb_context, command);
-    skip |= ValidateFinalSubpassLayoutTransitions(cb_context, command);
+    skip |= ValidateResolveOperations(cb_context, env, command);
+    skip |= ValidateStoreOperation(cb_context, env, command);
+    skip |= ValidateFinalSubpassLayoutTransitions(cb_context, env, command);
     return skip;
 }
 
@@ -770,7 +791,7 @@ AccessContext* RenderPassAccessContext::CreateStoreResolveProxy() const {
 }
 
 bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const CommandBufferContext& cb_context,
-                                                                    vvl::Func command) const {
+                                                                    const SyncEnvironment& env, vvl::Func command) const {
     bool skip = false;
 
     // As validation methods are const and precede the record/update phase, for any tranistions from the current (last)
@@ -822,12 +843,13 @@ bool RenderPassAccessContext::ValidateFinalSubpassLayoutTransitions(const Comman
 
             if (hazard.Tag() == kInvalidTag) {  // Hazard vs. store/resolve
                 const std::string error = sync_state.error_messages_.RenderPassFinalLayoutTransitionVsStoreOrResolveError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout,
+                    env, hazard, rp_state_->VkHandle(), command, resource_description, transition.old_layout, transition.new_layout,
                     transition.src_subpass);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             } else {
                 const std::string error = sync_state.error_messages_.RenderPassFinalLayoutTransitionError(
-                    hazard, cb_context, command, resource_description, transition.old_layout, transition.new_layout);
+                    env, hazard, rp_state_->VkHandle(), command, resource_description, transition.old_layout,
+                    transition.new_layout);
                 skip |= sync_state.SyncError(hazard.Hazard(), rp_state_->Handle(), loc, error);
             }
         }
@@ -893,7 +915,7 @@ void RenderPassAccessContext::RecordLoadOperations(const ResourceUsageTag tag) {
 }
 
 AttachmentViewGenVector RenderPassAccessContext::CreateAttachmentViewGen(
-    const VkRect2D& render_area, const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views) {
+    const VkRect2D& render_area, vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views) {
     AttachmentViewGenVector view_gens;
     VkExtent3D extent = CastTo3D(render_area.extent);
     VkOffset3D offset = CastTo3D(render_area.offset);
@@ -906,7 +928,7 @@ AttachmentViewGenVector RenderPassAccessContext::CreateAttachmentViewGen(
 
 RenderPassAccessContext::RenderPassAccessContext(const vvl::RenderPass& rp_state, const VkRect2D& render_area,
                                                  VkQueueFlags queue_flags,
-                                                 const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views,
+                                                 vvl::span<const std::shared_ptr<const vvl::ImageView>> attachment_views,
                                                  const AccessContext& external_context, uint32_t render_pass_instance_id)
     : rp_state_(&rp_state),
       attachment_views_(CreateAttachmentViewGen(render_area, attachment_views)),
@@ -945,6 +967,12 @@ void RenderPassAccessContext::RecordNextSubpass(ResourceUsageTag resolve_tag, co
 
     RecordLayoutTransitions(transition_tag);
     RecordLoadOperations(load_tag);
+}
+
+void RenderPassAccessContext::AdvanceSubpass() {
+    if (current_subpass_ + 1 < rp_state_->create_info.subpassCount) {
+        current_subpass_++;
+    }
 }
 
 void RenderPassAccessContext::RecordEndRenderPass(AccessContext* external_context, const ResourceUsageTag store_tag,
