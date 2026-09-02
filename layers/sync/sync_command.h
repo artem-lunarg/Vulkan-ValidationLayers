@@ -415,6 +415,7 @@ struct RenderPassCommand {
         RenderPassCommand MakeCommand(const CommandData& command_data) const;
     };
     Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
     bool Validate(CommandReplayContext& replay_context, const CommandBufferContext& cb_context,
                   ResourceUsageTag replay_tag, const Location& loc) const;
     void Apply(CommandReplayContext& replay_context, ResourceUsageTag tag) const;

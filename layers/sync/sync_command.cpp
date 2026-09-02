@@ -144,6 +144,29 @@ RenderPassCommand::Storage RenderPassCommand::MakeStorage(CommandData& command_d
     return {type, render_pass_index, first_attachment, attachment_count, render_area, render_pass_instance_id, command};
 }
 
+bool RenderPassCommand::Validate(const CommandBufferContext& cb_context, const Location& loc) const {
+    const SyncEnvironment& env = cb_context.GetSyncEnvironment();
+    switch (type) {
+        case Type::kBegin: {
+            if (!render_pass) {
+                return false;
+            }
+            RenderPassAccessContext rp_context(*render_pass, render_area, env.queue_flags, attachments,
+                                               cb_context.GetCbAccessContext(), render_pass_instance_id);
+            return rp_context.ValidateBeginRenderPass(cb_context, env, loc.function);
+        }
+        case Type::kNext: {
+            const RenderPassAccessContext* rp_context = cb_context.GetCurrentRenderPassContext();
+            return rp_context ? rp_context->ValidateNextSubpass(cb_context, env, loc.function) : false;
+        }
+        case Type::kEnd: {
+            const RenderPassAccessContext* rp_context = cb_context.GetCurrentRenderPassContext();
+            return rp_context ? rp_context->ValidateEndRenderPass(cb_context, env, loc.function) : false;
+        }
+    }
+    return false;
+}
+
 EventCommand EventCommand::Storage::MakeCommand(const CommandData& command_data) const {
     vvl::span<const std::shared_ptr<const vvl::Event>> event_span;
     if (event_count != 0) {
