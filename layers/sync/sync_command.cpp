@@ -72,6 +72,9 @@ bool ReplayCommands(SyncEnvironment& env, AccessContext& destination_access_cont
                     command.render_pass_instance_offset = replay_context.render_pass_instance_offset;
                 } else if constexpr (std::is_same_v<CommandType, ShaderAccessCommand>) {
                     command.additional_accesses.render_pass_instance_offset = replay_context.render_pass_instance_offset;
+                    if (command.render_pass_instance_id != vvl::kNoIndex32) {
+                        command.render_pass_instance_id += replay_context.render_pass_instance_offset;
+                    }
                 }
 
                 AccessContext& access_context = replay_context.CurrentAccessContext();
@@ -594,7 +597,8 @@ ShaderAccessCommand ShaderAccessCommand::Storage::MakeCommand(const CommandData&
     if (image_access_count != 0) {
         image_accesses = vvl::make_span(&command_data.descriptor_image_accesses[first_image_access], image_access_count);
     }
-    return {pipeline, buffer_accesses, image_accesses, additional_accesses.MakeCommand(command_data)};
+    return {
+        pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, additional_accesses.MakeCommand(command_data)};
 }
 
 ShaderAccessCommand::Storage ShaderAccessCommand::MakeStorage(CommandData& command_data) const {
@@ -627,8 +631,14 @@ ShaderAccessCommand::Storage ShaderAccessCommand::MakeStorage(CommandData& comma
         command_data.descriptor_image_accesses.insert(command_data.descriptor_image_accesses.end(), image_accesses.begin(),
                                                       image_accesses.end());
     }
-    return {pipeline,           first_buffer_access, buffer_access_count,
-            first_image_access, image_access_count,  additional_accesses.MakeStorage(command_data)};
+    return {pipeline,
+            first_buffer_access,
+            buffer_access_count,
+            first_image_access,
+            image_access_count,
+            render_pass_instance_id,
+            subpass,
+            additional_accesses.MakeStorage(command_data)};
 }
 
 bool ShaderAccessCommand::Validate(const CommandBufferContext& cb_context, const Location& loc) const {
@@ -639,6 +649,7 @@ bool ShaderAccessCommand::Validate(const SyncEnvironment& env, const AccessConte
                                    const CommandBufferContext& cb_context, ResourceUsageTag replay_tag, const Location& loc) const {
     bool skip = false;
     const SyncValidator& validator = env.validator;
+    const AttachmentAccess attachment_access{AttachmentAccessType::Access, SyncOrdering::kRaster, render_pass_instance_id, subpass};
     auto validate_access = [&](const auto& value) {
         using AccessType = std::decay_t<decltype(value)>;
         HazardResult hazard;
@@ -647,8 +658,7 @@ bool ShaderAccessCommand::Validate(const SyncEnvironment& env, const AccessConte
         } else {
             if (value.access_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
                 ImageRangeGen range_gen = MakeImageRangeGen(*value.image_view, value.offset, value.extent);
-                hazard = access_context.DetectAttachmentHazard(
-                    range_gen, value.access_index, additional_accesses.GetAttachmentAccess(value.attachment_access), env.queue_id);
+                hazard = access_context.DetectAttachmentHazard(range_gen, value.access_index, attachment_access, env.queue_id);
             } else {
                 hazard = access_context.DetectHazard(*value.image_view, value.access_index);
             }
@@ -700,6 +710,7 @@ bool ShaderAccessCommand::Validate(const SyncEnvironment& env, const AccessConte
 }
 
 void ShaderAccessCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const {
+    const AttachmentAccess attachment_access{AttachmentAccessType::Access, SyncOrdering::kRaster, render_pass_instance_id, subpass};
     for (const BufferAccess& access : buffer_accesses) {
         const ResourceUsageTagEx tag_ex{tag, access.handle_index};
         access_context.UpdateAccessState(*access.buffer, access.access_index, access.range, tag_ex, 0, env.queue_id);
@@ -708,9 +719,7 @@ void ShaderAccessCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, Acce
         const ResourceUsageTagEx tag_ex{tag, access.handle_index};
         if (access.access_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
             ImageRangeGen range_gen = MakeImageRangeGen(*access.image_view, access.offset, access.extent);
-            access_context.UpdateAttachmentAccessState(range_gen, access.access_index,
-                                                       additional_accesses.GetAttachmentAccess(access.attachment_access), tag_ex,
-                                                       env.queue_id);
+            access_context.UpdateAttachmentAccessState(range_gen, access.access_index, attachment_access, tag_ex, env.queue_id);
         } else {
             ImageRangeGen range_gen = MakeImageRangeGen(*access.image_view);
             access_context.UpdateAccessState(range_gen, access.access_index, tag_ex, 0, env.queue_id);

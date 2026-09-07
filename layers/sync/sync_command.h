@@ -242,15 +242,16 @@ struct ShaderAccessCommand {
         VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
         uint32_t handle_index = vvl::kNoIndex32;
-        // Input attachments use the render area and render-pass attachment ordering.
+        // Input attachments use the render area.
         VkOffset3D offset{};
         VkExtent3D extent{};
-        AttachmentAccess attachment_access;
     };
 
     const vvl::Pipeline* pipeline = nullptr;
     vvl::span<const BufferAccess> buffer_accesses;
     vvl::span<const ImageViewAccess> image_accesses;
+    uint32_t render_pass_instance_id = vvl::kNoIndex32;
+    uint32_t subpass = vvl::kNoIndex32;
     // Vertex, index, indirect, attachment, and shader binding table accesses retain their order.
     ResourceAccessCommand additional_accesses;
 
@@ -260,6 +261,8 @@ struct ShaderAccessCommand {
         uint32_t buffer_access_count;
         uint32_t first_image_access;
         uint32_t image_access_count;
+        uint32_t render_pass_instance_id;
+        uint32_t subpass;
         ResourceAccessCommand::Storage additional_accesses;
         ShaderAccessCommand MakeCommand(const CommandData& command_data) const;
     };

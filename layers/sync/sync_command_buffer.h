@@ -224,6 +224,8 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
         const vvl::Pipeline* pipeline = nullptr;
         std::vector<ShaderAccessCommand::BufferAccess> buffer_accesses;
         std::vector<ShaderAccessCommand::ImageViewAccess> image_accesses;
+        uint32_t render_pass_instance_id = vvl::kNoIndex32;
+        uint32_t subpass = vvl::kNoIndex32;
     };
     DescriptorAccesses CollectDescriptorAccesses(VkPipelineBindPoint pipelineBindPoint) const;
 

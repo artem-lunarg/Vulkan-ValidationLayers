@@ -1031,8 +1031,9 @@ bool SyncValidator::PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, ui
     if (!syncval_settings.IsRecordTimeValidationEnabled()) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {}};
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1050,12 +1051,13 @@ bool SyncValidator::PreCallValidateCmdDispatchIndirect(VkCommandBuffer commandBu
     if (!syncval_settings.IsRecordTimeValidationEnabled()) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
     std::vector<ResourceAccessCommand::Access> accesses;
 
     CollectIndirectBufferAccesses(sizeof(VkDispatchIndirectCommand), buffer, offset, 1, sizeof(VkDispatchIndirectCommand),
                                   accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1079,8 +1081,9 @@ bool SyncValidator::PreCallValidateCmdDispatchBase(VkCommandBuffer commandBuffer
     if (!syncval_settings.IsRecordTimeValidationEnabled()) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {}};
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_COMPUTE);
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1114,11 +1117,12 @@ bool SyncValidator::PreCallValidateCmdDraw(VkCommandBuffer commandBuffer, uint32
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawVertexAccesses(vertexCount, firstVertex, accesses);
     cb_context.CollectDrawAttachmentAccesses(accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1142,11 +1146,12 @@ bool SyncValidator::PreCallValidateCmdDrawIndexed(VkCommandBuffer commandBuffer,
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawVertexIndexAccesses(indexCount, firstIndex, accesses);
     cb_context.CollectDrawAttachmentAccesses(accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1171,13 +1176,14 @@ bool SyncValidator::PreCallValidateCmdDrawIndirect(VkCommandBuffer commandBuffer
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectIndirectBufferAccesses(sizeof(VkDrawIndirectCommand), buffer, offset, drawCount, stride, accesses);
     // TODO: Shader instrumentation support is needed to read indirect buffer content (new syncval mode)
     // skip |= cb_context->ValidateDrawVertex(?, ?, error_obj.location);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1206,14 +1212,15 @@ bool SyncValidator::PreCallValidateCmdDrawIndexedIndirect(VkCommandBuffer comman
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectIndirectBufferAccesses(sizeof(VkDrawIndexedIndirectCommand), buffer, offset, drawCount, stride, accesses);
 
     // TODO: Shader instrumentation support is needed to read indirect buffer content (new syncval mode)
     // skip |= cb_context->ValidateDrawVertexIndex(?, ?, error_obj.location);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1240,7 +1247,8 @@ bool SyncValidator::PreCallValidateCmdDrawIndirectCount(VkCommandBuffer commandB
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectIndirectBufferAccesses(sizeof(VkDrawIndirectCommand), buffer, offset, maxDrawCount, stride, accesses);
@@ -1248,7 +1256,7 @@ bool SyncValidator::PreCallValidateCmdDrawIndirectCount(VkCommandBuffer commandB
 
     // TODO: Shader instrumentation support is needed to read indirect buffer content (new syncval mode)
     // skip |= cb_context->ValidateDrawVertex(?, ?, error_obj.location);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1313,7 +1321,8 @@ bool SyncValidator::PreCallValidateCmdDrawIndexedIndirectCount(VkCommandBuffer c
     if (!syncval_settings.IsRecordTimeValidationEnabled()) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectIndirectBufferAccesses(sizeof(VkDrawIndexedIndirectCommand), buffer, offset, maxDrawCount, stride, accesses);
@@ -1321,7 +1330,7 @@ bool SyncValidator::PreCallValidateCmdDrawIndexedIndirectCount(VkCommandBuffer c
 
     // TODO: Shader instrumentation support is needed to read indirect buffer content (new syncval mode)
     // skip |= cb_context->ValidateDrawVertexIndex(?, ?, error_obj.location);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1390,10 +1399,11 @@ bool SyncValidator::PreCallValidateCmdDrawMeshTasksEXT(VkCommandBuffer commandBu
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1415,11 +1425,12 @@ bool SyncValidator::PreCallValidateCmdDrawMeshTasksIndirectEXT(VkCommandBuffer c
     if (!syncval_settings.IsRecordTimeValidationEnabled() || drawCount == 0) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectIndirectBufferAccesses(sizeof(VkDrawMeshTasksIndirectCommandEXT), buffer, offset, drawCount, stride, accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1447,11 +1458,12 @@ bool SyncValidator::PreCallValidateCmdDrawMeshTasksIndirectCountEXT(VkCommandBuf
 
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectCountBufferAccesses(countBuffer, countBufferOffset, "draw count", accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1478,7 +1490,8 @@ bool SyncValidator::PreCallValidateCmdDrawMultiIndexedEXT(VkCommandBuffer comman
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     const auto ptr = reinterpret_cast<const uint8_t*>(pIndexInfo);
@@ -1486,7 +1499,7 @@ bool SyncValidator::PreCallValidateCmdDrawMultiIndexedEXT(VkCommandBuffer comman
         const auto info_ptr = reinterpret_cast<const VkMultiDrawIndexedInfoEXT*>(ptr + i * stride);
         cb_context.CollectDrawVertexIndexAccesses(info_ptr->indexCount, info_ptr->firstIndex, accesses);
     }
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1519,7 +1532,8 @@ bool SyncValidator::PreCallValidateCmdDrawMultiEXT(VkCommandBuffer commandBuffer
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
 
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     const auto ptr = reinterpret_cast<const uint8_t*>(pVertexInfo);
@@ -1527,7 +1541,7 @@ bool SyncValidator::PreCallValidateCmdDrawMultiEXT(VkCommandBuffer commandBuffer
         const auto info_ptr = reinterpret_cast<const VkMultiDrawInfoEXT*>(ptr + i * stride);
         cb_context.CollectDrawVertexAccesses(info_ptr->vertexCount, info_ptr->firstVertex, accesses);
     }
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -1559,11 +1573,12 @@ bool SyncValidator::PreCallValidateCmdDrawIndirectByteCountEXT(VkCommandBuffer c
     if (!syncval_settings.IsRecordTimeValidationEnabled()) return false;
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
+        cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
     std::vector<ResourceAccessCommand::Access> accesses;
     cb_context.CollectDrawAttachmentAccesses(accesses);
     CollectCountBufferAccesses(counterBuffer, counterBufferOffset, "transform feedback counter", accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -3257,14 +3272,14 @@ bool SyncValidator::PreCallValidateCmdTraceRaysKHR(VkCommandBuffer commandBuffer
     }
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] =
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
         cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     std::vector<ResourceAccessCommand::Access> accesses;
     CollectSbtBufferAccesses(pRaygenShaderBindingTable, "raygen", accesses);
     CollectSbtBufferAccesses(pMissShaderBindingTable, "miss", accesses);
     CollectSbtBufferAccesses(pHitShaderBindingTable, "hit", accesses);
     CollectSbtBufferAccesses(pCallableShaderBindingTable, "callable", accesses);
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -3298,7 +3313,7 @@ bool SyncValidator::PreCallValidateCmdTraceRaysIndirectKHR(VkCommandBuffer comma
     }
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] =
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
         cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     std::vector<ResourceAccessCommand::Access> accesses;
     CollectSbtBufferAccesses(pRaygenShaderBindingTable, "raygen", accesses);
@@ -3308,7 +3323,7 @@ bool SyncValidator::PreCallValidateCmdTraceRaysIndirectKHR(VkCommandBuffer comma
     if (const vvl::Buffer* indirect_buffer = GetSingleBufferFromDeviceAddress(*device_state, indirectDeviceAddress)) {
         CollectIndirectBufferAccesses(sizeof(VkTraceRaysIndirectCommandKHR), indirect_buffer->VkHandle(), 0, 1, 0, accesses);
     }
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 
@@ -3340,13 +3355,13 @@ bool SyncValidator::PreCallValidateCmdTraceRaysIndirect2KHR(VkCommandBuffer comm
     }
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-    const auto [pipeline, buffer_accesses, image_accesses] =
+    const auto [pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass] =
         cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     std::vector<ResourceAccessCommand::Access> accesses;
     if (const vvl::Buffer* indirect_buffer = GetSingleBufferFromDeviceAddress(*device_state, indirectDeviceAddress)) {
         CollectIndirectBufferAccesses(sizeof(VkTraceRaysIndirectCommand2KHR), indirect_buffer->VkHandle(), 0, 1, 0, accesses);
     }
-    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, {accesses}};
+    const ShaderAccessCommand command{pipeline, buffer_accesses, image_accesses, render_pass_instance_id, subpass, {accesses}};
     return command.Validate(cb_context, error_obj.location);
 }
 

@@ -329,8 +329,9 @@ void CommandBufferContext::RecordShaderAccesses(ResourceUsageTag tag, Descriptor
         access.handle_index = AddCommandHandle(tag, access.image_view->image_state->Handle()).handle_index;
     }
     RegisterResourceAccessHandles(*this, tag, accesses, sync_state_.syncval_settings.full_validation);
-    const ShaderAccessCommand command{
-        descriptor_accesses.pipeline, descriptor_accesses.buffer_accesses, descriptor_accesses.image_accesses, {accesses}};
+    const ShaderAccessCommand command{descriptor_accesses.pipeline,       descriptor_accesses.buffer_accesses,
+                                      descriptor_accesses.image_accesses, descriptor_accesses.render_pass_instance_id,
+                                      descriptor_accesses.subpass,        {accesses}};
     if (apply_accesses) {
         command.Apply(GetSyncEnvironment(), tag, GetCurrentAccessContext());
     }
@@ -592,6 +593,8 @@ CommandBufferContext::DescriptorAccesses CommandBufferContext::CollectDescriptor
     const std::vector<LastBound::DescriptorSetSlot>& ds_slots = last_bound_state.ds_slots;
     if (!pipeline) return result;
     result.pipeline = pipeline;
+    result.render_pass_instance_id = current_render_pass_instance_id_;
+    result.subpass = current_renderpass_context_ ? current_renderpass_context_->GetCurrentSubpass() : vvl::kNoIndex32;
 
     using DescriptorClass = vvl::DescriptorClass;
     using BufferDescriptor = vvl::BufferDescriptor;
@@ -643,7 +646,6 @@ CommandBufferContext::DescriptorAccesses CommandBufferContext::CollectDescriptor
                     if (sync_index == SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ) {
                         access.offset = CastTo3D(cb_state_->render_area.offset);
                         access.extent = CastTo3D(cb_state_->render_area.extent);
-                        access.attachment_access = GetAttachmentAccess(SyncOrdering::kRaster);
                     }
                     result.image_accesses.emplace_back(std::move(access));
                     break;

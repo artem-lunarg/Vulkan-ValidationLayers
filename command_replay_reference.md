@@ -76,12 +76,18 @@ is retained once rather than per descriptor access, and each referenced descript
 set once per stored command. Non-descriptor accesses keep their existing ownership.
 Other accesses remain in their existing order after the descriptor accesses.
 
+Render-pass instance ID and subpass are stored once per shader command rather than
+in each image-view access. Validation and application reconstruct `AttachmentAccess`
+locally for input attachments. Replay offsets the reconstructed command's instance
+ID, leaving the stored ID unchanged. Access arrays still require no decoding.
+
 Measured with clang-cl targeting Windows x64 and the MSVC Debug runtime, buffer
-descriptor entries occupy 80 bytes and image-view entries 104 bytes, versus 112 bytes
-for either entry in the previous variant array. Shader command Storage grows from
-24 to 32 bytes for the second range, while CommandEntry remains 120 bytes. Mixed
-commands now collect into two temporary vectors rather than one. These are layout
-measurements, not performance measurements.
+descriptor entries occupy 80 bytes and image-view entries 96 bytes, versus 112 bytes
+for either entry in the previous variant array. Moving attachment metadata to the
+command reduced image-view entries from 104 to 96 bytes and increased shader command
+Storage from 32 to 40 bytes. CommandEntry remains 120 bytes. Mixed commands collect
+into two temporary vectors rather than one. These are layout measurements, not
+performance measurements.
 
 Shader accesses retain the existing heuristic and capture the resource accesses
 visible during recording. This port does not introduce submit-time descriptor
@@ -132,3 +138,9 @@ mode and 430 with 9 skipped in full-validation mode. Both normalized logs match
 fresh pre-change runs exactly. Replay-only positives plus the push-descriptor
 hazard test passed 219 tests with 5 skipped. Logs are in
 `build/typed-access-before-*.log` and `build/typed-access-after-*.log`.
+
+Moving shader attachment metadata to the command passed 431 tests with 9 skipped
+in default mode and 430 with 9 skipped in full-validation mode. Both normalized
+logs match fresh pre-change runs exactly. Replay-only positives plus the
+push-descriptor hazard test passed 219 tests with 5 skipped. Logs are in
+`build/shader-rp-before-*.log` and `build/shader-rp-after-*.log`.
