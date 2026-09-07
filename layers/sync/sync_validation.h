@@ -266,11 +266,15 @@ class SyncValidator : public vvl::DeviceProxy {
     bool ValidateIndirectBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context,
                                 const VkDeviceSize struct_size, const VkBuffer buffer, const VkDeviceSize offset,
                                 const uint32_t drawCount, const uint32_t stride, const Location& loc) const;
+    void CollectIndirectBufferAccesses(VkDeviceSize struct_size, VkBuffer buffer, VkDeviceSize offset, uint32_t draw_count,
+                                       uint32_t stride, std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordIndirectBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, const VkDeviceSize struct_size,
                               const VkBuffer buffer, const VkDeviceSize offset, const uint32_t drawCount, uint32_t stride);
 
     bool ValidateCountBuffer(const CommandBufferContext& cb_context, const AccessContext& access_context, VkBuffer buffer,
                              VkDeviceSize offset, const Location& loc, const char* count_buffer_label = "draw count") const;
+    void CollectCountBufferAccesses(VkBuffer buffer, VkDeviceSize offset, const char* label,
+                                    std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordCountBuffer(CommandBufferContext& cb_context, ResourceUsageTag tag, VkBuffer buffer, VkDeviceSize offset);
 
     bool PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, uint32_t z,
@@ -438,8 +442,12 @@ class SyncValidator : public vvl::DeviceProxy {
 
     bool PreCallValidateCmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoDecodeInfoKHR* pDecodeInfo,
                                           const ErrorObject& error_obj) const override;
+    std::vector<ResourceAccessCommand::Access> CollectDecodeVideoAccesses(const vvl::CommandBuffer& cb_state,
+                                                                          const VkVideoDecodeInfoKHR& decode_info) const;
     bool PreCallValidateCmdEncodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoEncodeInfoKHR* pEncodeInfo,
                                           const ErrorObject& error_obj) const override;
+    std::vector<ResourceAccessCommand::Access> CollectEncodeVideoAccesses(const vvl::CommandBuffer& cb_state,
+                                                                          const VkVideoEncodeInfoKHR& encode_info) const;
 
     void PostCallRecordResetEvent(VkDevice device, VkEvent event, const RecordObject& record_obj) override;
     bool PreCallValidateCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask,
@@ -547,6 +555,11 @@ class SyncValidator : public vvl::DeviceProxy {
                                                           const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
                                                           const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos,
                                                           const ErrorObject& error_obj) const override;
+    std::vector<ResourceAccessCommand::Access> CollectBuildAccelerationStructuresAccesses(
+        uint32_t info_count, const VkAccelerationStructureBuildGeometryInfoKHR* infos,
+        const VkAccelerationStructureBuildRangeInfoKHR* const* build_range_infos, const Location& loc) const;
+    void CollectAccelerationStructureAccesses(VkAccelerationStructureKHR acceleration_structure, SyncAccessIndex access_index,
+                                              const Location& loc, std::vector<ResourceAccessCommand::Access>& accesses) const;
     void PostCallRecordCmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount,
                                                          const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
                                                          const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos,
@@ -570,10 +583,8 @@ class SyncValidator : public vvl::DeviceProxy {
                                                                const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo,
                                                                const RecordObject& record_obj) override;
 
-    bool ValidateSbtBuffer(const CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                           const Location& loc, const char* sbt_buffer_label) const;
-    void RecordSbtBuffer(CommandBufferContext& cb_context, const VkStridedDeviceAddressRegionKHR* p_sbt_address_region,
-                         ResourceUsageTag tag);
+    void CollectSbtBufferAccesses(const VkStridedDeviceAddressRegionKHR* sbt_address_region, const char* sbt_buffer_label,
+                                  std::vector<ResourceAccessCommand::Access>& accesses) const;
     bool PreCallValidateCmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                                         const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
                                         const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,

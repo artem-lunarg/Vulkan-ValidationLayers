@@ -214,21 +214,36 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
                                            const std::vector<std::shared_ptr<const vvl::ImageView>>& attachment_views);
 
     bool ValidateBeginRendering(const ErrorObject& error_obj, BeginRenderingCmdState& cmd_state) const;
+    std::vector<ResourceAccessCommand::Access> CollectBeginRenderingAccesses(const DynamicRenderingInfo& rendering_info) const;
     void RecordBeginRendering(BeginRenderingCmdState& cmd_state, const Location& loc);
     bool ValidateEndRendering(const ErrorObject& error_obj) const;
+    std::vector<ResourceAccessCommand::Access> CollectEndRenderingAccesses() const;
     void RecordEndRendering(const RecordObject& record_obj);
-    bool ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const Location& loc) const;
-    void RecordDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, ResourceUsageTag tag);
+
+    struct DescriptorAccesses {
+        const vvl::Pipeline* pipeline = nullptr;
+        std::vector<ShaderAccessCommand::BufferAccess> buffer_accesses;
+        std::vector<ShaderAccessCommand::ImageViewAccess> image_accesses;
+    };
+    DescriptorAccesses CollectDescriptorAccesses(VkPipelineBindPoint pipelineBindPoint) const;
+
     bool ValidateDrawVertex(uint32_t vertexCount, uint32_t firstVertex, const Location& loc) const;
+    void CollectDrawVertexAccesses(uint32_t vertex_count, uint32_t first_vertex,
+                                   std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordDrawVertex(uint32_t vertexCount, uint32_t firstVertex, ResourceUsageTag tag);
     bool ValidateDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, const Location& loc) const;
+    void CollectDrawVertexIndexAccesses(uint32_t index_count, uint32_t first_index,
+                                        std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordDrawVertexIndex(uint32_t indexCount, uint32_t firstIndex, ResourceUsageTag tag);
     bool ValidateDrawAttachment(const Location& loc) const;
     bool ValidateDrawDynamicRenderingAttachment(const Location& loc) const;
+    void CollectDrawAttachmentAccesses(std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordDrawAttachment(ResourceUsageTag tag);
     void RecordDrawDynamicRenderingAttachment(ResourceUsageTag tag);
     bool ValidateClearAttachment(const Location& loc, const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
                                  const VkClearRect& clear_rect) const;
+    void CollectClearAttachmentAccesses(const VkClearAttachment& clear_attachment, uint32_t clear_rect_index,
+                                        const VkClearRect& clear_rect, std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordClearAttachment(ResourceUsageTag tag, const VkClearAttachment& clear_attachment, const VkClearRect& clear_rect);
 
     ResourceUsageTag RecordNextSubpass(vvl::Func command);
@@ -262,6 +277,10 @@ class CommandBufferContext final : public ResourceUsageInfoProvider, public Debu
         auto storage = command.MakeStorage(command_data_);
         commands_.push_back(CommandEntry{tag, tag_count, std::move(storage)});
     }
+
+    void RecordResourceAccesses(ResourceUsageTag tag, vvl::span<ResourceAccessCommand::Access> accesses, bool apply_accesses);
+    void RecordShaderAccesses(ResourceUsageTag tag, DescriptorAccesses& descriptor_accesses,
+                              vvl::span<ResourceAccessCommand::Access> accesses, bool apply_accesses);
 
     const std::vector<HandleRecord>& GetHandleRecords() const { return handles_; }
 

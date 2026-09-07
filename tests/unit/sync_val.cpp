@@ -2079,6 +2079,62 @@ TEST_F(NegativeSyncVal, TexelBufferDescriptorHazard) {
     m_command_buffer.End();
 }
 
+TEST_F(NegativeSyncVal, PushDescriptorDispatchHazard) {
+    TEST_DESCRIPTION("Dispatch accesses are resolved when the dispatch is recorded, so a later push does not replace them");
+    AddRequiredExtensions(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    RETURN_IF_SKIP(InitSyncVal());
+
+    vkt::Buffer buffer_a(*m_device, 128, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    vkt::Buffer buffer_b(*m_device, 128, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    vkt::Buffer dst_buffer(*m_device, 128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    OneOffDescriptorSet descriptor_set(m_device, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}},
+                                       VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT);
+    vkt::PipelineLayout pipeline_layout(*m_device, {&descriptor_set.layout_});
+
+    const char* cs_source = R"glsl(
+        #version 450
+        layout(set=0, binding=0) buffer Buffer { uint values[]; };
+        void main(){
+            values[0] = 42;
+        }
+    )glsl";
+    CreateComputePipelineHelper pipe(*this);
+    pipe.cs_ = VkShaderObj(*m_device, cs_source, VK_SHADER_STAGE_COMPUTE_BIT);
+    pipe.cp_ci_.layout = pipeline_layout;
+    pipe.CreateComputePipeline();
+
+    auto push_buffer = [&](const vkt::Buffer& buffer) {
+        VkDescriptorBufferInfo buffer_info = {buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet descriptor_write = vku::InitStructHelper();
+        descriptor_write.dstBinding = 0;
+        descriptor_write.descriptorCount = 1;
+        descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_write.pBufferInfo = &buffer_info;
+        vk::CmdPushDescriptorSetKHR(m_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &descriptor_write);
+    };
+
+    // The first dispatch writes buffer_a, the second one writes buffer_b
+    m_command_buffer.Begin();
+    vk::CmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    push_buffer(buffer_a);
+    vk::CmdDispatch(m_command_buffer, 1, 1, 1);
+    push_buffer(buffer_b);
+    vk::CmdDispatch(m_command_buffer, 1, 1, 1);
+    m_command_buffer.End();
+    m_default_queue->Submit(m_command_buffer);
+
+    // Reading buffer_a conflicts with the first dispatch
+    vkt::CommandBuffer cb(*m_device, m_command_pool);
+    cb.Begin();
+    cb.Copy(buffer_a, dst_buffer);
+    cb.End();
+    m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+    m_default_queue->Submit(cb);
+    m_errorMonitor->VerifyFound();
+    m_default_queue->Wait();
+}
+
 TEST_F(NegativeSyncVal, CopyVsShaderDescriptorAccess) {
     TEST_DESCRIPTION("Write to resource that is being accessed by the shader");
     RETURN_IF_SKIP(InitSyncVal());

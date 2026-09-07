@@ -18,6 +18,7 @@
 #pragma once
 
 #include "sync/sync_common.h"
+#include "sync/sync_command.h"
 #include "sync/sync_access_context.h"
 #include "error_message/error_location.h"
 #include <vulkan/utility/vk_safe_struct.hpp>
@@ -122,6 +123,8 @@ class RenderPassAccessContext {
                                         AccessContext& access_context);
 
     bool ValidateDrawSubpassAttachment(const CommandBufferContext& cb_context, vvl::Func command) const;
+    void CollectDrawSubpassAttachmentAccesses(const vvl::CommandBuffer& cmd_buffer,
+                                              std::vector<ResourceAccessCommand::Access>& accesses) const;
     void RecordDrawSubpassAttachment(const vvl::CommandBuffer& cmd_buffer, ResourceUsageTag tag);
 
     const vvl::ImageView* GetClearAttachmentView(const VkClearAttachment& clear_attachment) const;
@@ -155,6 +158,7 @@ class RenderPassAccessContext {
 
   private:
     const vvl::RenderPass* rp_state_;
+    const VkRect2D render_area_{};
     const AttachmentViewGenVector attachment_views_;
     const AccessContext* external_context_;
     const std::unique_ptr<AccessContext[]> subpass_contexts_;

@@ -17,16 +17,27 @@
 
 #pragma once
 
+#include "sync_access_state.h"
 #include "sync_barrier.h"
 #include "containers/span.h"
+#include "vulkan/generated/vk_object_types.h"
+
+#include <cassert>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
 
 struct Location;
-struct VulkanTypedHandle;
 
 namespace vvl {
 class Buffer;
+class AccelerationStructureKHR;
+class DescriptorSet;
 class Image;
 class ImageView;
+class Pipeline;
+class Event;
 class RenderPass;
 enum class Func;
 }  // namespace vvl
@@ -68,6 +79,32 @@ struct BufferCopyCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+struct BufferAccessCommand {
+    const vvl::Buffer& buffer;
+    SyncAccessIndex access_index;
+    AccessRange range;
+    uint8_t flags = 0;
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    const char* resource_name = "buffer ";
+    uint32_t handle_index = vvl::kNoIndex32;
+
+    struct Storage {
+        uint32_t buffer_index;
+        SyncAccessIndex access_index;
+        AccessRange range;
+        uint8_t flags;
+        VkQueryPool query_pool;
+        const char* resource_name;
+        uint32_t handle_index;
+        BufferAccessCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
 struct ImageCopyCommand {
     const vvl::Image& src_image;
     const vvl::Image& dst_image;
@@ -91,12 +128,247 @@ struct ImageCopyCommand {
     void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
 };
 
+// An ordered list of resource accesses resolved while recording a Vulkan command. Unlike AccessContext, this is an event
+// stream rather than a synchronization-state summary, so it can be applied during recording or replay.
+struct ResourceAccessCommand {
+    struct BufferAccess {
+        struct AccelerationStructureInfo {
+            const vvl::AccelerationStructureKHR* acceleration_structure = nullptr;
+            std::string location;
+        };
+
+        const vvl::Buffer* buffer = nullptr;
+        const vvl::Pipeline* pipeline = nullptr;
+        SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+        AccessRange range;
+        SyncFlags flags = 0;
+        bool apply_access = true;
+        bool legacy_record_time_object_only = false;
+        VulkanTypedHandle tag_handle;
+        std::string resource_name = "buffer ";
+        std::optional<AccelerationStructureInfo> acceleration_structure_info;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageViewAccess {
+        enum class ErrorLocation { kNone, kColorAttachment, kDepthAttachment, kStencilAttachment };
+
+        const vvl::ImageView* image_view = nullptr;
+        SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+        bool use_render_area = false;
+        VkOffset3D offset{};
+        VkExtent3D extent{};
+        uint32_t view_mask = 0;
+        VkImageAspectFlags aspect_mask = 0;
+        AttachmentAccess attachment_access;
+        VulkanTypedHandle tag_handle;
+        VulkanTypedHandle additional_object;
+        std::string resource_description;
+        const char* message_type = "ImageAccessError";
+        bool legacy_register_handle = false;
+        ErrorLocation error_location = ErrorLocation::kNone;
+        uint32_t attachment_index = vvl::kNoIndex32;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageRangeAccess {
+        enum class ErrorType { kGeneric, kClearAttachment, kVideo };
+
+        const vvl::Image* image = nullptr;
+        SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+        VkImageSubresourceRange subresource_range{};
+        bool is_depth_sliced = false;
+        bool use_offset_extent = false;
+        VkOffset3D offset{};
+        VkExtent3D extent{};
+        AttachmentAccess attachment_access;
+        VulkanTypedHandle tag_handle;
+        std::string resource_description;
+        ErrorType error_type = ErrorType::kGeneric;
+        VkImageAspectFlags clear_aspects = 0;
+        uint32_t clear_rect_index = 0;
+        VkClearRect clear_rect{};
+        bool legacy_register_handle = false;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    using Access = std::variant<BufferAccess, ImageViewAccess, ImageRangeAccess>;
+    vvl::span<const Access> accesses;
+    // Set when reconstructing the command for replay. Stored accesses retain local IDs.
+    uint32_t render_pass_instance_offset = 0;
+
+    AttachmentAccess GetAttachmentAccess(AttachmentAccess access) const {
+        if (access.render_pass_instance_id != vvl::kNoIndex32) {
+            access.render_pass_instance_id += render_pass_instance_offset;
+        }
+        return access;
+    }
+
+    struct Storage {
+        uint32_t first_access;
+        uint32_t access_count;
+        ResourceAccessCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+// Descriptor accesses are stored directly, separately from non-shader resource accesses.
+struct ShaderAccessCommand {
+    struct DescriptorInfo {
+        const vvl::DescriptorSet* descriptor_set = nullptr;
+        VkDescriptorType descriptor_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        uint32_t array_element = 0;
+        VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+        VulkanTypedHandle resource_handle;
+    };
+
+    struct BufferAccess {
+        DescriptorInfo info;
+        const vvl::Buffer* buffer = nullptr;
+        AccessRange range;
+        SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageViewAccess {
+        DescriptorInfo info;
+        const vvl::ImageView* image_view = nullptr;
+        VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+        uint32_t handle_index = vvl::kNoIndex32;
+        // Input attachments use the render area and render-pass attachment ordering.
+        VkOffset3D offset{};
+        VkExtent3D extent{};
+        AttachmentAccess attachment_access;
+    };
+
+    const vvl::Pipeline* pipeline = nullptr;
+    vvl::span<const BufferAccess> buffer_accesses;
+    vvl::span<const ImageViewAccess> image_accesses;
+    // Vertex, index, indirect, attachment, and shader binding table accesses retain their order.
+    ResourceAccessCommand additional_accesses;
+
+    struct Storage {
+        const vvl::Pipeline* pipeline;
+        uint32_t first_buffer_access;
+        uint32_t buffer_access_count;
+        uint32_t first_image_access;
+        uint32_t image_access_count;
+        ResourceAccessCommand::Storage additional_accesses;
+        ShaderAccessCommand MakeCommand(const CommandData& command_data) const;
+    };
+
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+struct ImageTransferCommand {
+    struct BufferAccess {
+        const vvl::Buffer* buffer;
+        SyncAccessIndex access_index;
+        AccessRange range;
+        uint32_t region_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageAccess {
+        const vvl::Image* image;
+        SyncAccessIndex access_index;
+        VkImageSubresourceLayers subresource;
+        VkOffset3D offset;
+        VkExtent3D extent;
+        uint32_t region_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    struct ImageRangeAccess {
+        const vvl::Image* image;
+        SyncAccessIndex access_index;
+        VkImageSubresourceRange subresource_range;
+        uint32_t range_index;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+
+    using Access = std::variant<BufferAccess, ImageAccess, ImageRangeAccess>;
+
+    vvl::span<const Access> accesses;
+
+    struct Storage {
+        uint32_t first_access;
+        uint32_t access_count;
+        ImageTransferCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+std::vector<ImageTransferCommand::Access> CollectBufferToImageCopyAccesses(const vvl::Buffer* src_buffer,
+                                                                           const vvl::Image* dst_image, uint32_t region_count,
+                                                                           const VkBufferImageCopy* regions);
+std::vector<ImageTransferCommand::Access> CollectBufferToImageCopyAccesses(const vvl::Buffer* src_buffer,
+                                                                           const vvl::Image* dst_image, uint32_t region_count,
+                                                                           const VkBufferImageCopy2* regions);
+std::vector<ImageTransferCommand::Access> CollectImageToBufferCopyAccesses(const vvl::Image* src_image,
+                                                                           const vvl::Buffer* dst_buffer, uint32_t region_count,
+                                                                           const VkBufferImageCopy* regions);
+std::vector<ImageTransferCommand::Access> CollectImageToBufferCopyAccesses(const vvl::Image* src_image,
+                                                                           const vvl::Buffer* dst_buffer, uint32_t region_count,
+                                                                           const VkBufferImageCopy2* regions);
+std::vector<ImageTransferCommand::Access> CollectImageBlitAccesses(const vvl::Image* src_image, const vvl::Image* dst_image,
+                                                                   uint32_t region_count, const VkImageBlit* regions);
+std::vector<ImageTransferCommand::Access> CollectImageBlitAccesses(const vvl::Image* src_image, const vvl::Image* dst_image,
+                                                                   uint32_t region_count, const VkImageBlit2* regions);
+std::vector<ImageTransferCommand::Access> CollectImageResolveAccesses(const vvl::Image* src_image, const vvl::Image* dst_image,
+                                                                      uint32_t region_count, const VkImageResolve* regions);
+std::vector<ImageTransferCommand::Access> CollectImageResolveAccesses(const vvl::Image* src_image, const vvl::Image* dst_image,
+                                                                      uint32_t region_count, const VkImageResolve2* regions);
+std::vector<ImageTransferCommand::Access> CollectImageClearAccesses(const vvl::Image* image, uint32_t range_count,
+                                                                    const VkImageSubresourceRange* ranges);
+
 struct BarrierCommand {
     const BarrierSet& barrier_set;
 
     struct Storage {
         uint32_t barrier_set_index;
         BarrierCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+struct EventCommand {
+    enum class Type { kSet, kReset, kWait };
+
+    Type type = Type::kSet;
+    vvl::span<const std::shared_ptr<const vvl::Event>> events;
+    SyncExecScope exec_scope;
+    vvl::span<const BarrierSet> barrier_sets;
+    vvl::Func command{};
+
+    struct Storage {
+        Type type;
+        uint32_t first_event;
+        uint32_t event_count;
+        SyncExecScope exec_scope;
+        uint32_t first_barrier_set;
+        uint32_t barrier_set_count;
+        vvl::Func command;
+        EventCommand MakeCommand(const CommandData& command_data) const;
     };
     Storage MakeStorage(CommandData& command_data) const;
     bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
@@ -158,8 +430,10 @@ struct EndRenderPassCommand {
                AccessContext& external_context) const;
 };
 
-using CommandStorage = std::variant<BufferCopyCommand::Storage, ImageCopyCommand::Storage, BarrierCommand::Storage,
-                                    BeginRenderPassCommand::Storage, NextSubpassCommand::Storage, EndRenderPassCommand::Storage>;
+using CommandStorage = std::variant<BufferCopyCommand::Storage, BufferAccessCommand::Storage, ImageCopyCommand::Storage,
+                                    ResourceAccessCommand::Storage, ShaderAccessCommand::Storage, ImageTransferCommand::Storage,
+                                    BarrierCommand::Storage, EventCommand::Storage, BeginRenderPassCommand::Storage,
+                                    NextSubpassCommand::Storage, EndRenderPassCommand::Storage>;
 
 struct CommandData {
     std::vector<std::shared_ptr<const vvl::Buffer>> buffers;
@@ -168,11 +442,24 @@ struct CommandData {
     std::vector<std::shared_ptr<const vvl::RenderPass>> render_passes;
     std::vector<BufferCopyRegion> buffer_copy_regions;
     std::vector<VkImageCopy> image_copy_regions;
+    std::vector<ResourceAccessCommand::Access> resource_accesses;
+    std::vector<ShaderAccessCommand::BufferAccess> descriptor_buffer_accesses;
+    std::vector<ShaderAccessCommand::ImageViewAccess> descriptor_image_accesses;
+    std::vector<ImageTransferCommand::Access> image_transfer_accesses;
     std::vector<BarrierSet> barrier_sets;
+    std::vector<std::shared_ptr<const vvl::Event>> events;
+    std::vector<BarrierSet> event_barrier_sets;
+    std::vector<std::shared_ptr<const vvl::Pipeline>> pipelines;
+    std::vector<std::shared_ptr<const vvl::DescriptorSet>> descriptor_sets;
+    std::vector<std::shared_ptr<const vvl::AccelerationStructureKHR>> acceleration_structures;
 
     uint32_t AddBuffer(const vvl::Buffer& buffer);
     uint32_t AddImage(const vvl::Image& image);
     uint32_t AddRenderPass(const vvl::RenderPass& render_pass);
+    void AddImageView(const vvl::ImageView& image_view);
+    void AddPipeline(const vvl::Pipeline& pipeline);
+    void AddDescriptorSet(const vvl::DescriptorSet& descriptor_set);
+    void AddAccelerationStructure(const vvl::AccelerationStructureKHR& acceleration_structure);
 };
 
 // TODO: CommandEntry won't be needed after all commands are introduced.
