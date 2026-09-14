@@ -1196,14 +1196,16 @@ void SyncValidator::PostCallRecordCmdDispatchIndirect(VkCommandBuffer commandBuf
 
 bool SyncValidator::PreCallValidateCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
                                            uint32_t firstVertex, uint32_t firstInstance, const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-
-    skip |= cb_context.ValidateDispatchDrawDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, error_obj.location);
-    skip |= cb_context.ValidateDrawVertex(vertexCount, firstVertex, error_obj.location);
-    skip |= cb_context.ValidateDrawAttachment(error_obj.location);
-    return skip;
+    const auto descriptor_accesses = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto vertex_accesses = cb_context.CollectVertexAccesses(vertexCount, firstVertex);
+    const DrawCommand command{descriptor_accesses.MakeCommand(), vertex_accesses.MakeCommand(),
+                              cb_context.GetDrawAttachmentCommand()};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 void SyncValidator::PostCallRecordCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
@@ -1211,23 +1213,33 @@ void SyncValidator::PostCallRecordCmdDraw(VkCommandBuffer commandBuffer, uint32_
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
     const ResourceUsageTag tag = cb_context.NextCommandTag(record_obj.location.function);
-
-    cb_context.RecordDispatchDrawDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, tag);
-    cb_context.RecordDrawVertex(vertexCount, firstVertex, tag);
-    cb_context.RecordDrawAttachment(tag);
+    auto descriptor_accesses = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    descriptor_accesses.RegisterResources(cb_context, tag);
+    auto vertex_accesses = cb_context.CollectVertexAccesses(vertexCount, firstVertex);
+    vertex_accesses.RegisterResources(cb_context, tag);
+    const DrawCommand command{descriptor_accesses.MakeCommand(), vertex_accesses.MakeCommand(),
+                              cb_context.GetDrawAttachmentCommand()};
+    if (syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCurrentAccessContext());
+    }
+    if (syncval_settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
 }
 
 bool SyncValidator::PreCallValidateCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
                                                   uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance,
                                                   const ErrorObject& error_obj) const {
-    bool skip = false;
+    if (!syncval_settings.IsRecordTimeValidationEnabled()) {
+        return false;
+    }
     const auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     const CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
-
-    skip |= cb_context.ValidateDispatchDrawDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, error_obj.location);
-    skip |= cb_context.ValidateDrawVertexIndex(indexCount, firstIndex, error_obj.location);
-    skip |= cb_context.ValidateDrawAttachment(error_obj.location);
-    return skip;
+    const auto descriptor_accesses = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    const auto vertex_accesses = cb_context.CollectIndexAccesses(indexCount, firstIndex);
+    const DrawCommand command{descriptor_accesses.MakeCommand(), vertex_accesses.MakeCommand(),
+                              cb_context.GetDrawAttachmentCommand()};
+    return command.Validate(cb_context, error_obj.location);
 }
 
 void SyncValidator::PostCallRecordCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
@@ -1236,10 +1248,18 @@ void SyncValidator::PostCallRecordCmdDrawIndexed(VkCommandBuffer commandBuffer, 
     auto cb_state = Get<vvl::CommandBuffer>(commandBuffer);
     CommandBufferContext& cb_context = GetCommandBufferContext(*cb_state);
     const ResourceUsageTag tag = cb_context.NextCommandTag(record_obj.location.function);
-
-    cb_context.RecordDispatchDrawDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, tag);
-    cb_context.RecordDrawVertexIndex(indexCount, firstIndex, tag);
-    cb_context.RecordDrawAttachment(tag);
+    auto descriptor_accesses = cb_context.CollectDescriptorAccesses(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    descriptor_accesses.RegisterResources(cb_context, tag);
+    auto vertex_accesses = cb_context.CollectIndexAccesses(indexCount, firstIndex);
+    vertex_accesses.RegisterResources(cb_context, tag);
+    const DrawCommand command{descriptor_accesses.MakeCommand(), vertex_accesses.MakeCommand(),
+                              cb_context.GetDrawAttachmentCommand()};
+    if (syncval_settings.IsRecordTimeValidationEnabled()) {
+        command.Apply(cb_context.GetSyncEnvironment(), tag, cb_context.GetCurrentAccessContext());
+    }
+    if (syncval_settings.full_validation) {
+        cb_context.StoreCommand(tag, command);
+    }
 }
 
 bool SyncValidator::PreCallValidateCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,

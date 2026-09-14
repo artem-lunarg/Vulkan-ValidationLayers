@@ -7236,3 +7236,71 @@ TEST_F(NegativeSyncVal, DrawIndirectStridedUpdate) {
     m_errorMonitor->VerifyFound();
     m_default_queue->Wait();
 }
+
+TEST_F(NegativeSyncVal, DrawVertexInputSubmitTime) {
+    TEST_DESCRIPTION("Validate saved vertex and index buffer accesses in both submission orders");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    RETURN_IF_SKIP(InitSyncVal());
+
+    VkPipelineRenderingCreateInfo pipeline_rendering = vku::InitStructHelper();
+    CreatePipelineHelper pipe(*this, &pipeline_rendering);
+    VkVertexInputBindingDescription binding{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    pipe.vi_ci_.vertexBindingDescriptionCount = 1;
+    pipe.vi_ci_.pVertexBindingDescriptions = &binding;
+    pipe.vi_ci_.vertexAttributeDescriptionCount = 1;
+    pipe.vi_ci_.pVertexAttributeDescriptions = &attribute;
+    pipe.cb_ci_.attachmentCount = 0;
+    pipe.CreateGraphicsPipeline();
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {32, 32};
+    rendering_info.layerCount = 1;
+
+    for (bool indexed : {false, true}) {
+        SCOPED_TRACE(indexed);
+        for (bool write_first : {false, true}) {
+            SCOPED_TRACE(write_first);
+            const VkBufferUsageFlags usage =
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            vkt::Buffer buffer(*m_device, 128, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkt::Buffer other_buffer(*m_device, 128, usage);
+            memset(buffer.Memory().Map(), 0, 128);
+            buffer.Memory().Unmap();
+            const VkDeviceSize offset = 16;
+            vkt::CommandBuffer draw_cb(*m_device, m_command_pool);
+            draw_cb.Begin();
+            draw_cb.BeginRendering(rendering_info);
+            vk::CmdBindPipeline(draw_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vk::CmdBindVertexBuffers(draw_cb, 0, 1, &buffer.handle(), &offset);
+            if (indexed) {
+                vk::CmdBindIndexBuffer(draw_cb, buffer, offset, VK_INDEX_TYPE_UINT32);
+                vk::CmdDrawIndexed(draw_cb, 3, 1, 2, 0, 0);
+                vk::CmdBindIndexBuffer(draw_cb, other_buffer, 0, VK_INDEX_TYPE_UINT16);
+            } else {
+                vk::CmdDraw(draw_cb, 3, 1, 2, 0);
+            }
+            // Replay must use the binding at the draw, not the final command-buffer state.
+            vk::CmdBindVertexBuffers(draw_cb, 0, 1, &other_buffer.handle(), &offset);
+            draw_cb.EndRendering();
+            draw_cb.End();
+
+            vkt::CommandBuffer fill_cb(*m_device, m_command_pool);
+            fill_cb.Begin();
+            vk::CmdFillBuffer(fill_cb, buffer, indexed ? 24 : 48, 4, 0);
+            fill_cb.End();
+
+            if (write_first) {
+                m_default_queue->Submit(fill_cb);
+                m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+                m_default_queue->Submit(draw_cb);
+            } else {
+                m_default_queue->Submit(draw_cb);
+                m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+                m_default_queue->Submit(fill_cb);
+            }
+            m_errorMonitor->VerifyFound();
+            m_default_queue->Wait();
+        }
+    }
+}

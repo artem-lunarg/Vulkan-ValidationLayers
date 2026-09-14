@@ -63,6 +63,7 @@ enum class CommandType : uint32_t {
     kEndRenderPass,
     kShaderAccess,
     kDispatchIndirect,
+    kDraw,
     kDrawIndirect,
     kDrawIndirectCount,
     kDrawMeshTasks,
@@ -354,6 +355,40 @@ struct DescriptorAccesses {
     }
 };
 
+struct VertexInputCommand {
+    struct Access {
+        const vvl::Buffer* buffer;
+        AccessRange range;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+    const vvl::Pipeline* pipeline;
+    vvl::span<const Access> accesses;
+    SyncAccessIndex access_index;
+
+    struct Storage {
+        const vvl::Pipeline* pipeline;
+        uint32_t first_access;
+        uint32_t access_count;
+        SyncAccessIndex access_index;
+        VertexInputCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+// Owns the access array used to construct a VertexInputCommand during recording.
+struct VertexInputAccesses {
+    const vvl::Pipeline* pipeline = nullptr;
+    std::vector<VertexInputCommand::Access> accesses;
+    SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+
+    void RegisterResources(CommandBufferContext& cb_context, ResourceUsageTag tag);
+    VertexInputCommand MakeCommand() const { return {pipeline, accesses, access_index}; }
+};
+
 struct DispatchIndirectCommand {
     ShaderAccessCommand shader_accesses;
     BufferAccessCommand indirect_access;
@@ -385,6 +420,25 @@ struct DrawAttachmentCommand {
         bool stencil_write;
         DrawAttachmentCommand MakeCommand(RenderPassAccessContext* render_pass_context,
                                           const RenderingInstance* rendering_instance) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+struct DrawCommand {
+    ShaderAccessCommand shader_accesses;
+    VertexInputCommand vertex_accesses;
+    DrawAttachmentCommand attachment_accesses;
+
+    struct Storage {
+        ShaderAccessCommand::Storage shader_access_storage;
+        VertexInputCommand::Storage vertex_access_storage;
+        DrawAttachmentCommand::Storage attachment_access_storage;
+        DrawCommand MakeCommand(const CommandData& command_data, RenderPassAccessContext* render_pass_context,
+                                const RenderingInstance* rendering_instance) const;
     };
     Storage MakeStorage(CommandData& command_data) const;
     bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
@@ -469,6 +523,7 @@ struct CommandData {
     std::vector<BeginRenderPassCommand::Storage> begin_render_pass_commands;
     std::vector<ShaderAccessCommand::Storage> shader_access_commands;
     std::vector<DispatchIndirectCommand::Storage> dispatch_indirect_commands;
+    std::vector<DrawCommand::Storage> draw_commands;
     std::vector<DrawIndirectCommand::Storage> draw_indirect_commands;
     std::vector<DrawIndirectCountCommand::Storage> draw_indirect_count_commands;
     std::vector<DrawMeshTasksCommand::Storage> draw_mesh_tasks_commands;
@@ -491,6 +546,7 @@ struct CommandData {
     std::vector<RenderingAttachment> rendering_attachments;
     std::vector<ShaderAccessCommand::BufferAccess> descriptor_buffer_accesses;
     std::vector<ShaderAccessCommand::ImageViewAccess> descriptor_image_accesses;
+    std::vector<VertexInputCommand::Access> vertex_input_accesses;
 
     std::vector<std::shared_ptr<const vvl::DescriptorSet>> descriptor_sets;
     vvl::unordered_set<const vvl::DescriptorSet*> descriptor_set_lookup;
@@ -540,6 +596,7 @@ struct CommandData {
     CommandRef Store(const DispatchIndirectCommand::Storage& storage) {
         return Store(CommandType::kDispatchIndirect, dispatch_indirect_commands, storage);
     }
+    CommandRef Store(const DrawCommand::Storage& storage) { return Store(CommandType::kDraw, draw_commands, storage); }
     CommandRef Store(const DrawIndirectCommand::Storage& storage) {
         return Store(CommandType::kDrawIndirect, draw_indirect_commands, storage);
     }
