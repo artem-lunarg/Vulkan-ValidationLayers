@@ -7304,3 +7304,97 @@ TEST_F(NegativeSyncVal, DrawVertexInputSubmitTime) {
         }
     }
 }
+
+TEST_F(NegativeSyncVal, MultiDrawVertexInputSubmitTime) {
+    TEST_DESCRIPTION("Submit saved multi-draw input ranges imported from a secondary command buffer");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    AddRequiredExtensions(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::multiDraw);
+    RETURN_IF_SKIP(InitSyncVal());
+
+    VkPipelineRenderingCreateInfo pipeline_rendering = vku::InitStructHelper();
+    CreatePipelineHelper pipe(*this, &pipeline_rendering);
+    VkVertexInputBindingDescription binding{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    pipe.vi_ci_.vertexBindingDescriptionCount = 1;
+    pipe.vi_ci_.pVertexBindingDescriptions = &binding;
+    pipe.vi_ci_.vertexAttributeDescriptionCount = 1;
+    pipe.vi_ci_.pVertexAttributeDescriptions = &attribute;
+    pipe.cb_ci_.attachmentCount = 0;
+    pipe.CreateGraphicsPipeline();
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {32, 32};
+    rendering_info.layerCount = 1;
+    rendering_info.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    VkCommandBufferInheritanceRenderingInfo rendering_inheritance = vku::InitStructHelper();
+    rendering_inheritance.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkCommandBufferInheritanceInfo inheritance = vku::InitStructHelper(&rendering_inheritance);
+    VkCommandBufferBeginInfo begin_info = vku::InitStructHelper();
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    begin_info.pInheritanceInfo = &inheritance;
+
+    for (bool indexed : {false, true}) {
+        SCOPED_TRACE(indexed);
+        for (bool write_first : {false, true}) {
+            SCOPED_TRACE(write_first);
+            const VkBufferUsageFlags usage =
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            vkt::Buffer buffer(*m_device, 256, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkt::Buffer other_buffer(*m_device, 256, usage);
+            memset(buffer.Memory().Map(), 0, 256);
+            buffer.Memory().Unmap();
+            const VkDeviceSize offset = 16;
+            vkt::CommandBuffer draw_cb(*m_device, m_command_pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+            draw_cb.Begin(&begin_info);
+            vk::CmdBindPipeline(draw_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vk::CmdBindVertexBuffers(draw_cb, 0, 1, &buffer.handle(), &offset);
+            if (indexed) {
+                vk::CmdBindIndexBuffer(draw_cb, buffer, offset, VK_INDEX_TYPE_UINT32);
+                struct DrawInfo {
+                    VkMultiDrawIndexedInfoEXT info;
+                    uint32_t padding;
+                };
+                DrawInfo draws[] = {{{0, 3, 0}, 0}, {{6, 3, 0}, 0}};
+                vk::CmdDrawMultiIndexedEXT(draw_cb, 2, &draws[0].info, 1, 0, sizeof(DrawInfo), nullptr);
+                draws[1].info = {};
+                vk::CmdBindIndexBuffer(draw_cb, other_buffer, 0, VK_INDEX_TYPE_UINT16);
+            } else {
+                struct DrawInfo {
+                    VkMultiDrawInfoEXT info;
+                    uint32_t padding;
+                };
+                DrawInfo draws[] = {{{0, 3}, 0}, {{6, 3}, 0}};
+                vk::CmdDrawMultiEXT(draw_cb, 2, &draws[0].info, 1, 0, sizeof(DrawInfo));
+                draws[1].info = {};
+            }
+            // Replay must use the binding at the draw, not the final command-buffer state.
+            vk::CmdBindVertexBuffers(draw_cb, 0, 1, &other_buffer.handle(), &offset);
+            draw_cb.End();
+
+            vkt::CommandBuffer primary_cb(*m_device, m_command_pool);
+            primary_cb.Begin();
+            primary_cb.BeginRendering(rendering_info);
+            primary_cb.ExecuteCommands(draw_cb);
+            primary_cb.EndRendering();
+            primary_cb.End();
+
+            vkt::CommandBuffer fill_cb(*m_device, m_command_pool);
+            fill_cb.Begin();
+            vk::CmdFillBuffer(fill_cb, buffer, indexed ? 40 : 112, 4, 0);
+            fill_cb.End();
+
+            if (write_first) {
+                m_default_queue->Submit(fill_cb);
+                m_errorMonitor->SetDesiredError("SYNC-HAZARD-READ-AFTER-WRITE");
+                m_default_queue->Submit(primary_cb);
+            } else {
+                m_default_queue->Submit(primary_cb);
+                m_errorMonitor->SetDesiredError("SYNC-HAZARD-WRITE-AFTER-READ");
+                m_default_queue->Submit(fill_cb);
+            }
+            m_errorMonitor->VerifyFound();
+            m_default_queue->Wait();
+        }
+    }
+}

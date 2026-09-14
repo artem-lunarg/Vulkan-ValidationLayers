@@ -5229,3 +5229,58 @@ TEST_F(PositiveSyncVal, DrawIndirectStridedGaps) {
     m_default_queue->Submit(fill_cb);
     m_default_queue->Wait();
 }
+
+TEST_F(PositiveSyncVal, MultiDrawVertexInputGapsSubmitTime) {
+    TEST_DESCRIPTION("Do not extend a multi-draw input range across gaps between draws");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredFeature(vkt::Feature::dynamicRendering);
+    AddRequiredExtensions(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+    AddRequiredFeature(vkt::Feature::multiDraw);
+    RETURN_IF_SKIP(InitSyncVal());
+
+    VkPipelineRenderingCreateInfo pipeline_rendering = vku::InitStructHelper();
+    CreatePipelineHelper pipe(*this, &pipeline_rendering);
+    VkVertexInputBindingDescription binding{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    pipe.vi_ci_.vertexBindingDescriptionCount = 1;
+    pipe.vi_ci_.pVertexBindingDescriptions = &binding;
+    pipe.vi_ci_.vertexAttributeDescriptionCount = 1;
+    pipe.vi_ci_.pVertexAttributeDescriptions = &attribute;
+    pipe.cb_ci_.attachmentCount = 0;
+    pipe.CreateGraphicsPipeline();
+    VkRenderingInfo rendering_info = vku::InitStructHelper();
+    rendering_info.renderArea.extent = {32, 32};
+    rendering_info.layerCount = 1;
+
+    for (bool indexed : {false, true}) {
+        SCOPED_TRACE(indexed);
+        const VkBufferUsageFlags usage =
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkt::Buffer buffer(*m_device, 256, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        memset(buffer.Memory().Map(), 0, 256);
+        buffer.Memory().Unmap();
+        const VkDeviceSize offset = 16;
+        vkt::CommandBuffer draw_cb(*m_device, m_command_pool);
+        draw_cb.Begin();
+        draw_cb.BeginRendering(rendering_info);
+        vk::CmdBindPipeline(draw_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vk::CmdBindVertexBuffers(draw_cb, 0, 1, &buffer.handle(), &offset);
+        if (indexed) {
+            vk::CmdBindIndexBuffer(draw_cb, buffer, offset, VK_INDEX_TYPE_UINT32);
+            const VkMultiDrawIndexedInfoEXT draws[] = {{0, 3, 0}, {6, 3, 0}};
+            vk::CmdDrawMultiIndexedEXT(draw_cb, 2, draws, 1, 0, sizeof(draws[0]), nullptr);
+        } else {
+            const VkMultiDrawInfoEXT draws[] = {{0, 3}, {6, 3}};
+            vk::CmdDrawMultiEXT(draw_cb, 2, draws, 1, 0, sizeof(draws[0]));
+        }
+        draw_cb.EndRendering();
+        draw_cb.End();
+
+        vkt::CommandBuffer fill_cb(*m_device, m_command_pool);
+        fill_cb.Begin();
+        vk::CmdFillBuffer(fill_cb, buffer, indexed ? 32 : 64, 4, 0);
+        fill_cb.End();
+        m_default_queue->Submit({draw_cb, fill_cb});
+        m_default_queue->Wait();
+    }
+}

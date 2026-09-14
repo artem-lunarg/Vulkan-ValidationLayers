@@ -64,6 +64,7 @@ enum class CommandType : uint32_t {
     kShaderAccess,
     kDispatchIndirect,
     kDraw,
+    kDrawMulti,
     kDrawIndirect,
     kDrawIndirectCount,
     kDrawMeshTasks,
@@ -389,6 +390,53 @@ struct VertexInputAccesses {
     VertexInputCommand MakeCommand() const { return {pipeline, accesses, access_index}; }
 };
 
+struct MultiDrawVertexInputCommand {
+    struct Binding {
+        const vvl::Buffer* buffer;
+        VkDeviceSize offset;
+        uint32_t stride;
+        uint32_t access_size;
+        uint32_t handle_index = vvl::kNoIndex32;
+    };
+    struct DrawRange {
+        uint32_t first;
+        uint32_t count;
+    };
+
+    const vvl::Pipeline* pipeline;
+    vvl::span<const Binding> bindings;
+    vvl::span<const DrawRange> draws;
+    SyncAccessIndex access_index;
+
+    struct Storage {
+        const vvl::Pipeline* pipeline;
+        uint32_t first_binding;
+        uint32_t binding_count;
+        uint32_t first_draw;
+        uint32_t draw_count;
+        SyncAccessIndex access_index;
+        MultiDrawVertexInputCommand MakeCommand(const CommandData& command_data) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+
+  private:
+    AccessRange GetRange(const Binding& binding, const DrawRange& draw) const;
+};
+
+// Owns the binding and draw arrays used to construct a MultiDrawVertexInputCommand during recording.
+struct MultiDrawVertexInputAccesses {
+    const vvl::Pipeline* pipeline = nullptr;
+    std::vector<MultiDrawVertexInputCommand::Binding> bindings;
+    std::vector<MultiDrawVertexInputCommand::DrawRange> draws;
+    SyncAccessIndex access_index = SYNC_ACCESS_INDEX_NONE;
+
+    void RegisterResources(CommandBufferContext& cb_context, ResourceUsageTag tag);
+    MultiDrawVertexInputCommand MakeCommand() const { return {pipeline, bindings, draws, access_index}; }
+};
+
 struct DispatchIndirectCommand {
     ShaderAccessCommand shader_accesses;
     BufferAccessCommand indirect_access;
@@ -439,6 +487,25 @@ struct DrawCommand {
         DrawAttachmentCommand::Storage attachment_access_storage;
         DrawCommand MakeCommand(const CommandData& command_data, RenderPassAccessContext* render_pass_context,
                                 const RenderingInstance* rendering_instance) const;
+    };
+    Storage MakeStorage(CommandData& command_data) const;
+    bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
+    bool Validate(const SyncEnvironment& env, const AccessContext& access_context, const CommandBufferContext& cb_context,
+                  ResourceUsageTag replay_tag, const Location& loc) const;
+    void Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const;
+};
+
+struct DrawMultiCommand {
+    ShaderAccessCommand shader_accesses;
+    DrawAttachmentCommand attachment_accesses;
+    MultiDrawVertexInputCommand vertex_accesses;
+
+    struct Storage {
+        ShaderAccessCommand::Storage shader_access_storage;
+        DrawAttachmentCommand::Storage attachment_access_storage;
+        MultiDrawVertexInputCommand::Storage vertex_access_storage;
+        DrawMultiCommand MakeCommand(const CommandData& command_data, RenderPassAccessContext* render_pass_context,
+                                     const RenderingInstance* rendering_instance) const;
     };
     Storage MakeStorage(CommandData& command_data) const;
     bool Validate(const CommandBufferContext& cb_context, const Location& loc) const;
@@ -524,6 +591,7 @@ struct CommandData {
     std::vector<ShaderAccessCommand::Storage> shader_access_commands;
     std::vector<DispatchIndirectCommand::Storage> dispatch_indirect_commands;
     std::vector<DrawCommand::Storage> draw_commands;
+    std::vector<DrawMultiCommand::Storage> draw_multi_commands;
     std::vector<DrawIndirectCommand::Storage> draw_indirect_commands;
     std::vector<DrawIndirectCountCommand::Storage> draw_indirect_count_commands;
     std::vector<DrawMeshTasksCommand::Storage> draw_mesh_tasks_commands;
@@ -547,6 +615,8 @@ struct CommandData {
     std::vector<ShaderAccessCommand::BufferAccess> descriptor_buffer_accesses;
     std::vector<ShaderAccessCommand::ImageViewAccess> descriptor_image_accesses;
     std::vector<VertexInputCommand::Access> vertex_input_accesses;
+    std::vector<MultiDrawVertexInputCommand::Binding> multi_draw_vertex_bindings;
+    std::vector<MultiDrawVertexInputCommand::DrawRange> multi_draw_ranges;
 
     std::vector<std::shared_ptr<const vvl::DescriptorSet>> descriptor_sets;
     vvl::unordered_set<const vvl::DescriptorSet*> descriptor_set_lookup;
@@ -597,6 +667,9 @@ struct CommandData {
         return Store(CommandType::kDispatchIndirect, dispatch_indirect_commands, storage);
     }
     CommandRef Store(const DrawCommand::Storage& storage) { return Store(CommandType::kDraw, draw_commands, storage); }
+    CommandRef Store(const DrawMultiCommand::Storage& storage) {
+        return Store(CommandType::kDrawMulti, draw_multi_commands, storage);
+    }
     CommandRef Store(const DrawIndirectCommand::Storage& storage) {
         return Store(CommandType::kDrawIndirect, draw_indirect_commands, storage);
     }
