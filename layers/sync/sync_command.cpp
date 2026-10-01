@@ -1071,7 +1071,7 @@ void SetEventCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessCo
     // TODO: Profile the full access-map copy for event-heavy workloads. During submit replay this copies
     // the queue access map; consider sharing immutable state or storing only the event source scope.
     auto src_access_context = std::make_shared<AccessContext>(env.validator);
-    src_access_context->InitFrom(access_context);
+    src_access_context->InitFromResolved(access_context);
 
     ApplyCmdSetEvent(env, event, src_exec_scope, src_access_context, tag, command);
 }

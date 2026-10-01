@@ -97,8 +97,8 @@ struct RenderingInstance {
                                bool depth_write, bool stencil_write, ResourceUsageTag tag, QueueId queue_id) const;
 
   private:
-    ImageRangeGen GetOptimizedDrawRangeGen(const AccessContext& access_context, uint32_t attachment_index, SyncAccessIndex usage,
-                                           const AttachmentAccess& attachment_access, QueueId queue_id) const;
+    void RecordDrawAttachment(AccessContext& access_context, uint32_t attachment_index, SyncAccessIndex usage,
+                              const AttachmentAccess& attachment_access, ResourceUsageTag tag, QueueId queue_id) const;
     HazardResult DetectDrawHazard(const AccessContext& access_context, uint32_t attachment_index, SyncAccessIndex usage,
                                   const AttachmentAccess& attachment_access, QueueId queue_id) const;
 };

@@ -377,7 +377,7 @@ CommandBufferContext::CommandBufferContext(const CommandBufferContext& from, AsP
     const AccessContext& from_context = from.GetCurrentAccessContext();
 
     // Construct a fully resolved single access context out of from
-    cb_access_context_.ResolveFromContextRecursePrev(from_context);
+    cb_access_context_.InitFromFlattened(from_context);
     // The proxy has flatten the current render pass context (if any), but the async contexts are needed for hazard detection
     cb_access_context_.ImportAsyncContexts(from_context);
 
@@ -1266,11 +1266,12 @@ void UpdateAccessMapStats(const AccessMap& access_map, AccessContextStats& stats
 
 void CommandBufferContext::UpdateStats(AccessStats& access_stats) const {
 #if VVL_ENABLE_SYNCVAL_STATS != 0
-    UpdateAccessMapStats(cb_access_context_.GetAccessMap(), access_stats.cb_access_stats);
+    std::optional<AccessContext> resolved;
+    UpdateAccessMapStats(cb_access_context_.GetAccessMap(resolved), access_stats.cb_access_stats);
 
     if (current_renderpass_context_) {
         for (const AccessContext& subpass_access_context : current_renderpass_context_->GetSubpassContexts()) {
-            UpdateAccessMapStats(subpass_access_context.GetAccessMap(), access_stats.subpass_access_stats);
+            UpdateAccessMapStats(subpass_access_context.GetAccessMap(resolved), access_stats.subpass_access_stats);
         }
     }
 #endif

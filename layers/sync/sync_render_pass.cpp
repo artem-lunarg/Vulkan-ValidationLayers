@@ -966,6 +966,7 @@ void RenderPassAccessContext::RecordNextSubpass(ResourceUsageTag resolve_tag, co
                                   subpass_contexts_[prev_subpass], queue_id);
     UpdateAttachmentStoreAccess(*rp_state_, attachment_views_, render_pass_instance_id_, prev_subpass, view_mask, store_tag,
                                 subpass_contexts_[prev_subpass], queue_id);
+    subpass_contexts_[prev_subpass].FinalizeAttachmentLoads();
 
     // Layout transition and load are from the current subpass
     AccessContext& current_context = CurrentContext();
@@ -983,6 +984,7 @@ void RenderPassAccessContext::RecordEndRenderPass(AccessContext& external_contex
                                   CurrentContext(), queue_id);
     UpdateAttachmentStoreAccess(*rp_state_, attachment_views_, render_pass_instance_id_, current_subpass_, view_mask, store_tag,
                                 CurrentContext(), queue_id);
+    CurrentContext().FinalizeAttachmentLoads();
 
     // Export the accesses from the renderpass...
     external_context.ResolveChildContexts(GetSubpassContexts());

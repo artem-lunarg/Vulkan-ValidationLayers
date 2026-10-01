@@ -125,7 +125,8 @@ void AccessStats::Update(SyncValidator& validator) {
     });
     for (const auto& batch : validator.GetAllQueueBatchContexts()) {
         const AccessContext& access_context = batch->GetAccessContext();
-        UpdateAccessMapStats(access_context.GetAccessMap(), queue_access_stats);
+        std::optional<AccessContext> resolved;
+        UpdateAccessMapStats(access_context.GetAccessMap(resolved), queue_access_stats);
     }
 
     max_cb_access_stats.UpdateMax(cb_access_stats);

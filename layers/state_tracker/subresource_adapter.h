@@ -404,6 +404,11 @@ class ImageRangeGenerator {
     ImageRangeGenerator& operator++();
     ImageRangeGenerator& operator=(const ImageRangeGenerator&) = default;
 
+    // A conservative bound for the generated ranges, including aliased image addresses
+    IndexRange GetImageRange() const {
+        return encoder_ ? IndexRange(base_address_, base_address_ + encoder_->TotalSize()) : IndexRange();
+    }
+
   private:
     bool Convert2DCompatibleTo3D();
     void SetUpSubresInfo();

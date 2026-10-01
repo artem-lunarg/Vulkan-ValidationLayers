@@ -179,30 +179,28 @@ void RenderingInstance::InitViewGens(std::vector<ImageRangeGen>& view_gen_storag
     view_gens = view_gen_storage;  // init span
 }
 
-ImageRangeGen RenderingInstance::GetOptimizedDrawRangeGen(const AccessContext& access_context, uint32_t attachment_index,
-                                                          SyncAccessIndex usage, const AttachmentAccess& attachment_access,
-                                                          QueueId queue_id) const {
+void RenderingInstance::RecordDrawAttachment(AccessContext& access_context, uint32_t attachment_index, SyncAccessIndex usage,
+                                             const AttachmentAccess& attachment_access, ResourceUsageTag tag,
+                                             QueueId queue_id) const {
     const auto& attachment = attachments[attachment_index];
     ImageRangeGen range_gen = view_gens[attachment_index];
 
-    // TODO: Remove this early return once GetRenderAreaRangeGen supports
-    // the layers selected by view_mask. Update DetectDrawHazard too.
-    if (view_mask != 0) {
-        return range_gen;
-    }
-
-    if (!attachment.CanOptimizeDrawAccess()) {
-        return attachment.GetRenderAreaRangeGen(render_area);
-    }
-    // LOAD reads only the render area.
-    // Use the whole subresource optimization for the draw only if its write has no hazard
-    if (attachment.load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
-        auto probe = range_gen;
-        if (access_context.DetectAttachmentHazard(probe, usage, attachment_access, queue_id).IsHazard()) {
-            return attachment.GetRenderAreaRangeGen(render_area);
+    bool write_is_safe = false;
+    // TODO: Support render-area ranges for the layers selected by view_mask. Update DetectDrawHazard too
+    if (view_mask == 0) {
+        if (!attachment.CanOptimizeDrawAccess()) {
+            range_gen = attachment.GetRenderAreaRangeGen(render_area);
+        } else if (attachment.load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            // LOAD reads only the render area. Expand the write only if the whole subresource has no hazard
+            ImageRangeGen probe = range_gen;
+            write_is_safe = !access_context.DetectAttachmentHazard(probe, usage, attachment_access, queue_id).IsHazard();
+            if (!write_is_safe) {
+                range_gen = attachment.GetRenderAreaRangeGen(render_area);
+            }
         }
     }
-    return range_gen;
+    access_context.UpdateAttachmentAccessState(range_gen, usage, attachment_access, ResourceUsageTagEx{tag}, queue_id,
+                                               write_is_safe);
 }
 
 HazardResult RenderingInstance::DetectDrawHazard(const AccessContext& access_context, uint32_t attachment_index,
@@ -301,12 +299,16 @@ void RenderingInstance::RecordBeginRendering(AccessContext& access_context, uint
             continue;
         }
         // TODO: Use GetRenderAreaRangeGen for multiview LOAD reads too once
-        // GetRenderAreaRangeGen supports the layers selected by view_mask.
-        ImageRangeGen range_gen = attachment.load_op == VK_ATTACHMENT_LOAD_OP_LOAD && view_mask == 0
-                                      ? attachment.GetRenderAreaRangeGen(render_area)
-                                      : view_gens[i];
+        // GetRenderAreaRangeGen supports the layers selected by view_mask
+        const bool load_reads_render_area = attachment.load_op == VK_ATTACHMENT_LOAD_OP_LOAD && view_mask == 0;
+        ImageRangeGen range_gen = load_reads_render_area ? attachment.GetRenderAreaRangeGen(render_area) : view_gens[i];
         const AttachmentAccess attachment_access = {AttachmentAccessType::LoadOp, attachment.GetOrdering(),
                                                     render_pass_instance_id};
+        if (attachment.view && load_reads_render_area && !attachment.feedback_enabled &&
+            access_context.DeferAttachmentLoad(*attachment.view, range_gen, view_gens[i], load_index, attachment_access,
+                                               ResourceUsageTagEx{tag}, queue_id)) {
+            continue;
+        }
         access_context.UpdateAttachmentAccessState(range_gen, load_index, attachment_access, ResourceUsageTagEx{tag}, queue_id);
     }
 }
@@ -436,6 +438,7 @@ void RenderingInstance::RecordEndRendering(AccessContext& access_context, uint32
             access_context.UpdateAttachmentAccessState(view_gen, store_index, attachment_access, ResourceUsageTagEx{tag}, queue_id);
         }
     }
+    access_context.FinalizeAttachmentLoads();
 }
 
 bool RenderingInstance::ValidateDrawAttachments(const SyncEnvironment& env, const AccessContext& access_context,
@@ -518,10 +521,8 @@ void RenderingInstance::RecordDrawAttachments(AccessContext& access_context, uin
         }
         const AttachmentAccess attachment_access{AttachmentAccessType::Access, SyncOrdering::kColorAttachment,
                                                  render_pass_instance_id, vvl::kNoIndex32};
-        ImageRangeGen view_gen = GetOptimizedDrawRangeGen(
-            access_context, output_location, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access, queue_id);
-        access_context.UpdateAttachmentAccessState(view_gen, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE, attachment_access,
-                                                   ResourceUsageTagEx{tag}, queue_id);
+        RecordDrawAttachment(access_context, output_location, SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE,
+                             attachment_access, tag, queue_id);
     }
 
     // NOTE: these are the old todos, need to reevaluate which ones are needed
@@ -537,10 +538,8 @@ void RenderingInstance::RecordDrawAttachments(AccessContext& access_context, uin
         if (writeable) {
             const AttachmentAccess attachment_access{AttachmentAccessType::Access, SyncOrdering::kDepthStencilAttachment,
                                                      render_pass_instance_id, vvl::kNoIndex32};
-            ImageRangeGen view_gen = GetOptimizedDrawRangeGen(
-                access_context, i, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE, attachment_access, queue_id);
-            access_context.UpdateAttachmentAccessState(view_gen, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                                       attachment_access, ResourceUsageTagEx{tag}, queue_id);
+            RecordDrawAttachment(access_context, i, SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_ATTACHMENT_WRITE, attachment_access, tag,
+                                 queue_id);
         }
     }
 }

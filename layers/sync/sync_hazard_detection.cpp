@@ -19,6 +19,7 @@
 #include "sync/sync_image.h"
 #include "sync/sync_validation.h"
 #include "state_tracker/buffer_state.h"
+#include <type_traits>
 
 namespace syncval {
 
@@ -97,8 +98,10 @@ class HazardDetector {
     HazardDetector(SyncAccessIndex access_index, const AccessContext& access_context)
         : access_info_(GetAccessInfo(access_index)), access_context_(access_context) {}
 
-    HazardResult Detect(const AccessMap::const_iterator& pos) const {
-        return DoDetect(access_context_, pos->second,
+    HazardResult Detect(const AccessMap::const_iterator& pos) const { return Detect(pos->second); }
+
+    HazardResult Detect(const AccessState& state) const {
+        return DoDetect(access_context_, state,
                         [this](const AccessState& access_state) { return access_state.DetectHazard(access_info_); });
     }
 
@@ -123,9 +126,11 @@ class HazardDetectorAttachment {
           queue_id_(queue_id),
           detect_load_op_after_store_op_hazards_(detect_load_op_after_store_op_hazards) {}
 
-    HazardResult Detect(const AccessMap::const_iterator& pos) const {
+    HazardResult Detect(const AccessMap::const_iterator& pos) const { return Detect(pos->second); }
+
+    HazardResult Detect(const AccessState& state) const {
         const OrderingBarrier& ordering = GetOrderingRules(attachment_access_.ordering);
-        return DoDetect(access_context_, pos->second, [this, &ordering](const AccessState& access_state) {
+        return DoDetect(access_context_, state, [this, &ordering](const AccessState& access_state) {
             return access_state.DetectHazard(access_info_, ordering, attachment_access_, 0, queue_id_,
                                              detect_load_op_after_store_op_hazards_);
         });
@@ -148,9 +153,10 @@ class HazardDetectorAttachment {
 struct HazardDetectorMarker {
     HazardDetectorMarker(const AccessContext& access_context) : access_context(access_context) {}
 
-    HazardResult Detect(const AccessMap::const_iterator& pos) const {
-        return DoDetect(access_context, pos->second,
-                        [](const AccessState& access_state) { return access_state.DetectMarkerHazard(); });
+    HazardResult Detect(const AccessMap::const_iterator& pos) const { return Detect(pos->second); }
+
+    HazardResult Detect(const AccessState& state) const {
+        return DoDetect(access_context, state, [](const AccessState& access_state) { return access_state.DetectMarkerHazard(); });
     }
 
     HazardResult DetectAsync(const AccessMap::const_iterator& pos, ResourceUsageTag start_tag, QueueId queue_id) const {
@@ -172,8 +178,10 @@ class BarrierHazardDetector {
           src_access_scope_(src_access_scope),
           queue_id_(queue_id) {}
 
-    HazardResult Detect(const AccessMap::const_iterator& pos) const {
-        return DoDetect(access_context_, pos->second, [this](const AccessState& access_state) {
+    HazardResult Detect(const AccessMap::const_iterator& pos) const { return Detect(pos->second); }
+
+    HazardResult Detect(const AccessState& state) const {
+        return DoDetect(access_context_, state, [this](const AccessState& access_state) {
             return access_state.DetectBarrierHazard(access_info_, queue_id_, src_exec_scope_, src_access_scope_);
         });
     }
@@ -323,6 +331,16 @@ HazardResult AccessContext::DetectAttachmentHazard(ImageRangeGen& range_gen, Syn
                                                    const AttachmentAccess& attachment_access, QueueId queue_id) const {
     HazardDetectorAttachment detector(current_usage, attachment_access, *this, queue_id,
                                       validator->syncval_settings.load_op_after_store_op_validation);
+    if (GetPendingLoadWriteRange(range_gen, current_usage, attachment_access, queue_id)) {
+        ImageRangeGen check_gen = range_gen;
+        // If the write is safe even without the load, keep the load's rows out of the map
+        HazardResult hazard = DetectHazardGeneratedRangeGen(detector, check_gen, DetectOptions::kDetectAll, false);
+        if (!hazard.IsHazard()) {
+            range_gen = check_gen;
+            return {};
+        }
+        // The load may order this write inside the rectangle, so include it in the temporary context
+    }
     return DetectHazardGeneratedRangeGen(detector, range_gen, DetectOptions::kDetectAll);
 }
 
@@ -437,6 +455,9 @@ HazardResult AccessContext::DetectHazardRange(Detector& detector, const AccessRa
         return {};
     }
 
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = GetAccessMapForRead(range, resolved);
+
     HazardResult hazard;
 
     if (static_cast<uint32_t>(options) & DetectOptions::kDetectAsync) {
@@ -450,14 +471,16 @@ HazardResult AccessContext::DetectHazardRange(Detector& detector, const AccessRa
         }
     }
     const bool detect_prev = (options & DetectOptions::kDetectPrevious) != 0;
-    auto pos = access_state_map_.LowerBound(range.begin);
-    hazard = DetectHazardOneRange(detector, detect_prev, pos, access_state_map_.end(), range);
+    auto pos = access_map.LowerBound(range.begin);
+    hazard = DetectHazardOneRange(detector, detect_prev, pos, access_map.end(), range);
     return hazard;
 }
 
 template <typename Detector>
-HazardResult AccessContext::DetectHazardGeneratedRangeGen(Detector& detector, ImageRangeGen& range_gen,
-                                                          DetectOptions options) const {
+HazardResult AccessContext::DetectHazardGeneratedRangeGen(Detector& detector, ImageRangeGen& range_gen, DetectOptions options,
+                                                          bool apply_pending_loads) const {
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = apply_pending_loads ? GetAccessMapForRead(range_gen, resolved) : access_state_map_;
     HazardResult hazard;
 
     if ((options & DetectOptions::kDetectAsync) != 0) {
@@ -471,13 +494,22 @@ HazardResult AccessContext::DetectHazardGeneratedRangeGen(Detector& detector, Im
     }
 
     const bool detect_prev = (options & DetectOptions::kDetectPrevious) != 0;
+    // Event barriers need separate range entries where their event scopes differ
+    if constexpr (!std::is_same_v<Detector, EventBarrierHazardDetector>) {
+        if (detect_prev && access_map.Size() == 0 && subpass_barriers_.size() == 1) {
+            const AccessContext* source = subpass_barriers_.front().src_subpass_context;
+            if (source && source->subpass_barriers_.empty()) {
+                return DetectPreviousHazard(detector, range_gen);
+            }
+        }
+    }
     using ConstIterator = AccessMap::const_iterator;
     auto do_detect_hazard_range = [this, &detector, &hazard, detect_prev](const ImageRangeGen::RangeType& range,
                                                                           const ConstIterator& end, ConstIterator& pos) {
         hazard = DetectHazardOneRange(detector, detect_prev, pos, end, range);
         return hazard.IsHazard();
     };
-    ForEachEntryInRangesUntil(access_state_map_, range_gen, do_detect_hazard_range);
+    ForEachEntryInRangesUntil(access_map, range_gen, do_detect_hazard_range);
     return hazard;
 }
 
@@ -485,9 +517,11 @@ template <typename Detector>
 HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, const AccessRange& range, ResourceUsageTag async_tag,
                                               QueueId async_queue_id) const {
     assert(range.non_empty());
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = GetAccessMapForRead(range, resolved);
     HazardResult hazard;
-    auto pos = access_state_map_.LowerBound(range.begin);
-    if (pos != access_state_map_.end() && pos->first.begin < range.end) {
+    auto pos = access_map.LowerBound(range.begin);
+    if (pos != access_map.end() && pos->first.begin < range.end) {
         hazard = detector.DetectAsync(pos, async_tag, async_queue_id);
     }
     return hazard;
@@ -496,6 +530,8 @@ HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, const Ac
 template <typename Detector>
 HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, ImageRangeGen& range_gen, ResourceUsageTag async_tag,
                                               QueueId async_queue_id) const {
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = GetAccessMapForRead(range_gen, resolved);
     using ConstIterator = AccessMap::const_iterator;
     HazardResult hazard;
 
@@ -508,7 +544,7 @@ HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, ImageRan
         }
         return false;
     };
-    ForEachEntryInRangesUntil(access_state_map_, range_gen, do_async_hazard_check);
+    ForEachEntryInRangesUntil(access_map, range_gen, do_async_hazard_check);
     return hazard;
 }
 
@@ -557,7 +593,7 @@ HazardResult AccessContext::DetectPreviousHazard(Detector& detector, const Acces
     AccessContext descent_context;
     ResolveSubpassDependencies(range, descent_context, false);
 
-    AccessMap& descent_map = descent_context.access_state_map_;
+    const AccessMap& descent_map = descent_context.GetAccessMap();
     for (auto prev = descent_map.begin(); prev != descent_map.end(); ++prev) {
         HazardResult hazard = detector.Detect(prev);
         if (hazard.IsHazard()) {
@@ -565,6 +601,33 @@ HazardResult AccessContext::DetectPreviousHazard(Detector& detector, const Acces
         }
     }
     return {};
+}
+
+template <typename Detector>
+HazardResult AccessContext::DetectPreviousHazard(Detector& detector, ImageRangeGen& range_gen) const {
+    const SubpassBarrier& barrier = subpass_barriers_.front();
+    const AccessContext& source = *barrier.src_subpass_context;
+    assert(subpass_barriers_.size() == 1 && source.subpass_barriers_.empty());
+    std::optional<AccessContext> resolved;
+    const AccessMap& source_map = source.GetAccessMapForRead(range_gen, resolved);
+    const ApplySubpassBarrierAction barrier_action(barrier);
+    HazardResult hazard;
+    using ConstIterator = AccessMap::const_iterator;
+    auto check_previous = [&source, &barrier_action, &detector, &hazard](const AccessRange& range, const ConstIterator& end,
+                                                                         ConstIterator& pos) {
+        while (pos != end && pos->first.begin < range.end) {
+            // Match the barrier cursor of the temporary context used by the recursive path
+            const AccessState state = source.ResolveAccessState(pos->second, barrier_action, 0);
+            hazard = detector.Detect(state);
+            if (hazard.IsHazard()) {
+                return true;
+            }
+            ++pos;
+        }
+        return false;
+    };
+    ForEachEntryInRangesUntil(source_map, range_gen, check_previous);
+    return hazard;
 }
 
 }  // namespace syncval

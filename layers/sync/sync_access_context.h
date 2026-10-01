@@ -144,6 +144,7 @@ class AttachmentViewGen {
                       VkImageAspectFlags use_full_extent_aspects, VkImageAspectFlags try_full_extent_aspects);
 
     const vvl::ImageView* GetViewState() const { return view_; }
+    bool IsFeedbackEnabled() const { return feedback_enabled_; }
     ImageRangeGen GetRangeGen(Gen type, uint32_t view_index = vvl::kNoIndex32) const;
 
     static Gen GetRenderAreaGen(VkImageAspectFlags aspect_mask) { return GetGen(aspect_mask, false); }
@@ -151,6 +152,7 @@ class AttachmentViewGen {
     Gen GetStoreGen(VkImageAspectFlags aspect_mask) const;
 
     static Gen GetDrawGen(VkImageAspectFlags aspect_mask) { return GetRenderAreaGen(aspect_mask); }
+    static Gen GetSubresourceGen(Gen render_area_gen) { return GetGen(GetDrawAspect(render_area_gen), true); }
     Gen GetOptimizedDrawGen(Gen render_area_gen) const;
     bool DrawOptimizationNeedsHazardCheck(Gen render_area_gen) const;
 
@@ -198,7 +200,7 @@ class AccessContext {
     void ResolveFromContext(ResolveOp&& resolve_op, const AccessContext& from_context,
                             subresource_adapter::ImageRangeGenerator range_gen);
 
-    void ResolveFromContextRecursePrev(const AccessContext& from);
+    void InitFromFlattened(const AccessContext& from);
 
     // Resolves this subpass context from the subpass context defined by the layout transition dependency
     void ResolveFromSubpassContext(const ApplySubpassTransitionBarrierAction& subpass_transition_action,
@@ -214,12 +216,19 @@ class AccessContext {
                            ResourceUsageTagEx tag_ex, SyncFlags flags = 0, QueueId queue_id = kQueueIdInvalid);
     void UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage, ResourceUsageTagEx tag_ex, SyncFlags flags = 0,
                            QueueId queue_id = kQueueIdInvalid);
+    // write_is_safe is true only when this range has already passed the write hazard check
     void UpdateAttachmentAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage,
                                      const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                                     QueueId queue_id = kQueueIdInvalid);
+                                     QueueId queue_id = kQueueIdInvalid, bool write_is_safe = false);
     void UpdateAttachmentAccessState(const AttachmentViewGen& view_gen, AttachmentViewGen::Gen gen_type,
                                      SyncAccessIndex current_usage, const AttachmentAccess& attachment_access,
                                      ResourceUsageTagEx tag_ex, uint32_t view_mask = 0, QueueId queue_id = kQueueIdInvalid);
+
+    // Save a rectangular load read without inserting its rows into the access map
+    bool DeferAttachmentLoad(const vvl::ImageView& view, ImageRangeGen render_area_gen, ImageRangeGen full_gen,
+                             SyncAccessIndex usage, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
+                             QueueId queue_id);
+    void FinalizeAttachmentLoads() { ApplyPendingLoads(); }
 
     void ImportAsyncContexts(const AccessContext& from);
     void ClearAsyncContexts() { async_.clear(); }
@@ -236,12 +245,22 @@ class AccessContext {
     void InitFrom(uint32_t subpass, VkQueueFlags queue_flags, const std::vector<SubpassDependencyInfo>& subpass_dependency_infos,
                   const AccessContext* contexts, const AccessContext& external_context, QueueId queue_id);
     void InitFrom(const AccessContext& other);
+    void InitFromResolved(const AccessContext& other) {
+        InitFrom(other);
+        ApplyPendingLoads();
+    }
     void Reset();
 
     void Trim();
     void AddReferencedTags(ResourceUsageTagSet& referenced) const;
 
-    const AccessMap& GetAccessMap() const { return access_state_map_; }
+    const AccessMap& GetAccessMap() const {
+        assert(pending_loads_.empty());
+        return access_state_map_;
+    }
+    const AccessMap& GetAccessMap(std::optional<AccessContext>& resolved) const {
+        return GetAccessMapForRead(kFullRange, resolved);
+    }
     const SubpassBarrier& GetSubpassBarrier(uint32_t src_subpass) const;
     const SubpassBarrier& GetDstExternalSubpassBarrier() const { return dst_external_; }
 
@@ -325,6 +344,31 @@ class AccessContext {
 
   private:
     void ResetGlobalBarriers();
+    void ApplyPendingLoads();
+    void ApplyPendingLoads(const AccessRange& range);
+    void ApplyPendingLoads(ImageRangeGen range_gen);
+
+    template <typename RangeGen>
+    void ApplyPendingLoads(RangeGen range_gen) {
+        for (; !pending_loads_.empty() && range_gen->non_empty(); ++range_gen) {
+            ApplyPendingLoads(*range_gen);
+        }
+    }
+
+    template <typename Range>
+    AccessMap& GetAccessMapForUpdate(const Range& range) {
+        ApplyPendingLoads(range);
+        return access_state_map_;
+    }
+
+    const AccessMap& GetAccessMapForRead(const AccessRange& range, std::optional<AccessContext>& resolved) const;
+    const AccessMap& GetAccessMapForRead(ImageRangeGen range_gen, std::optional<AccessContext>& resolved) const;
+    bool HasPendingLoads(const AccessRange& range) const;
+
+    AccessState ResolveAccessState(const AccessState& access, const AccessStateFunction& barrier_action,
+                                   uint32_t next_global_barrier_index) const;
+
+    void InitFrom(const AccessContext& other, const AccessRange& range);
 
     // Resolve accesses from src contexts from all subpass dependencies including src external dependency
     void ResolveSubpassDependencies(const AccessRange& range, AccessContext& resolve_context, bool infill,
@@ -339,7 +383,7 @@ class AccessContext {
     // Gaps in resolve_context are resolved by importing from previous contexts or by
     // applying an optional infill operation if previous contexts cannot resolve them
     void ResolveAccessRangeRecursePrev(const AccessRange& range, const AccessStateFunction& barrier_action,
-                                       AccessContext& resolve_context, bool infill) const;
+                                       AccessContext& resolve_context, bool infill, bool apply_pending_loads = true) const;
 
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
@@ -356,12 +400,17 @@ class AccessContext {
                                             const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
                                             QueueId queue_id = kQueueIdInvalid);
 
+    // A replacing write must cover the pending rectangle and be ordered after its read
+    std::optional<AccessRange> GetPendingLoadWriteRange(ImageRangeGen range_gen, SyncAccessIndex usage,
+                                                        const AttachmentAccess& attachment_access, QueueId queue_id) const;
+
     // A recursive range walkers for hazard detection, first for the current context
     // and then walks the DAG of the contexts for subpasses
     template <typename Detector>
     HazardResult DetectHazardRange(Detector& detector, const AccessRange& range, DetectOptions options) const;
     template <typename Detector>
-    HazardResult DetectHazardGeneratedRangeGen(Detector& detector, ImageRangeGen& range_gen, DetectOptions options) const;
+    HazardResult DetectHazardGeneratedRangeGen(Detector& detector, ImageRangeGen& range_gen, DetectOptions options,
+                                               bool apply_pending_loads = true) const;
 
     // A non recursive range walker for the asynchronous contexts (those we have no barriers with)
     template <typename Detector>
@@ -376,12 +425,25 @@ class AccessContext {
                                       const AccessMap::const_iterator& the_end, const AccessRange& range) const;
     template <typename Detector>
     HazardResult DetectPreviousHazard(Detector& detector, const AccessRange& range) const;
+    template <typename Detector>
+    HazardResult DetectPreviousHazard(Detector& detector, ImageRangeGen& range_gen) const;
 
   public:
     const SyncValidator* validator = nullptr;
 
   private:
     AccessMap access_state_map_;
+    struct PendingLoad {
+        // Keep the image encoder referenced by render_area_gen alive
+        std::shared_ptr<const vvl::Image> image;
+        AccessRange subresource_range;
+        ImageRangeGen render_area_gen;
+        SyncAccessIndex usage;
+        AttachmentAccess attachment_access;
+        ResourceUsageTagEx tag_ex;
+        QueueId queue_id;
+    };
+    std::vector<PendingLoad> pending_loads_;
 
     // These contexts *must* have the same lifespan as this context, or be cleared, before the referenced contexts can expire
     std::vector<AsyncReference> async_;
@@ -446,26 +508,29 @@ void AccessContext::UpdateMemoryAccessState(Action& action, const AccessRange& r
         return;
     }
 
+    AccessMap& access_map = GetAccessMapForUpdate(range);
     ActionToOpsAdapter<Action> ops{action};
-    auto pos = access_state_map_.LowerBound(range.begin);
-    InfillUpdateRange(access_state_map_, pos, range, ops);
+    auto pos = access_map.LowerBound(range.begin);
+    InfillUpdateRange(access_map, pos, range, ops);
 }
 
 template <typename Action, typename RangeGen>
 void AccessContext::UpdateMemoryAccessState(const Action& action, RangeGen& range_gen) {
+    AccessMap& access_map = GetAccessMapForUpdate(range_gen);
     ActionToOpsAdapter<Action> ops{action};
-    auto pos = access_state_map_.LowerBound(range_gen->begin);
+    auto pos = access_map.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
-        pos = InfillUpdateRange(access_state_map_, pos, *range_gen, ops);
+        pos = InfillUpdateRange(access_map, pos, *range_gen, ops);
     }
 }
 
 template <typename Predicate>
 void AccessContext::EraseIf(Predicate&& pred) {
-    auto pos = access_state_map_.begin();
-    while (pos != access_state_map_.end()) {
+    AccessMap& access_map = GetAccessMapForUpdate(kFullRange);
+    auto pos = access_map.begin();
+    while (pos != access_map.end()) {
         if (pred(*pos)) {
-            pos = access_state_map_.Erase(pos);
+            pos = access_map.Erase(pos);
         } else {
             ++pos;
         }

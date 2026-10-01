@@ -58,8 +58,19 @@ void CollectBarriersFunctor::operator()(const Iterator& pos) const {
                                         pending_barriers);
 }
 
-void AccessContext::InitFrom(const AccessContext& other) {
-    access_state_map_.Assign(other.access_state_map_);
+void AccessContext::InitFrom(const AccessContext& other) { InitFrom(other, kFullRange); }
+
+void AccessContext::InitFrom(const AccessContext& other, const AccessRange& range) {
+    if (range == kFullRange) {
+        access_state_map_.Assign(other.access_state_map_);
+    } else {
+        access_state_map_.Clear();
+        for (auto pos = other.access_state_map_.LowerBound(range.begin);
+             pos != other.access_state_map_.end() && pos->first.begin < range.end; ++pos) {
+            access_state_map_.Insert(access_state_map_.end(), pos->first & range, pos->second);
+        }
+    }
+    pending_loads_ = other.pending_loads_;
 
     async_ = other.async_;
     start_tag_ = other.start_tag_;
@@ -79,6 +90,7 @@ void AccessContext::InitFrom(const AccessContext& other) {
 
 void AccessContext::Reset() {
     access_state_map_.Clear();
+    pending_loads_.clear();
     async_.clear();
     start_tag_ = {};
     ResetGlobalBarriers();
@@ -87,6 +99,7 @@ void AccessContext::Reset() {
 }
 
 void AccessContext::RegisterGlobalBarrier(const SyncBarrier& barrier, QueueId queue_id) {
+    ApplyPendingLoads();
     assert(global_barriers_.empty() || global_barriers_queue_ == queue_id);
 
     // Search for existing def
@@ -182,14 +195,15 @@ void AccessContext::ResetGlobalBarriers() {
 }
 
 void AccessContext::Trim() {
-    for (auto& [range, access] : access_state_map_) {
+    AccessMap& access_map = GetAccessMapForUpdate(kFullRange);
+    for (auto& [range, access] : access_map) {
         access.Normalize();
     }
-    Consolidate(access_state_map_);
+    Consolidate(access_map);
 }
 
 void AccessContext::AddReferencedTags(ResourceUsageTagSet& used) const {
-    for (const auto& [range, access] : access_state_map_) {
+    for (const auto& [range, access] : GetAccessMap()) {
         access.GatherReferencedTags(used);
     }
 }
@@ -203,9 +217,12 @@ const SubpassBarrier& AccessContext::GetSubpassBarrier(uint32_t src_subpass) con
     }
 }
 
-void AccessContext::ResolveFromContextRecursePrev(const AccessContext& from) {
+void AccessContext::InitFromFlattened(const AccessContext& from) {
+    Reset();
+    // Keep the current context's loads deferred in the proxy. Previous contexts are resolved normally
     auto noop_action = [](AccessState* access) {};
-    from.ResolveAccessRangeRecursePrev(kFullRange, noop_action, *this, false);
+    from.ResolveAccessRangeRecursePrev(kFullRange, noop_action, *this, false, false);
+    pending_loads_ = from.pending_loads_;
 }
 
 void AccessContext::ResolveFromSubpassContext(const ApplySubpassTransitionBarrierAction& subpass_transition_action,
@@ -220,6 +237,7 @@ void AccessContext::ResolveAllSubpassDependencies() { ResolveSubpassDependencies
 
 void AccessContext::ResolveChildContexts(vvl::span<AccessContext> subpass_contexts) {
     for (AccessContext& access_context : subpass_contexts) {
+        assert(access_context.pending_loads_.empty());
         ApplySubpassBarrierAction barrier_action(access_context.GetDstExternalSubpassBarrier());
         access_context.ResolveAccessRange(kFullRange, barrier_action, *this);
     }
@@ -235,28 +253,31 @@ void AccessContext::ResolveSubpassDependencies(const AccessRange& range, AccessC
     }
 }
 
+AccessState AccessContext::ResolveAccessState(const AccessState& access, const AccessStateFunction& barrier_action,
+                                              uint32_t next_global_barrier_index) const {
+    AccessState resolved = access;
+    ApplyGlobalBarriers(resolved);
+    resolved.next_global_barrier_index = next_global_barrier_index;
+    barrier_action(&resolved);
+    return resolved;
+}
+
 void AccessContext::ResolveAccessRange(const AccessRange& range, const AccessStateFunction& barrier_action,
                                        AccessContext& resolve_context) const {
     if (!range.non_empty()) {
         return;
     }
-    AccessMap& resolve_map = resolve_context.access_state_map_;
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = GetAccessMapForRead(range, resolved);
+    AccessMap& resolve_map = resolve_context.GetAccessMapForUpdate(range);
 
-    ParallelIterator current(resolve_map, access_state_map_, range.begin);
+    ParallelIterator current(resolve_map, access_map, range.begin);
     while (current.range.non_empty() && range.includes(current.range.begin)) {
         const auto current_range = current.range & range;
         if (current.pos_B.inside_lower_bound_range) {
             const auto& src_pos = current.pos_B.lower_bound;
 
-            // Create a copy of the source access state (source is this context, destination is the resolve context).
-            // Then do the following steps:
-            //  a) apply not yet applied global barriers
-            //  b) update global barrier index to ensure global barriers from the resolve context are not applied
-            //  c) apply barrier action
-            AccessState src_access = src_pos->second;
-            ApplyGlobalBarriers(src_access);                                                 // a
-            src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();  // b
-            barrier_action(&src_access);                                                     // c
+            AccessState src_access = ResolveAccessState(src_pos->second, barrier_action, resolve_context.GetGlobalBarrierCount());
 
             if (current.pos_A.inside_lower_bound_range) {
                 const auto trimmed = Split(current.pos_A.lower_bound, resolve_map, current_range);
@@ -276,27 +297,21 @@ void AccessContext::ResolveAccessRange(const AccessRange& range, const AccessSta
 }
 
 void AccessContext::ResolveAccessRangeRecursePrev(const AccessRange& range, const AccessStateFunction& barrier_action,
-                                                  AccessContext& resolve_context, bool infill) const {
+                                                  AccessContext& resolve_context, bool infill, bool apply_pending_loads) const {
     if (!range.non_empty()) {
         return;
     }
-    AccessMap& resolve_map = resolve_context.access_state_map_;
+    std::optional<AccessContext> resolved;
+    const AccessMap& access_map = apply_pending_loads ? GetAccessMapForRead(range, resolved) : access_state_map_;
+    AccessMap& resolve_map = resolve_context.GetAccessMapForUpdate(range);
 
-    ParallelIterator current(resolve_map, access_state_map_, range.begin);
+    ParallelIterator current(resolve_map, access_map, range.begin);
     while (current.range.non_empty() && range.includes(current.range.begin)) {
         const auto current_range = current.range & range;
         if (current.pos_B.inside_lower_bound_range) {
             const auto& src_pos = current.pos_B.lower_bound;
 
-            // Create a copy of the source access state (source is this context, destination is the resolve context).
-            // Then do the following steps:
-            //  a) apply not yet applied global barriers
-            //  b) update global barrier index to ensure global barriers from the resolve context are not applied
-            //  c) apply barrier action
-            AccessState src_access = src_pos->second;
-            ApplyGlobalBarriers(src_access);                                                 // a
-            src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();  // b
-            barrier_action(&src_access);                                                     // c
+            AccessState src_access = ResolveAccessState(src_pos->second, barrier_action, resolve_context.GetGlobalBarrierCount());
 
             if (current.pos_A.inside_lower_bound_range) {
                 const auto trimmed = Split(current.pos_A.lower_bound, resolve_map, current_range);
@@ -313,7 +328,7 @@ void AccessContext::ResolveAccessRangeRecursePrev(const AccessRange& range, cons
             // The current context is empty for the current_range, so recur to fill the gap.
             // Since we will be recurring back up the DAG, expand the gap descent to cover the
             // full range for which B is not valid, to minimize that recurrence
-            if (current.pos_B.lower_bound == access_state_map_.end()) {
+            if (current.pos_B.lower_bound == access_map.end()) {
                 recurrence_range.end = range.end;
             } else {
                 recurrence_range.end = std::min(range.end, current.pos_B.lower_bound->first.begin);
@@ -461,6 +476,123 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
     return pos;
 }
 
+bool AccessContext::DeferAttachmentLoad(const vvl::ImageView& view, ImageRangeGen render_area_gen, ImageRangeGen full_gen,
+                                        SyncAccessIndex usage, const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
+                                        QueueId queue_id) {
+    assert(attachment_access.type == AttachmentAccessType::LoadOp && syncAccessReadMask[usage]);
+    if (render_area_gen->empty() || full_gen->empty() || *render_area_gen == *full_gen) {
+        return false;
+    }
+    const AccessRange subresource_range = *full_gen;
+    ++full_gen;
+    if (full_gen->non_empty()) {
+        return false;
+    }
+    ApplyPendingLoads(subresource_range);
+    pending_loads_.push_back({view.image_state, subresource_range, render_area_gen, usage, attachment_access, tag_ex, queue_id});
+    return true;
+}
+
+void AccessContext::ApplyPendingLoads() { ApplyPendingLoads(kFullRange); }
+
+void AccessContext::ApplyPendingLoads(const AccessRange& range) {
+    for (size_t i = 0; i < pending_loads_.size();) {
+        if (!range.intersects(pending_loads_[i].subresource_range)) {
+            ++i;
+            continue;
+        }
+        PendingLoad load = pending_loads_[i];
+        pending_loads_.erase(pending_loads_.begin() + i);
+        auto pos = access_state_map_.LowerBound(load.render_area_gen->begin);
+        for (; load.render_area_gen->non_empty(); ++load.render_area_gen) {
+            pos =
+                DoUpdateAccessState(pos, *load.render_area_gen, load.usage, load.attachment_access, load.tag_ex, 0, load.queue_id);
+        }
+    }
+}
+
+void AccessContext::ApplyPendingLoads(ImageRangeGen range_gen) {
+    if (pending_loads_.empty() || range_gen->empty() || !HasPendingLoads(range_gen.GetImageRange())) {
+        return;
+    }
+    ApplyPendingLoads<ImageRangeGen>(range_gen);
+}
+
+bool AccessContext::HasPendingLoads(const AccessRange& range) const {
+    return std::any_of(pending_loads_.begin(), pending_loads_.end(),
+                       [&range](const PendingLoad& load) { return range.intersects(load.subresource_range); });
+}
+
+const AccessMap& AccessContext::GetAccessMapForRead(const AccessRange& range, std::optional<AccessContext>& resolved) const {
+    if (!HasPendingLoads(range)) {
+        return access_state_map_;
+    }
+    // Copy only the queried history. Keep the original context and its pending loads unchanged
+    AccessContext& scratch = resolved.emplace();
+    scratch.InitFrom(*this, range);
+    scratch.pending_loads_.clear();
+    for (const PendingLoad& load : pending_loads_) {
+        if (!range.intersects(load.subresource_range)) {
+            continue;
+        }
+        auto pos = scratch.access_state_map_.LowerBound(range.begin);
+        for (ImageRangeGen load_gen = load.render_area_gen; load_gen->non_empty() && load_gen->begin < range.end; ++load_gen) {
+            const AccessRange load_range = *load_gen & range;
+            if (load_range.non_empty()) {
+                pos =
+                    scratch.DoUpdateAccessState(pos, load_range, load.usage, load.attachment_access, load.tag_ex, 0, load.queue_id);
+            }
+        }
+    }
+    return scratch.access_state_map_;
+}
+
+const AccessMap& AccessContext::GetAccessMapForRead(ImageRangeGen range_gen, std::optional<AccessContext>& resolved) const {
+    if (pending_loads_.empty() || range_gen->empty() || !HasPendingLoads(range_gen.GetImageRange())) {
+        return access_state_map_;
+    }
+    AccessRange range = *range_gen;
+    for (++range_gen; range_gen->non_empty(); ++range_gen) {
+        range.end = range_gen->end;
+    }
+    return GetAccessMapForRead(range, resolved);
+}
+
+std::optional<AccessRange> AccessContext::GetPendingLoadWriteRange(ImageRangeGen range_gen, SyncAccessIndex usage,
+                                                                   const AttachmentAccess& attachment_access,
+                                                                   QueueId queue_id) const {
+    if (pending_loads_.empty() || range_gen->empty() || syncAccessReadMask[usage] ||
+        (attachment_access.type != AttachmentAccessType::Access && attachment_access.type != AttachmentAccessType::StoreOp)) {
+        return {};
+    }
+    const AccessRange range = *range_gen;
+    ++range_gen;
+    if (range_gen->non_empty()) {
+        return {};
+    }
+    bool found = false;
+    for (const PendingLoad& load : pending_loads_) {
+        if (!range.intersects(load.subresource_range)) {
+            continue;
+        }
+        if (!range.includes(load.subresource_range) ||
+            attachment_access.render_pass_instance_id != load.attachment_access.render_pass_instance_id ||
+            attachment_access.subpass != load.attachment_access.subpass) {
+            return {};
+        }
+        // Check ordering against the saved read without creating its row entries
+        AccessState read = AccessState::DefaultAccessState();
+        read.Update(GetAccessInfo(load.usage), load.attachment_access, load.tag_ex, 0, load.queue_id);
+        if (read.DetectHazard(GetAccessInfo(usage), GetOrderingRules(attachment_access.ordering), attachment_access, 0, queue_id,
+                              false)
+                .IsHazard()) {
+            return {};
+        }
+        found = true;
+    }
+    return found ? std::optional<AccessRange>(range) : std::nullopt;
+}
+
 void AccessContext::UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex current_usage, const AccessRange& range,
                                       ResourceUsageTagEx tag_ex, SyncFlags flags, QueueId queue_id) {
     assert(range.valid());
@@ -478,7 +610,8 @@ void AccessContext::UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex
     const VkDeviceSize base_address = ResourceBaseAddress(buffer);
     const AccessRange buffer_range = range + base_address;
 
-    auto pos = access_state_map_.LowerBound(buffer_range.begin);
+    AccessMap& access_map = GetAccessMapForUpdate(buffer_range);
+    auto pos = access_map.LowerBound(buffer_range.begin);
     DoUpdateAccessState(pos, buffer_range, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id);
 }
 
@@ -487,7 +620,8 @@ void AccessContext::UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex 
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
         return;
     }
-    auto pos = access_state_map_.LowerBound(range_gen->begin);
+    AccessMap& access_map = GetAccessMapForUpdate(range_gen);
+    auto pos = access_map.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
         pos = DoUpdateAccessState(pos, *range_gen, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id);
     }
@@ -495,11 +629,21 @@ void AccessContext::UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex 
 
 void AccessContext::UpdateAttachmentAccessState(ImageRangeGen& range_gen, SyncAccessIndex current_usage,
                                                 const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
-                                                QueueId queue_id) {
+                                                QueueId queue_id, bool write_is_safe) {
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
         return;
     }
-    auto pos = access_state_map_.LowerBound(range_gen->begin);
+    const std::optional<AccessRange> write_range = GetPendingLoadWriteRange(range_gen, current_usage, attachment_access, queue_id);
+    if (write_range) {
+        ImageRangeGen check_gen = range_gen;
+        if (write_is_safe || !DetectAttachmentHazard(check_gen, current_usage, attachment_access, queue_id).IsHazard()) {
+            // The write replaces these reads, so their rows never need to enter the map
+            vvl::erase_if(pending_loads_,
+                          [&write_range](const PendingLoad& load) { return write_range->includes(load.subresource_range); });
+        }
+    }
+    AccessMap& access_map = GetAccessMapForUpdate(range_gen);
+    auto pos = access_map.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
         pos = DoUpdateAccessState(pos, *range_gen, current_usage, attachment_access, tag_ex, 0, queue_id);
     }
@@ -513,6 +657,15 @@ void AccessContext::UpdateAttachmentAccessState(const AttachmentViewGen& view_ge
         const AttachmentViewGen::Gen optimized_gen_type = draw_access ? view_gen.GetOptimizedDrawGen(gen_type) : gen_type;
         ImageRangeGen range_gen = view_gen.GetRangeGen(optimized_gen_type);
 
+        if (attachment_access.type == AttachmentAccessType::LoadOp && syncAccessReadMask[current_usage] &&
+            !view_gen.IsFeedbackEnabled() &&
+            DeferAttachmentLoad(*view_gen.GetViewState(), range_gen,
+                                view_gen.GetRangeGen(AttachmentViewGen::GetSubresourceGen(gen_type)), current_usage,
+                                attachment_access, tag_ex, queue_id)) {
+            return;
+        }
+
+        bool write_is_safe = false;
         // LOAD only reads the render area. Track the draw over the whole subresource only if its
         // write has no hazard. Check again at submission, when accesses from earlier command buffers
         // are also known
@@ -520,9 +673,11 @@ void AccessContext::UpdateAttachmentAccessState(const AttachmentViewGen& view_ge
             ImageRangeGen probe = range_gen;
             if (DetectAttachmentHazard(probe, current_usage, attachment_access, queue_id).IsHazard()) {
                 range_gen = view_gen.GetRangeGen(gen_type);
+            } else {
+                write_is_safe = true;
             }
         }
-        UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex, queue_id);
+        UpdateAttachmentAccessState(range_gen, current_usage, attachment_access, tag_ex, queue_id, write_is_safe);
     } else {
         uint32_t view_index = 0;
         while (view_mask) {
@@ -639,7 +794,7 @@ VkImageAspectFlags AttachmentViewGen::GetDrawAspect(Gen render_area_gen) {
         case kStencilOnlyRenderArea:
             return VK_IMAGE_ASPECT_STENCIL_BIT;
         default:
-            // expect a generator returned by GetDrawGen()
+            // Expect a render-area generator
             assert(false);
             return 0;
     }
