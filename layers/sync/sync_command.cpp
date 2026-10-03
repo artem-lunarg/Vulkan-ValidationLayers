@@ -1069,9 +1069,11 @@ bool SetEventCommand::Validate(const SyncEnvironment& env, const AccessContext& 
 void SetEventCommand::Apply(SyncEnvironment& env, ResourceUsageTag tag, AccessContext& access_context) const {
     // Capture the state at this execution of SetEvent for later inspection at wait time.
     // TODO: Profile the full access-map copy for event-heavy workloads. During submit replay this copies
-    // the queue access map; consider sharing immutable state or storing only the event source scope.
+    // the queue access map; consider sharing immutable state or storing only the event source scope
     auto src_access_context = std::make_shared<AccessContext>(env.validator);
     src_access_context->InitFrom(access_context);
+    // Event scopes use exact ranges for filtering and are reused by all barriers in subsequent waits
+    src_access_context->Materialize();
 
     ApplyCmdSetEvent(env, event, src_exec_scope, src_access_context, tag, command);
 }
