@@ -38,7 +38,7 @@ namespace syncval {
 // Generate the ranges that are the intersection of range and the entries in the RangeMap
 class MapRangesRangeGenerator {
   public:
-    // Default constructed is safe to dereference for "empty" test, but for no other operation.
+    // Default constructed is safe to dereference for "empty" test, but for no other operation
     MapRangesRangeGenerator() {
         // Default construction *must* be empty range
         assert(current_.empty());
@@ -81,7 +81,7 @@ using EventSimpleRangeGenerator = MapRangesRangeGenerator;
 template <typename RangeGen>
 class FilteredGeneratorGenerator {
   public:
-    // Default constructed is safe to dereference for "empty" test, but for no other operation.
+    // Default constructed is safe to dereference for "empty" test, but for no other operation
     FilteredGeneratorGenerator() : filter_(nullptr), gen_(), filter_pos_(), current_() {
         // Default construction for KeyType *must* be empty range
         assert(current_.empty());

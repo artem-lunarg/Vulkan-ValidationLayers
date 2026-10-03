@@ -23,6 +23,7 @@
 
 #include "subresource_adapter.h"
 #include <cmath>
+#include <limits>
 #include "state_tracker/image_state.h"
 #include "generated/dispatch_functions.h"
 #include "utils/image_utils.h"
@@ -741,6 +742,22 @@ void ImageRangeGenerator::SetUpIncrementer(bool all_width, bool all_height, bool
     } else {
         SetUpSubresIncrementer();
     }
+}
+
+std::optional<StridedRange> ImageRangeGenerator::GetStridedRangeImpl() const {
+    // The descriptor must cover the complete generator, starting at its initial position
+    if (pos_.empty() || view_mask_ || mip_index_ || incr_state_.y_index || incr_state_.layer_z_index ||
+        subres_range_.levelCount != 1 || (subres_range_.aspectMask & (subres_range_.aspectMask - 1)) ||
+        incr_state_.layer_z_count > incr_state_.layer_z_step || !incr_state_.y_step) {
+        return std::nullopt;
+    }
+    const uint32_t count = incr_state_.y_count / incr_state_.y_step + (incr_state_.y_count % incr_state_.y_step != 0);
+    const IndexType width = pos_.size();
+    const IndexType stride = incr_state_.incr_y;
+    if (count < 2 || !width || width >= stride || (count - 1) > (std::numeric_limits<IndexType>::max() - pos_.end) / stride) {
+        return std::nullopt;
+    }
+    return StridedRange{pos_.begin, width, stride, count};
 }
 
 ImageRangeGenerator& ImageRangeGenerator::operator++() {

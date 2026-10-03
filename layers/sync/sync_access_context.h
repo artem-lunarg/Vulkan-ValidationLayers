@@ -61,7 +61,7 @@ struct ApplyMarkupFunctor {
         auto inserted = accesses->Insert(pos_hint, range, AccessState::DefaultAccessState());
         return inserted;
     }
-    void operator()(const Iterator& pos) const {}
+    void operator()(AccessState& access) const {}
     const bool layout_transition;
 };
 
@@ -82,7 +82,7 @@ struct CollectBarriersFunctor {
         assert(!layout_transition);  // MarkupFunctor infills gaps for layout transtion, so we should never get here in that case
         return pos_hint;
     }
-    void operator()(const Iterator& pos) const;
+    void operator()(AccessState& access_state) const;
 
     const AccessContext& access_context;
     const BarrierScope barrier_scope;
@@ -239,6 +239,7 @@ class AccessContext {
     void Reset();
 
     void Trim();
+    void Materialize() { access_state_map_.Materialize(kFullRange); }
     void AddReferencedTags(ResourceUsageTagSet& referenced) const;
 
     const AccessMap& GetAccessMap() const { return access_state_map_; }
@@ -250,6 +251,7 @@ class AccessContext {
 
     template <typename Predicate>
     void EraseIf(Predicate&& pred);
+    void EraseRange(const AccessRange& range);
 
     // For use during queue submit building up the QueueBatchContext AccessContext for validation, otherwise clear.
     void AddAsyncContext(const AccessContext& context, ResourceUsageTag tag, QueueId queue_id);
@@ -318,13 +320,13 @@ class AccessContext {
     HazardResult DetectImageBarrierHazard(const AttachmentViewGen& attachment_view, const SyncBarrier& barrier,
                                           DetectOptions options, QueueId queue_id = kQueueIdInvalid) const;
 
-    HazardResult DetectSubpassTransitionHazard(const SubpassBarrier& subpass_barrier,
-                                               const AttachmentViewGen& attach_view) const;
+    HazardResult DetectSubpassTransitionHazard(const SubpassBarrier& subpass_barrier, const AttachmentViewGen& attach_view) const;
 
     HazardResult DetectMarkerHazard(const vvl::Buffer& buffer, const AccessRange& range) const;
 
   private:
     void ResetGlobalBarriers();
+    void PrepareForLayoutTransition(const AccessRange& range);
 
     // Resolve accesses from src contexts from all subpass dependencies including src external dependency
     void ResolveSubpassDependencies(const AccessRange& range, AccessContext& resolve_context, bool infill,
@@ -341,6 +343,11 @@ class AccessContext {
     void ResolveAccessRangeRecursePrev(const AccessRange& range, const AccessStateFunction& barrier_action,
                                        AccessContext& resolve_context, bool infill) const;
 
+    void ResolveAccessRangeImpl(const AccessRange& range, const AccessStateFunction& barrier_action, AccessContext& resolve_context,
+                                bool recurse, bool infill) const;
+    void ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination,
+                      bool replace = false) const;
+
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
     // Not intended for subpass layout transition, as the pending state handling is more complex
@@ -355,6 +362,10 @@ class AccessContext {
     AccessMap::iterator DoUpdateAccessState(AccessMap::iterator pos, const AccessRange& range, SyncAccessIndex access_index,
                                             const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
                                             QueueId queue_id = kQueueIdInvalid);
+
+    bool UpdateStridedAccess(const subresource_adapter::StridedRange& strided, SyncAccessIndex access_index,
+                             const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
+                             QueueId queue_id);
 
     // A recursive range walkers for hazard detection, first for the current context
     // and then walks the DAG of the contexts for subpasses
@@ -373,9 +384,12 @@ class AccessContext {
 
     template <typename Detector>
     HazardResult DetectHazardOneRange(Detector& detector, bool detect_prev, AccessMap::const_iterator& pos,
-                                      const AccessMap::const_iterator& the_end, const AccessRange& range) const;
+                                      const AccessMap::const_iterator& the_end, const AccessRange& range,
+                                      const subresource_adapter::StridedRange* query_pattern = nullptr) const;
     template <typename Detector>
     HazardResult DetectPreviousHazard(Detector& detector, const AccessRange& range) const;
+    template <typename Detector>
+    HazardResult DetectPreviousHazard(Detector& detector, ImageRangeGen& range_gen) const;
 
   public:
     const SyncValidator* validator = nullptr;
@@ -431,10 +445,12 @@ struct ActionToOpsAdapter {
         // where as Action::Infill assumes the caller will apply the action() logic to the infill_range
         for (; infill != pos; ++infill) {
             assert(infill != accesses.end());
-            action(infill);
+            update(infill);
         }
     }
-    void update(const AccessMap::iterator& pos) const { action(pos); }
+    void update(const AccessMap::iterator& pos) const {
+        pos->second.VisitStates([&](AccessState& state) { action(state); });
+    }
     const Action& action;
 };
 
@@ -446,6 +462,7 @@ void AccessContext::UpdateMemoryAccessState(Action& action, const AccessRange& r
         return;
     }
 
+    if (action.layout_transition) PrepareForLayoutTransition(range);
     ActionToOpsAdapter<Action> ops{action};
     auto pos = access_state_map_.LowerBound(range.begin);
     InfillUpdateRange(access_state_map_, pos, range, ops);
@@ -456,6 +473,10 @@ void AccessContext::UpdateMemoryAccessState(const Action& action, RangeGen& rang
     ActionToOpsAdapter<Action> ops{action};
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
+        if (action.layout_transition) {
+            PrepareForLayoutTransition(*range_gen);
+            pos = access_state_map_.LowerBound(range_gen->begin);
+        }
         pos = InfillUpdateRange(access_state_map_, pos, *range_gen, ops);
     }
 }
@@ -464,7 +485,17 @@ template <typename Predicate>
 void AccessContext::EraseIf(Predicate&& pred) {
     auto pos = access_state_map_.begin();
     while (pos != access_state_map_.end()) {
-        if (pred(*pos)) {
+        AccessMapEntry& entry = pos->second;
+        bool erase;
+        if (!entry.pattern) {
+            erase = pred(entry.state);
+        } else {
+            auto& pattern = *entry.pattern;
+            if (pattern.outside_present && pred(entry.state)) pattern.outside_present = false;
+            if (pattern.inside_present && pred(pattern.inside)) pattern.inside_present = false;
+            erase = !pattern.outside_present && !pattern.inside_present;
+        }
+        if (erase) {
             pos = access_state_map_.Erase(pos);
         } else {
             ++pos;
