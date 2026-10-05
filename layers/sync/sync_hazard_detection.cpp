@@ -591,7 +591,22 @@ HazardResult AccessContext::DetectHazardOneRange(Detector& detector, bool detect
             constexpr bool group_states = !std::is_same_v<Detector, EventBarrierHazardDetector>;
             const AccessRange detect_range = group_states ? (pos->first & range) : pos->first;
             const bool preserve_gaps = detect_prev && !subpass_barriers_.empty();
-            VisitForDetection(entry, detect_range, detect, group_states, preserve_gaps);
+            bool resolved_history = false;
+            if constexpr (group_states) {
+                if (preserve_gaps && entry.HasGaps() && range.includes(pos->first)) {
+                    AccessContext inherited;
+                    ResolveSubpassDependencies(pos->first, inherited, false);
+                    // Keep local barrier cursors while inherited states start at zero for the original detector
+                    ResolveEntry(pos->first, entry, inherited, true);
+                    const AccessMap& effective_map = inherited.access_state_map_;
+                    auto effective = effective_map.begin();
+                    hazard = DetectHazardOneRange(detector, false, effective, effective_map.end(), pos->first);
+                    resolved_history = true;
+                }
+            }
+            if (!resolved_history) {
+                VisitForDetection(entry, detect_range, detect, group_states, preserve_gaps);
+            }
         }
         if (hazard.IsHazard()) return hazard;
         if (pos->first.end > range.end) break;

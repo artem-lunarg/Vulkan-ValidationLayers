@@ -262,7 +262,8 @@ void AccessContext::ResolveAccessRangeRecursePrev(const AccessRange& range, cons
     ResolveAccessRangeImpl(range, barrier_action, resolve_context, true, infill);
 }
 
-void AccessContext::ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination) const {
+void AccessContext::ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination,
+                                 bool replace) const {
     AccessMap& map = destination.access_state_map_;
     auto pos = map.LowerBound(range.begin);
     ResourceAddress begin = range.begin;
@@ -295,14 +296,16 @@ void AccessContext::ResolveEntry(const AccessRange& range, const AccessMapEntry&
                 map.Materialize(part_range);
                 part.Visit(part_range, [&](const AccessRange& span, const AccessState* state) {
                     if (state) {
-                        ResolveEntry(span, AccessMapEntry(*state), destination);
+                        ResolveEntry(span, AccessMapEntry(*state), destination, replace);
                     }
                     return false;
                 });
                 pos = map.LowerBound(end);
             } else {
                 target.VisitStates([&](AccessState& state) { destination.ApplyGlobalBarriers(state); });
-                if (!part.pattern && !target.pattern) {
+                if (replace && !part.pattern) {
+                    target.SetUniform(part.state);
+                } else if (!part.pattern && !target.pattern) {
                     target.state.Resolve(part.state);
                 } else {
                     if (!target.pattern) {
@@ -310,7 +313,7 @@ void AccessContext::ResolveEntry(const AccessRange& range, const AccessMapEntry&
                     }
                     auto& dst = *target.pattern;
                     if (!part.pattern || part.pattern->outside_present) {
-                        if (dst.outside_present) {
+                        if (dst.outside_present && !replace) {
                             target.state.Resolve(part.state);
                         } else {
                             target.state.Assign(part.state);
@@ -318,7 +321,11 @@ void AccessContext::ResolveEntry(const AccessRange& range, const AccessMapEntry&
                         dst.outside_present = true;
                     }
                     const AccessState& inside = part.pattern ? part.pattern->inside : part.state;
-                    dst.inside.Resolve(inside);
+                    if (replace) {
+                        dst.inside.Assign(inside);
+                    } else {
+                        dst.inside.Resolve(inside);
+                    }
                 }
                 ++pos;
             }
@@ -351,16 +358,21 @@ void AccessContext::ResolveAccessRangeImpl(const AccessRange& range, const Acces
         const AccessRange part_range(begin, std::min(range.end, pos->first.end));
         const AccessMapEntry& entry = pos->second;
         if (recurse && entry.HasGaps() && !subpass_barriers_.empty()) {
-            entry.Visit(part_range, [&](const AccessRange& span, const AccessState* state) {
-                if (state) {
-                    AccessState source(*state);
-                    transform(source);
-                    ResolveEntry(span, AccessMapEntry(source), resolve_context);
-                } else {
-                    ResolveGapsRecursePrev(span, resolve_context, infill, barrier_action);
-                }
-                return false;
+            AccessContext inherited;
+            ResolveGapsRecursePrev(part_range, inherited, infill, barrier_action);
+            AccessMapEntry local(entry);
+            local.VisitStates([&](AccessState& state) {
+                transform(state);
+                state.next_global_barrier_index = 0;
             });
+            // Local history replaces inherited history only where a local branch is present
+            ResolveEntry(part_range, local, inherited, true);
+            for (const auto& [bounds, effective] : inherited.access_state_map_) {
+                AccessMapEntry source(effective);
+                source.VisitStates(
+                    [&](AccessState& state) { state.next_global_barrier_index = resolve_context.GetGlobalBarrierCount(); });
+                ResolveEntry(bounds, source, resolve_context);
+            }
         } else {
             AccessMapEntry source(entry);
             source.Clip(part_range);

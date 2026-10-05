@@ -345,7 +345,8 @@ class AccessContext {
 
     void ResolveAccessRangeImpl(const AccessRange& range, const AccessStateFunction& barrier_action, AccessContext& resolve_context,
                                 bool recurse, bool infill) const;
-    void ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination) const;
+    void ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination,
+                      bool replace = false) const;
 
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
