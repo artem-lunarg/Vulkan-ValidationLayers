@@ -51,8 +51,7 @@ void AccessContext::InitFrom(uint32_t subpass, VkQueueFlags queue_flags,
     dst_external_ = SubpassBarrier(*this, queue_flags, info.barrier_to_external, queue_id);
 }
 
-void CollectBarriersFunctor::operator()(const Iterator& pos) const {
-    AccessState& access_state = pos->second;
+void CollectBarriersFunctor::operator()(AccessState& access_state) const {
     access_context.ApplyGlobalBarriers(access_state);
     access_state.CollectPendingBarriers(barrier_scope, barrier, layout_transition, layout_transition_handle_index,
                                         pending_barriers);
@@ -191,6 +190,17 @@ void AccessContext::Trim() {
 void AccessContext::AddReferencedTags(ResourceUsageTagSet& used) const {
     for (const auto& [range, access] : access_state_map_) {
         access.GatherReferencedTags(used);
+    }
+}
+
+void AccessContext::EraseRange(const AccessRange& range) {
+    auto pos = access_state_map_.LowerBound(range.begin);
+    while (pos != access_state_map_.end() && pos->first.begin < range.end) {
+        if (range.includes(pos->first)) {
+            pos = access_state_map_.Erase(pos);
+        } else {
+            ++pos;
+        }
     }
 }
 
