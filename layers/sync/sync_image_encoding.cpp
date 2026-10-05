@@ -197,6 +197,58 @@ void ImageRangeEncoder::Decode(const VkImageSubresource& subres, const IndexType
     out_offset.x = static_cast<int32_t>(static_cast<double>(decode) / texel_sizes_[LowerBoundFromMask(subres.aspectMask)]);
 }
 
+StridedRange::IndexRange StridedRange::NextSpan(IndexRange range, bool& inside) const {
+    assert(count > 0);
+    inside = false;
+    if (range.empty()) {
+        return {};
+    }
+    if (range.begin < base) {
+        return {range.begin, std::min(range.end, base)};
+    }
+    const IndexType end = Bounds().end;
+    if (range.begin >= end) {
+        return range;
+    }
+    if (width == stride) {
+        inside = true;
+        return {range.begin, std::min(range.end, end)};
+    }
+    const IndexType row = (range.begin - base) / stride;
+    const IndexType row_begin = base + row * stride;
+    const IndexType row_end = row_begin + width;
+
+    inside = range.begin < row_end;
+
+    const IndexType span_end = inside ? row_end : row_begin + stride;
+    return {range.begin, std::min(range.end, span_end)};
+}
+
+StridedRange::IndexRange StridedRange::FirstIntersection(IndexRange range) const {
+    if (range.empty()) {
+        return range;
+    }
+    bool inside;
+    const IndexRange span = NextSpan(range, inside);
+    if (inside) {
+        return span;
+    }
+    // If range lies entirely in the gap, span.end == range.end and the result is empty.
+    // Otherwise return the next segment, limited by range.end
+    return NextSpan({span.end, range.end}, inside);
+}
+
+StridedRange::IndexRange StridedRange::FirstOutside(IndexRange range) const {
+    bool inside;
+    const IndexRange span = NextSpan(range, inside);
+    if (!inside) {
+        return span;
+    }
+    // If range lies entirely in the segment, span.end == range.end and the result is empty.
+    // Otherwise return the next gap, limited by range.end
+    return NextSpan({span.end, range.end}, inside);
+}
+
 inline VkImageSubresourceRange GetRemaining(const VkImageSubresourceRange& full_range, VkImageSubresourceRange subres_range) {
     subres_range.levelCount = GetEffectiveLevelCount(subres_range, full_range.levelCount);
     subres_range.layerCount = GetEffectiveLayerCount(subres_range, full_range.layerCount);
@@ -507,6 +559,33 @@ void ImageRangeGenerator::SetUpIncrementer(bool all_width, bool all_height, bool
     } else {
         SetUpSubresIncrementer();
     }
+}
+
+std::optional<StridedRange> ImageRangeGenerator::GetStridedRange() const {
+    if (set_initial_pos_fn_ != &ImageRangeGenerator::SetInitialPosFullOffset) {
+        return {};
+    }
+    // Return a strided range only if it reproduces every range this generator emits:
+    // a) the generator must be at the start of the strided sequence
+    if (mip_index_ || incr_state_.y_index || incr_state_.layer_z_index) {
+        return {};
+    }
+    // b) only one aspect and one layer or slice form a single strided sequence
+    if (!IsSingleBitSet(subres_range_.aspectMask) || incr_state_.layer_z_count > incr_state_.layer_z_step || !incr_state_.y_step) {
+        return {};
+    }
+    const IndexType width = pos_.size();
+    const IndexType stride = incr_state_.incr_y;
+    // c) rows must not overlap
+    if (width >= stride) {
+        return {};
+    }
+
+    const uint32_t count = (incr_state_.y_count + incr_state_.y_step - 1) / incr_state_.y_step;
+    if (count < 4) {
+        return {};  // use regular ranges if we have only a few rows
+    }
+    return StridedRange{pos_.begin, width, stride, count};
 }
 
 ImageRangeGenerator& ImageRangeGenerator::operator++() {

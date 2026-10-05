@@ -20,6 +20,7 @@
 
 #include "containers/small_vector.h"
 #include "state_tracker/subresource_encoding.h"
+#include <optional>
 #include <vector>
 
 namespace vvl {
@@ -88,6 +89,39 @@ class ImageRangeEncoder : public vvl::SubresourceEncoder {
     bool is_compressed_;
 };
 
+// Sequence of equally sized segments separated by gaps
+struct StridedRange {
+    using IndexType = ImageRangeEncoder::IndexType;
+    using IndexRange = ImageRangeEncoder::IndexRange;
+
+    IndexType base = 0;    // start address of the first segment
+    IndexType width = 0;   // byte size of each segment
+    IndexType stride = 0;  // byte distance between consecutive segment starts
+    uint32_t count = 0;    // number of segments
+
+    bool operator==(const StridedRange& other) const {
+        return base == other.base && width == other.width && stride == other.stride && count == other.count;
+    }
+
+    IndexRange Bounds() const {
+        assert(count > 0);
+        return IndexRange(base, base + (count - 1) * stride + width);
+    }
+
+    // Return the first covered segment or gap within range.
+    // Set inside to true for a covered segment
+    IndexRange NextSpan(IndexRange range, bool& inside) const;
+
+    // Return the first part of range inside a segment, or an empty range if none
+    IndexRange FirstIntersection(IndexRange range) const;
+
+    // Return the first part of range inside a gap, or an empty range if none
+    IndexRange FirstOutside(IndexRange range) const;
+
+    bool Intersects(IndexRange range) const { return !FirstIntersection(range).empty(); }
+    bool Covers(IndexRange range) const { return FirstOutside(range).empty(); }
+};
+
 class ImageRangeGenerator {
   public:
     using IndexType = ImageRangeEncoder::IndexType;
@@ -106,6 +140,7 @@ class ImageRangeGenerator {
     const IndexRange* operator->() const { return &pos_; }
     ImageRangeGenerator& operator++();
     ImageRangeGenerator& operator=(const ImageRangeGenerator&) = default;
+    std::optional<StridedRange> GetStridedRange() const;
 
   private:
     bool Convert2DCompatibleTo3D();

@@ -98,6 +98,9 @@ void AccessContextStats::UpdateMax(const AccessContextStats& cur_stats) {
     UPDATE_MAX(access_states);
     UPDATE_MAX(read_states);
     UPDATE_MAX(write_states);
+    UPDATE_MAX(map_entries);
+    UPDATE_MAX(patterned_entries);
+    UPDATE_MAX(pattern_allocation_size);
     UPDATE_MAX(access_states_with_multiple_reads);
     UPDATE_MAX(access_states_with_dynamic_allocations);
     UPDATE_MAX(access_states_dynamic_allocation_size);
@@ -106,10 +109,16 @@ void AccessContextStats::UpdateMax(const AccessContextStats& cur_stats) {
 
 void UpdateAccessMapStats(const AccessMap& access_map, AccessContextStats& stats) {
     stats.access_contexts += 1;
-    stats.access_states += (uint32_t)access_map.Size();
+    stats.map_entries += static_cast<uint32_t>(access_map.Size());
     for (const auto& entry : access_map) {
-        const AccessState& access_state = entry.second;
-        access_state.UpdateStats(stats);
+        if (entry.second.strided_access) {
+            ++stats.patterned_entries;
+            stats.pattern_allocation_size += sizeof(AccessMapEntry::StridedAccess);
+        }
+        entry.second.VisitStates([&stats](const AccessState& access_state) {
+            ++stats.access_states;
+            access_state.UpdateStats(stats);
+        });
     }
 }
 
@@ -211,6 +220,13 @@ std::string Stats::CreateReport() {
         ss << std::setw(15) << stats.access_states_dynamic_allocation_size;
         ss << "\n";
     };
+    auto print_access_map_stats = [&ss](const char* context_type, const AccessContextStats& stats) {
+        const uint64_t payload_bytes = sizeof(AccessMapEntry) * uint64_t(stats.map_entries) + stats.pattern_allocation_size;
+        const uint64_t representation_overhead = payload_bytes - sizeof(AccessState) * uint64_t(stats.access_states);
+        ss << context_type << ": entries " << stats.map_entries << ", patterned " << stats.patterned_entries
+           << ", pattern allocations (B) " << stats.pattern_allocation_size << ", representation overhead (B) "
+           << representation_overhead << "\n";
+    };
 
     ss << "-----------------------\n";
     ss << "Common stats                    count       max_count\n";
@@ -245,6 +261,15 @@ std::string Stats::CreateReport() {
     print_access_state_stats("CB", access_stats.max_cb_access_stats);
     print_access_state_stats("Queue", access_stats.max_queue_access_stats);
     print_access_state_stats("Subpass", access_stats.max_subpass_access_stats);
+
+    ss << "\nAccess map representation (excluding map nodes)\n";
+    print_access_map_stats("CB", access_stats.cb_access_stats);
+    print_access_map_stats("Queue", access_stats.queue_access_stats);
+    print_access_map_stats("Subpass", access_stats.subpass_access_stats);
+    ss << "\nMAX Access map representation\n";
+    print_access_map_stats("CB", access_stats.max_cb_access_stats);
+    print_access_map_stats("Queue", access_stats.max_queue_access_stats);
+    print_access_map_stats("Subpass", access_stats.max_subpass_access_stats);
 
     ss << "\n";
     ss << "Memory barriers          : " << barrier_stats.memory_barriers.u32 << "\n";

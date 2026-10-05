@@ -380,6 +380,7 @@ void BarrierSet::MakeImageMemoryBarriers(const SyncValidator& sync_state, VkQueu
 // to ensure independent barrier application
 //
 struct ApplySingleBufferBarrierFunctor {
+    const bool layout_transition = false;
     const AccessContext& access_context;
     const BarrierScope& barrier_scope;
     const SyncBarrier& barrier;
