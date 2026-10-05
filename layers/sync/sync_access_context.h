@@ -237,6 +237,7 @@ class AccessContext {
     void Reset();
 
     void Trim();
+    void Materialize() { access_state_map_.Materialize(kFullRange); }
     void AddReferencedTags(ResourceUsageTagSet& referenced) const;
 
     const AccessMap& GetAccessMap() const { return access_state_map_; }
@@ -324,6 +325,8 @@ class AccessContext {
 
   private:
     void ResetGlobalBarriers();
+    // Give absent pattern history local entries. Returns true when exact rows replaced the patterns
+    bool ResolveAbsentHistory(const AccessRange& range);
 
     // Resolve accesses from src contexts from all subpass dependencies including src external dependency
     void ResolveSubpassDependencies(const AccessRange& range, AccessContext& resolve_context, bool infill,
@@ -342,7 +345,7 @@ class AccessContext {
 
     void ResolveAccessRangeImpl(const AccessRange& range, const AccessStateFunction& barrier_action, AccessContext& resolve_context,
                                 bool recurse, bool infill) const;
-    void ResolveEntry(const AccessRange& range, const AccessState& source, AccessContext& destination) const;
+    void ResolveEntry(const AccessRange& range, const AccessMapEntry& source, AccessContext& destination) const;
 
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
@@ -358,6 +361,9 @@ class AccessContext {
     AccessMap::iterator DoUpdateAccessState(AccessMap::iterator pos, const AccessRange& range, SyncAccessIndex access_index,
                                             const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
                                             QueueId queue_id = kQueueIdInvalid);
+
+    bool UpdateStridedAccess(const StridedRange& strided, SyncAccessIndex access_index, const AttachmentAccess& attachment_access,
+                             ResourceUsageTagEx tag_ex, SyncFlags flags, QueueId queue_id);
 
     // A recursive range walkers for hazard detection, first for the current context
     // and then walks the DAG of the contexts for subpasses
@@ -437,7 +443,9 @@ struct ActionToOpsAdapter {
             update(infill);
         }
     }
-    void update(const AccessMap::iterator& pos) const { action(pos->second); }
+    void update(const AccessMap::iterator& pos) const {
+        pos->second.VisitStates([&](AccessState& state) { action(state); });
+    }
     const Action& action;
 };
 
@@ -459,6 +467,10 @@ void AccessContext::UpdateMemoryAccessState(const Action& action, RangeGen& rang
     ActionToOpsAdapter<Action> ops{action};
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
+        if (action.layout_transition) {
+            ResolveAbsentHistory(*range_gen);
+            pos = access_state_map_.LowerBound(range_gen->begin);
+        }
         pos = InfillUpdateRange(access_state_map_, pos, *range_gen, ops);
     }
 }
@@ -467,10 +479,28 @@ template <typename Predicate>
 void AccessContext::EraseIf(Predicate&& pred) {
     auto pos = access_state_map_.begin();
     while (pos != access_state_map_.end()) {
-        if (pred(pos->second)) {
+        AccessMapEntry& entry = pos->second;
+        if (!entry.pattern) {
+            pos = pred(entry.state) ? access_state_map_.Erase(pos) : std::next(pos);
+            continue;
+        }
+        auto& pattern = *entry.pattern;
+        if (pattern.outside_present && pred(entry.state)) {
+            pattern.outside_present = false;
+        }
+        if (!pred(pattern.inside)) {
+            ++pos;
+        } else if (!pattern.outside_present) {
             pos = access_state_map_.Erase(pos);
         } else {
-            ++pos;
+            // Only the outside history survives. Preserve the predicate's decision across expansion
+            const AccessRange bounds = pos->first;
+            const auto shape = pattern.range;
+            access_state_map_.Materialize(bounds);
+            pos = access_state_map_.LowerBound(bounds.begin);
+            while (pos != access_state_map_.end() && pos->first.begin < bounds.end) {
+                pos = shape.Covers(pos->first) ? access_state_map_.Erase(pos) : std::next(pos);
+            }
         }
     }
 }

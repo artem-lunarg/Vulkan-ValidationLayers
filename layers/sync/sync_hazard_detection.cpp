@@ -19,25 +19,26 @@
 #include "sync/sync_image.h"
 #include "sync/sync_validation.h"
 #include "state_tracker/buffer_state.h"
+#include <type_traits>
 
 namespace syncval {
 
-// Execute Action for each map entry in the generated ranges until it returns true
+// Execute Action for each map entry in the generated ranges until it returns true.
 //
 // Action is const w.r.t. map
 // Action is allowed (assumed) to modify pos
 // Action must not advance pos for ranges strictly < pos->first
 // Action must handle range strictly less than pos->first correctly
 // Action must handle pos == end correctly
-// Action is assumed to only require invocation once per map entry
-// Note: If Action invocations are heavyweight and inter-entry (gap) calls are not needed
-//       add a template or function parameter to skip them. TBD.
+// Uniform entries and matching patterns need only one invocation.
+// Other patterns can require an invocation for each generated range
 template <typename Action>
-bool ForEachEntryInRangesUntil(const AccessMap& map, ImageRangeGen& range_gen, Action& action) {
+bool ForEachEntryInRangesUntil(const AccessMap& map, ImageRangeGen& range_gen, Action& action, bool group_patterns = true) {
     using RangeType = ImageRangeGen::RangeType;
     using IndexType = RangeType::index_type;
     auto pos = map.LowerBound((*range_gen).begin);
     const auto end = map.end();
+    const auto query_pattern = group_patterns ? range_gen.GetStridedRange() : std::nullopt;
     IndexType skip_limit = 0;
     for (; range_gen->non_empty() && pos != end; ++range_gen) {
         RangeType range = *range_gen;
@@ -64,17 +65,21 @@ bool ForEachEntryInRangesUntil(const AccessMap& map, ImageRangeGen& range_gen, A
             assert(pos == map.LowerBound(range.begin));
         }
 
-        // If the range intersects pos->first, consider Action performed for that map entry, and
-        // make sure not to call Action for this pos for any subsequent ranges
-        skip_limit = range.end > pos->first.begin ? pos->first.end : 0U;
+        // Uniform entries and matching patterns can be skipped after the first intersecting range
+        const bool grouped = !pos->second.pattern || (query_pattern && pos->second.pattern->range == *query_pattern);
+        skip_limit = grouped && range.end > pos->first.begin ? pos->first.end : 0U;
 
         // Action is allowed to alter pos but shouldn't do so if range is strictly < pos->first
-        if (action(range, end, pos)) return true;
+        if (action(range, end, pos)) {
+            return true;
+        }
     }
 
     // Action needs to handle the "at end " condition (and can be useful for recursive actions)
     for (; range_gen->non_empty(); ++range_gen) {
-        if (action(*range_gen, end, pos)) return true;
+        if (action(*range_gen, end, pos)) {
+            return true;
+        }
     }
 
     return false;
@@ -205,7 +210,10 @@ class EventBarrierHazardDetector {
           scope_end_(event_scope.end()) {}
 
     HazardResult Detect(AccessRange range, const AccessState& access) {
-        // Piece together event-scope coverage of the supplied range
+        // Generated queries can intersect the same virtual span more than once
+        if (range.end <= checked_until_) return {};
+        range.begin = std::max(range.begin, checked_until_);
+        checked_until_ = range.end;
         HazardResult hazard;
 
         bool in_scope = AdvanceScope(range);
@@ -248,7 +256,7 @@ class EventBarrierHazardDetector {
     ResourceAddress ScopeBegin() const { return scope_pos_->first.begin; }
     ResourceAddress ScopeEnd() const { return scope_pos_->first.end; }
     const AccessRange& ScopeRange() const { return scope_pos_->first; }
-    const AccessState& ScopeState() const { return scope_pos_->second; }
+    const AccessState& ScopeState() const { return scope_pos_->second.state; }
 
     bool AdvanceScope(const AccessRange& range) {
         // Note: non_empty is (valid && !empty), so don't change !non_empty to empty...
@@ -270,7 +278,31 @@ class EventBarrierHazardDetector {
     const ResourceUsageTag scope_tag_;
     AccessContext::ScopeMap::const_iterator scope_pos_;
     AccessContext::ScopeMap::const_iterator scope_end_;
+    ResourceAddress checked_until_ = 0;
 };
+
+// Range-insensitive detectors need each selected leaf only once, in first-address order.
+// Exact traversal also exposes gaps when predecessor contexts must supply their history
+template <typename Action>
+bool VisitForDetection(const AccessMapEntry& entry, const AccessRange& range, const Action& action, bool group_states,
+                       bool preserve_gaps) {
+    if (!entry.pattern) {
+        return action(range, &entry.state);
+    }
+    const auto& pattern = *entry.pattern;
+    if (!group_states || (preserve_gaps && entry.HasGaps())) {
+        return entry.Visit(range, action);
+    }
+
+    const AccessRange inside = pattern.range.FirstIntersection(range);
+    const AccessRange outside = pattern.range.FirstOutside(range);
+    const auto visit_inside = [&]() { return inside.non_empty() && action(inside, &pattern.inside); };
+    const auto visit_outside = [&]() { return outside.non_empty() && pattern.outside_present && action(outside, &entry.state); };
+    if (outside.non_empty() && (inside.empty() || outside.begin < inside.begin)) {
+        return visit_outside() || visit_inside();
+    }
+    return visit_inside() || visit_outside();
+}
 
 HazardResult AccessContext::DetectHazard(const vvl::Buffer& buffer, SyncAccessIndex access_index, const AccessRange& range) const {
     if (!SimpleBinding(buffer)) {
@@ -473,7 +505,8 @@ HazardResult AccessContext::DetectHazardGeneratedRangeGen(Detector& detector, Im
         hazard = DetectHazardOneRange(detector, detect_prev, pos, end, range);
         return hazard.IsHazard();
     };
-    ForEachEntryInRangesUntil(access_state_map_, range_gen, do_detect_hazard_range);
+    ForEachEntryInRangesUntil(access_state_map_, range_gen, do_detect_hazard_range,
+                              !std::is_same_v<Detector, EventBarrierHazardDetector>);
     return hazard;
 }
 
@@ -483,8 +516,14 @@ HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, const Ac
     assert(range.non_empty());
     HazardResult hazard;
     auto pos = access_state_map_.LowerBound(range.begin);
-    if (pos != access_state_map_.end() && pos->first.begin < range.end) {
-        hazard = detector.DetectAsync(pos->first, pos->second, async_tag, async_queue_id);
+    while (pos != access_state_map_.end() && pos->first.begin < range.end) {
+        const auto detect = [&](const AccessRange& span, const AccessState* state) {
+            if (!state) return false;
+            hazard = detector.DetectAsync(span, *state, async_tag, async_queue_id);
+            return true;
+        };
+        if (pos->second.Visit(pos->first & range, detect)) break;
+        ++pos;
     }
     return hazard;
 }
@@ -498,8 +537,14 @@ HazardResult AccessContext::DetectAsyncHazard(const Detector& detector, ImageRan
     auto do_async_hazard_check = [&detector, async_tag, async_queue_id, &hazard](const ImageRangeGen::RangeType& range,
                                                                                  const ConstIterator& end, ConstIterator& pos) {
         while (pos != end && pos->first.begin < range.end) {
-            hazard = detector.DetectAsync(pos->first, pos->second, async_tag, async_queue_id);
-            if (hazard.IsHazard()) return true;
+            const auto detect = [&](const AccessRange& span, const AccessState* state) {
+                if (state) hazard = detector.DetectAsync(span, *state, async_tag, async_queue_id);
+                return hazard.IsHazard();
+            };
+            if (VisitForDetection(pos->second, pos->first & range, detect, true, false)) {
+                return true;
+            }
+            if (pos->first.end > range.end) break;
             ++pos;
         }
         return false;
@@ -529,8 +574,27 @@ HazardResult AccessContext::DetectHazardOneRange(Detector& detector, bool detect
             gap.begin = pos->first.end;
         }
 
-        hazard = detector.Detect(pos->first, pos->second);
+        const auto& entry = pos->second;
+        if (!entry.pattern) {
+            hazard = detector.Detect(pos->first, entry.state);
+        } else {
+            const auto detect = [&](const AccessRange& span, const AccessState* state) {
+                const AccessRange intersection = span & range;
+                if (intersection.empty()) return false;
+                if (state) {
+                    hazard = detector.Detect(span, *state);
+                } else if (detect_prev) {
+                    hazard = DetectPreviousHazard(detector, intersection);
+                }
+                return hazard.IsHazard();
+            };
+            constexpr bool group_states = !std::is_same_v<Detector, EventBarrierHazardDetector>;
+            const AccessRange detect_range = group_states ? (pos->first & range) : pos->first;
+            const bool preserve_gaps = detect_prev && !subpass_barriers_.empty();
+            VisitForDetection(entry, detect_range, detect, group_states, preserve_gaps);
+        }
         if (hazard.IsHazard()) return hazard;
+        if (pos->first.end > range.end) break;
         ++pos;
     }
 
@@ -553,14 +617,9 @@ HazardResult AccessContext::DetectPreviousHazard(Detector& detector, const Acces
     AccessContext descent_context;
     ResolveSubpassDependencies(range, descent_context, false);
 
-    AccessMap& descent_map = descent_context.access_state_map_;
-    for (auto prev = descent_map.begin(); prev != descent_map.end(); ++prev) {
-        HazardResult hazard = detector.Detect(prev->first, prev->second);
-        if (hazard.IsHazard()) {
-            return hazard;
-        }
-    }
-    return {};
+    const AccessMap& descent_map = descent_context.access_state_map_;
+    auto prev = descent_map.begin();
+    return DetectHazardOneRange(detector, false, prev, descent_map.end(), range);
 }
 
 }  // namespace syncval

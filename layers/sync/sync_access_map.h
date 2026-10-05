@@ -22,15 +22,82 @@
 
 #include "sync/sync_common.h"
 #include "sync/sync_access_state.h"
+#include "sync/sync_image_encoding.h"
 #include "containers/range.h"
 #include "containers/container_utils.h"
 
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <memory>
 #include <utility>
 
 namespace syncval {
+
+// A bounded piecewise state. The history outside the pattern can be absent, which keeps the gap semantics
+// of the addresses between the rows
+struct AccessMapEntry {
+    struct PatternState {
+        StridedRange range;
+        AccessState inside;
+        bool outside_present = true;
+
+        PatternState(const StridedRange& range, const AccessState& inside, bool outside_present)
+            : range(range), inside(inside), outside_present(outside_present) {}
+    };
+
+    AccessState state;
+    std::unique_ptr<PatternState> pattern;
+
+    AccessMapEntry(const AccessState& state) : state(state) {}
+    AccessMapEntry(const AccessMapEntry& other);
+    AccessMapEntry(AccessMapEntry&& other) noexcept : state(std::move(other.state)), pattern(std::move(other.pattern)) {}
+    void SetUniform(const AccessState& value);
+    void Clip(const AccessRange& range);
+    bool HasGaps() const { return pattern && !pattern->outside_present; }
+    bool HasAny(const AccessRange& range) const {
+        return !pattern || pattern->range.Intersects(range) ||
+               (pattern->outside_present && pattern->range.FirstOutside(range).non_empty());
+    }
+    bool CanMerge(const AccessMapEntry& other) const;
+
+    template <typename Action>
+    void VisitStates(const Action& action) {
+        if (!pattern || pattern->outside_present) {
+            action(state);
+        }
+        if (pattern) {
+            action(pattern->inside);
+        }
+    }
+    template <typename Action>
+    void VisitStates(const Action& action) const {
+        if (!pattern || pattern->outside_present) {
+            action(static_cast<const AccessState&>(state));
+        }
+        if (pattern) {
+            action(static_cast<const AccessState&>(pattern->inside));
+        }
+    }
+
+    // Enumerate exact spans in address order. Absent history is reported as a null state
+    template <typename Action>
+    bool Visit(AccessRange remaining, const Action& action) const {
+        if (!pattern) {
+            return action(remaining, &state);
+        }
+        while (remaining.non_empty()) {
+            bool inside;
+            const AccessRange span = pattern->range.NextSpan(remaining, inside);
+            const AccessState* value = inside ? &pattern->inside : (pattern->outside_present ? &state : nullptr);
+            if (action(span, value)) {
+                return true;
+            }
+            remaining.begin = span.end;
+        }
+        return false;
+    }
+};
 
 // There are two types of comparisons of AccessMap ranges:
 //  a)  Two non-empty, non-overlapping ranges.
@@ -50,7 +117,7 @@ struct AccessMapCompare {
 
 // Implements an ordered map of non-overlapping, non-empty ranges
 class AccessMap {
-    using ImplMap = std::map<AccessRange, AccessState, AccessMapCompare>;
+    using ImplMap = std::map<AccessRange, AccessMapEntry, AccessMapCompare>;
 
   public:
     using index_type = ResourceAddress;
@@ -79,16 +146,18 @@ class AccessMap {
     // Merge at least two entries in [first, last), retaining the last entry's state.
     // The caller must ensure the entries are adjacent and their states can be merged.
     iterator Merge(iterator first, iterator last);
-    iterator Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state);
+    iterator Insert(const_iterator hint, const AccessRange& range, const AccessMapEntry& access_state);
     iterator InfillGap(const_iterator range_lower_bound, const AccessRange& range, const AccessState& access_state);
     void InfillGaps(const AccessRange& range, const AccessState& access_state);
     iterator Split(const iterator split_it, const index_type& index);
+
+    void Materialize(AccessRange range);
 
     AccessMap() : impl_map_(AccessMapCompare()) {}
 
   private:
     // No replacement insert
-    std::pair<iterator, bool> Insert(const AccessRange& range, const AccessState& access_state);
+    std::pair<iterator, bool> Insert(const AccessRange& range, const AccessMapEntry& access_state);
 
   private:
     ImplMap impl_map_;

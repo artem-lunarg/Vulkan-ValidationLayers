@@ -19,6 +19,49 @@
 
 namespace syncval {
 
+AccessMapEntry::AccessMapEntry(const AccessMapEntry& other) : state(other.state) {
+    if (other.pattern) pattern = std::make_unique<PatternState>(*other.pattern);
+}
+
+void AccessMapEntry::SetUniform(const AccessState& value) {
+    state.Assign(value);
+    pattern.reset();
+}
+
+void AccessMapEntry::Clip(const AccessRange& range) {
+    if (!pattern) {
+        return;
+    }
+    if (pattern->range.Covers(range)) {
+        SetUniform(pattern->inside);
+    } else if (pattern->outside_present && !pattern->range.Intersects(range)) {
+        pattern.reset();
+    }
+}
+
+bool AccessMapEntry::CanMerge(const AccessMapEntry& other) const {
+    return !pattern && !other.pattern && state.next_global_barrier_index == other.state.next_global_barrier_index &&
+           state == other.state;
+}
+
+void AccessMap::Materialize(AccessRange range) {
+    auto pos = LowerBound(range.begin);
+    while (pos != end() && pos->first.begin < range.end) {
+        if (!pos->second.pattern) {
+            ++pos;
+            continue;
+        }
+        pos = syncval::Split(pos, *this, range);
+        const AccessRange bounds = pos->first;
+        AccessMapEntry entry(pos->second);
+        pos = Erase(pos);
+        entry.Visit(bounds, [&](const AccessRange& span, const AccessState* state) {
+            if (state) Insert(pos, span, *state);
+            return false;
+        });
+    }
+}
+
 void AccessMap::Assign(const AccessMap& other) {
     auto temp_copy(other.impl_map_);
     impl_map_.swap(temp_copy);
@@ -60,7 +103,7 @@ AccessMap::iterator AccessMap::Merge(iterator first, iterator last) {
     return impl_map_.insert(last, std::move(node));
 }
 
-AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state) {
+AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& range, const AccessMapEntry& access_state) {
     assert(range.non_empty());
     bool hint_open;
     const_iterator impl_next = hint;
@@ -88,7 +131,7 @@ AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& ra
     return iterator(impl_insert);
 }
 
-std::pair<AccessMap::iterator, bool> AccessMap::Insert(const AccessRange& range, const AccessState& access_state) {
+std::pair<AccessMap::iterator, bool> AccessMap::Insert(const AccessRange& range, const AccessMapEntry& access_state) {
     assert(range.non_empty());
 
     // Look for range conflicts (and an insertion point, which makes the lower_bound *not* wasted work)
@@ -118,12 +161,20 @@ void AccessMap::InfillGaps(const AccessRange& range, const AccessState& access_s
             Insert(pos, {begin, gap_end}, access_state);
             begin = gap_end;
         } else {
-            begin = std::min(range.end, pos->first.end);
+            const AccessRange part(begin, std::min(range.end, pos->first.end));
+            if (pos->second.HasGaps()) {
+                pos = syncval::Split(pos, *this, part);
+                auto& entry = pos->second;
+                if (entry.pattern) {
+                    entry.state.Assign(access_state);
+                    entry.pattern->outside_present = true;
+                }
+            }
+            begin = part.end;
             ++pos;
         }
     }
 }
-
 AccessMap::iterator AccessMap::Split(const iterator split_it, const index_type& index) {
     const auto range = split_it->first;
 
@@ -149,10 +200,12 @@ AccessMap::iterator AccessMap::Split(const iterator split_it, const index_type& 
     // NOTE: we insert from upper to lower because that's what emplace_hint can do in constant time
     assert(impl_map_.find(upper_range) == impl_map_.end());
     next_it = impl_map_.emplace_hint(next_it, std::make_pair(upper_range, value));
+    next_it->second.Clip(upper_range);
 
     // Move value to the lower range (we can move since the upper range already got a copy of value)
     assert(impl_map_.find(lower_range) == impl_map_.end());
     next_it = impl_map_.emplace_hint(next_it, std::make_pair(lower_range, std::move(value)));
+    next_it->second.Clip(lower_range);
 
     // Iterator to the beginning of the lower range
     return next_it;
@@ -185,7 +238,7 @@ void Consolidate(AccessMap& map) {
 
     // To be included in a merge range there must be no gap in the AccessRange space, and the mapped_type values must match
     auto can_merge = [](const It& last, const It& cur) {
-        return cur->first.begin == last->first.end && cur->second == last->second;
+        return cur->first.begin == last->first.end && cur->second.CanMerge(last->second);
     };
 
     while (current != map_end) {
