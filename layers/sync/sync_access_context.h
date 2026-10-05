@@ -339,6 +339,10 @@ class AccessContext {
     void ResolveAccessRangeRecursePrev(const AccessRange& range, const AccessStateFunction& barrier_action,
                                        AccessContext& resolve_context, bool infill) const;
 
+    void ResolveAccessRangeImpl(const AccessRange& range, const AccessStateFunction& barrier_action, AccessContext& resolve_context,
+                                bool recurse, bool infill) const;
+    void ResolveEntry(const AccessRange& range, const AccessState& source, AccessContext& destination) const;
+
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
     // Not intended for subpass layout transition, as the pending state handling is more complex

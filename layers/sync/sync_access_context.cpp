@@ -236,112 +236,64 @@ void AccessContext::ResolveSubpassDependencies(const AccessRange& range, AccessC
 
 void AccessContext::ResolveAccessRange(const AccessRange& range, const AccessStateFunction& barrier_action,
                                        AccessContext& resolve_context) const {
-    if (!range.non_empty()) {
-        return;
-    }
-    AccessMap& resolve_map = resolve_context.access_state_map_;
-
-    ParallelIterator current(resolve_map, access_state_map_, range.begin);
-    while (current.range.non_empty() && range.includes(current.range.begin)) {
-        const auto current_range = current.range & range;
-        if (current.pos_B.inside_lower_bound_range) {
-            const auto& src_pos = current.pos_B.lower_bound;
-
-            // Create a copy of the source access state (source is this context, destination is the resolve context).
-            // Then do the following steps:
-            //  a) apply not yet applied global barriers
-            //  b) update global barrier index to ensure global barriers from the resolve context are not applied
-            //  c) apply barrier action
-            AccessState src_access = src_pos->second;
-            ApplyGlobalBarriers(src_access);                                                 // a
-            src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();  // b
-            barrier_action(&src_access);                                                     // c
-
-            if (current.pos_A.inside_lower_bound_range) {
-                const auto trimmed = Split(current.pos_A.lower_bound, resolve_map, current_range);
-                AccessState& dst_state = trimmed->second;
-                resolve_context.ApplyGlobalBarriers(dst_state);
-                dst_state.Resolve(src_access);
-                current.OnCurrentRangeModified(trimmed);
-            } else {
-                auto inserted = resolve_map.Insert(current.pos_A.lower_bound, current_range, src_access);
-                current.OnCurrentRangeModified(inserted);
-            }
-        }
-        if (current.range.non_empty()) {
-            current.NextRange();
-        }
-    }
+    ResolveAccessRangeImpl(range, barrier_action, resolve_context, false, false);
 }
 
 void AccessContext::ResolveAccessRangeRecursePrev(const AccessRange& range, const AccessStateFunction& barrier_action,
                                                   AccessContext& resolve_context, bool infill) const {
+    ResolveAccessRangeImpl(range, barrier_action, resolve_context, true, infill);
+}
+
+void AccessContext::ResolveEntry(const AccessRange& range, const AccessState& source, AccessContext& destination) const {
+    AccessMap& map = destination.access_state_map_;
+    auto pos = map.LowerBound(range.begin);
+    ResourceAddress begin = range.begin;
+    while (begin < range.end) {
+        const bool present = pos != map.end() && pos->first.includes(begin);
+        const ResourceAddress end =
+            std::min(range.end, pos == map.end() ? range.end : (present ? pos->first.end : pos->first.begin));
+        const AccessRange part_range(begin, end);
+        if (!present) {
+            auto inserted = map.Insert(pos, part_range, source);
+            pos = std::next(inserted);
+        } else {
+            pos = Split(pos, map, part_range);
+            AccessState& target = pos->second;
+            destination.ApplyGlobalBarriers(target);
+            target.Resolve(source);
+            ++pos;
+        }
+        begin = end;
+    }
+}
+
+void AccessContext::ResolveAccessRangeImpl(const AccessRange& range, const AccessStateFunction& barrier_action,
+                                           AccessContext& resolve_context, bool recurse, bool infill) const {
     if (!range.non_empty()) {
         return;
     }
-    AccessMap& resolve_map = resolve_context.access_state_map_;
-
-    ParallelIterator current(resolve_map, access_state_map_, range.begin);
-    while (current.range.non_empty() && range.includes(current.range.begin)) {
-        const auto current_range = current.range & range;
-        if (current.pos_B.inside_lower_bound_range) {
-            const auto& src_pos = current.pos_B.lower_bound;
-
-            // Create a copy of the source access state (source is this context, destination is the resolve context).
-            // Then do the following steps:
-            //  a) apply not yet applied global barriers
-            //  b) update global barrier index to ensure global barriers from the resolve context are not applied
-            //  c) apply barrier action
-            AccessState src_access = src_pos->second;
-            ApplyGlobalBarriers(src_access);                                                 // a
-            src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();  // b
-            barrier_action(&src_access);                                                     // c
-
-            if (current.pos_A.inside_lower_bound_range) {
-                const auto trimmed = Split(current.pos_A.lower_bound, resolve_map, current_range);
-                AccessState& dst_state = trimmed->second;
-                resolve_context.ApplyGlobalBarriers(dst_state);
-                dst_state.Resolve(src_access);
-                current.OnCurrentRangeModified(trimmed);
-            } else {
-                auto inserted = resolve_map.Insert(current.pos_A.lower_bound, current_range, src_access);
-                current.OnCurrentRangeModified(inserted);
+    auto pos = access_state_map_.LowerBound(range.begin);
+    ResourceAddress begin = range.begin;
+    const auto transform = [&](AccessState& state) {
+        ApplyGlobalBarriers(state);
+        state.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();
+        barrier_action(&state);
+    };
+    while (begin < range.end) {
+        if (pos == access_state_map_.end() || begin < pos->first.begin) {
+            const ResourceAddress end = std::min(range.end, pos == access_state_map_.end() ? range.end : pos->first.begin);
+            if (recurse) {
+                ResolveGapsRecursePrev({begin, end}, resolve_context, infill, barrier_action);
             }
-        } else {  // Descend to fill this gap
-            AccessRange recurrence_range = current_range;
-            // The current context is empty for the current_range, so recur to fill the gap.
-            // Since we will be recurring back up the DAG, expand the gap descent to cover the
-            // full range for which B is not valid, to minimize that recurrence
-            if (current.pos_B.lower_bound == access_state_map_.end()) {
-                recurrence_range.end = range.end;
-            } else {
-                recurrence_range.end = std::min(range.end, current.pos_B.lower_bound->first.begin);
-            }
-
-            // Note that resolve_context over the recurrence_range may contain both empty and
-            // non-empty entries; only the current context has a continuous empty entry over
-            // this range. Therefore, the next call must iterate over potentially multiple
-            // ranges in resolve_context that cross the recurrence_range and fill the empty ones.
-            ResolveGapsRecursePrev(recurrence_range, resolve_context, infill, barrier_action);
-
-            // recurrence_range is already processed and it can be larger than the current_range.
-            // The NextRange might move to the range that is still inside recurrence_range, but we
-            // need the range that goes after recurrence_range. Seek to the end of recurrence_range,
-            // so NextRange will get the expected range.
-            // TODO: it might be simpler to seek directly to recurrence_range.end without calling NextRange().
-            assert(recurrence_range.non_empty());
-            const auto seek_to = recurrence_range.end - 1;
-            current.SeekAfterModification(seek_to);
+            begin = end;
+            continue;
         }
-        if (current.range.non_empty()) {
-            current.NextRange();
-        }
-    }
-
-    // Infill the remainder, which is empty for both the current and resolve contexts
-    if (current.range.end < range.end) {
-        AccessRange trailing_fill_range = {current.range.end, range.end};
-        ResolveGapsRecursePrev(trailing_fill_range, resolve_context, infill, barrier_action);
+        const AccessRange part_range(begin, std::min(range.end, pos->first.end));
+        AccessState source(pos->second);
+        transform(source);
+        ResolveEntry(part_range, source, resolve_context);
+        begin = part_range.end;
+        ++pos;
     }
 }
 
