@@ -413,6 +413,11 @@ class AccessState {
     // If greater than 0, then all global barriers with smaller indices are already applied.
     uint32_t next_global_barrier_index = 0;
 
+    // Index of the encoded range and its inside history, or kNoIndex32 for uniform history.
+    // With an encoding, this state holds the history outside the encoded range within the map key.
+    // AccessMap owns the encoding and manages the index separately from access history copies
+    uint32_t range_encoding_index = vvl::kNoIndex32;
+
   private:
     // The most recent write.
     // NOTE: For reads, each must be "safe" relative to its prior write, so we need

@@ -22,15 +22,48 @@
 
 #include "sync/sync_common.h"
 #include "sync/sync_access_state.h"
+#include "sync/sync_image_encoding.h"
 #include "containers/range.h"
 #include "containers/container_utils.h"
 
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <memory>
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace syncval {
+
+// The map value holds the outside history. This record holds the history inside the encoded range
+struct AccessRangeEncoding {
+    StridedRange range;
+    AccessState inside;
+    bool outside_present;
+
+    AccessRangeEncoding(const StridedRange& range, const AccessState& inside, bool outside_present)
+        : range(range), inside(inside), outside_present(outside_present) {}
+
+    template <typename Action>
+    bool Visit(AccessRange remaining, const AccessState& outside, const Action& action) const {
+        while (remaining.non_empty()) {
+            bool is_inside;
+            const AccessRange span = range.NextSpan(remaining, is_inside);
+            const AccessState* state = is_inside ? &inside : (outside_present ? &outside : nullptr);
+            if (action(span, state)) {
+                return true;
+            }
+            remaining.begin = span.end;
+        }
+        return false;
+    }
+};
+
+inline bool CanMerge(const AccessState& left, const AccessState& right) {
+    return left.range_encoding_index == vvl::kNoIndex32 && right.range_encoding_index == vvl::kNoIndex32 &&
+           left.next_global_barrier_index == right.next_global_barrier_index && left == right;
+}
 
 // There are two types of comparisons of AccessMap ranges:
 //  a)  Two non-empty, non-overlapping ranges.
@@ -73,25 +106,81 @@ class AccessMap {
     const_iterator LowerBound(ResourceAddress range_begin) const;
     size_t Size() const { return impl_map_.size(); }
 
-    void Clear() { impl_map_.clear(); }
+    void Clear();
     iterator Erase(const iterator& pos);
     void Erase(iterator first, iterator last);
     // Merge at least two entries in [first, last), retaining the last entry's state.
     // The caller must ensure the entries are adjacent and their states can be merged.
     iterator Merge(iterator first, iterator last);
-    iterator Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state);
+    iterator Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state,
+                    const AccessRangeEncoding* encoding = nullptr);
     iterator InfillGap(const_iterator range_lower_bound, const AccessRange& range, const AccessState& access_state);
     void InfillGaps(const AccessRange& range, const AccessState& access_state);
     iterator Split(const iterator split_it, const index_type& index);
 
+    AccessRangeEncoding* GetEncoding(const AccessState& state) {
+        return state.range_encoding_index == vvl::kNoIndex32 ? nullptr : range_encodings_[state.range_encoding_index].get();
+    }
+    const AccessRangeEncoding* GetEncoding(const AccessState& state) const {
+        return state.range_encoding_index == vvl::kNoIndex32 ? nullptr : range_encodings_[state.range_encoding_index].get();
+    }
+    void SetEncoding(AccessState& state, const AccessRangeEncoding& encoding);
+    void ClearEncoding(AccessState& state);
+    void SetUniform(AccessState& state, const AccessState& value);
+    void Clip(AccessState& state, const AccessRange& range);
+    void Resolve(AccessState& state, const AccessState& other, const AccessRangeEncoding* encoding);
+    void Materialize(const AccessRange& range);
+    bool HasEncodings() const { return range_encodings_.size() != free_encoding_indices_.size(); }
+    bool HasGaps(const AccessState& state) const {
+        const AccessRangeEncoding* encoding = GetEncoding(state);
+        return encoding && !encoding->outside_present;
+    }
+
+    template <typename Action>
+    void VisitStates(AccessState& state, const Action& action) {
+        AccessRangeEncoding* encoding = GetEncoding(state);
+        if (!encoding || encoding->outside_present) {
+            action(state);
+        }
+        if (encoding) {
+            action(encoding->inside);
+        }
+    }
+
+    template <typename Action>
+    void VisitStates(const AccessState& state, const Action& action) const {
+        const AccessRangeEncoding* encoding = GetEncoding(state);
+        if (!encoding || encoding->outside_present) {
+            action(state);
+        }
+        if (encoding) {
+            action(encoding->inside);
+        }
+    }
+
+    // Visit exact spans, reporting absent history between encoded rows as a null state
+    template <typename Action>
+    bool Visit(AccessRange range, const AccessState& state, const Action& action) const {
+        const AccessRangeEncoding* encoding = GetEncoding(state);
+        if (!encoding) {
+            return action(range, &state);
+        }
+        return encoding->Visit(range, state, action);
+    }
+
     AccessMap() : impl_map_(AccessMapCompare()) {}
+    AccessMap(const AccessMap& other) { Assign(other); }
 
   private:
     // No replacement insert
-    std::pair<iterator, bool> Insert(const AccessRange& range, const AccessState& access_state);
+    std::pair<iterator, bool> Insert(const AccessRange& range, const AccessState& access_state,
+                                     const AccessRangeEncoding* encoding);
 
   private:
     ImplMap impl_map_;
+    // Pointees stay stable while PendingBarriers holds pointers to inside states
+    std::vector<std::unique_ptr<AccessRangeEncoding>> range_encodings_;
+    std::vector<uint32_t> free_encoding_indices_;
 };
 
 // Split a range into pieces bound by the intersection of the iterator's range and the supplied range

@@ -110,6 +110,10 @@ void UpdateAccessMapStats(const AccessMap& access_map, AccessContextStats& stats
     for (const auto& entry : access_map) {
         const AccessState& access_state = entry.second;
         access_state.UpdateStats(stats);
+        if (const AccessRangeEncoding* encoding = access_map.GetEncoding(access_state)) {
+            ++stats.access_states;
+            encoding->inside.UpdateStats(stats);
+        }
     }
 }
 

@@ -21,7 +21,121 @@ namespace syncval {
 
 void AccessMap::Assign(const AccessMap& other) {
     auto temp_copy(other.impl_map_);
+    std::vector<std::unique_ptr<AccessRangeEncoding>> encodings_copy(other.range_encodings_.size());
+    for (size_t i = 0; i < encodings_copy.size(); ++i) {
+        if (other.range_encodings_[i]) {
+            encodings_copy[i] = std::make_unique<AccessRangeEncoding>(*other.range_encodings_[i]);
+        }
+    }
+    auto free_indices_copy(other.free_encoding_indices_);
+    auto source = other.begin();
+    for (auto& [range, state] : temp_copy) {
+        state.range_encoding_index = source->second.range_encoding_index;
+        ++source;
+    }
     impl_map_.swap(temp_copy);
+    range_encodings_.swap(encodings_copy);
+    free_encoding_indices_.swap(free_indices_copy);
+}
+
+void AccessMap::Clear() {
+    impl_map_.clear();
+    range_encodings_.clear();
+    free_encoding_indices_.clear();
+}
+
+void AccessMap::SetEncoding(AccessState& state, const AccessRangeEncoding& encoding) {
+    auto copy = std::make_unique<AccessRangeEncoding>(encoding);
+    if (state.range_encoding_index != vvl::kNoIndex32) {
+        range_encodings_[state.range_encoding_index] = std::move(copy);
+        return;
+    }
+    if (!free_encoding_indices_.empty()) {
+        const uint32_t index = free_encoding_indices_.back();
+        free_encoding_indices_.pop_back();
+        range_encodings_[index] = std::move(copy);
+        state.range_encoding_index = index;
+    } else {
+        assert(range_encodings_.size() < vvl::kNoIndex32);
+        const uint32_t index = static_cast<uint32_t>(range_encodings_.size());
+        range_encodings_.push_back(std::move(copy));
+        state.range_encoding_index = index;
+    }
+}
+
+void AccessMap::ClearEncoding(AccessState& state) {
+    if (state.range_encoding_index != vvl::kNoIndex32) {
+        free_encoding_indices_.push_back(state.range_encoding_index);
+        range_encodings_[state.range_encoding_index].reset();
+        state.range_encoding_index = vvl::kNoIndex32;
+    }
+}
+
+void AccessMap::SetUniform(AccessState& state, const AccessState& value) {
+    state.Assign(value);
+    ClearEncoding(state);
+}
+
+void AccessMap::Clip(AccessState& state, const AccessRange& range) {
+    const AccessRangeEncoding* encoding = GetEncoding(state);
+    if (!encoding) {
+        return;
+    }
+    if (encoding->range.Covers(range)) {
+        SetUniform(state, encoding->inside);
+    } else if (encoding->outside_present && !encoding->range.Intersects(range)) {
+        ClearEncoding(state);
+    }
+}
+
+void AccessMap::Resolve(AccessState& state, const AccessState& other, const AccessRangeEncoding* encoding) {
+    AccessRangeEncoding* dst_encoding = GetEncoding(state);
+    assert(!dst_encoding || !encoding || dst_encoding->range == encoding->range);
+    if (!dst_encoding && !encoding) {
+        state.Resolve(other);
+        return;
+    }
+    if (!dst_encoding) {
+        SetEncoding(state, AccessRangeEncoding(encoding->range, state, true));
+        dst_encoding = GetEncoding(state);
+    }
+    if (!encoding || encoding->outside_present) {
+        if (dst_encoding->outside_present) {
+            state.Resolve(other);
+        } else {
+            state.Assign(other);
+        }
+        dst_encoding->outside_present = true;
+    }
+    dst_encoding->inside.Resolve(encoding ? encoding->inside : other);
+}
+
+void AccessMap::Materialize(const AccessRange& range) {
+    if (range.empty() || !HasEncodings()) {
+        return;
+    }
+    auto pos = LowerBound(range.begin);
+    while (pos != end() && pos->first.begin < range.end) {
+        if (!GetEncoding(pos->second)) {
+            ++pos;
+            continue;
+        }
+        pos = syncval::Split(pos, *this, range);
+        if (!GetEncoding(pos->second)) {
+            ++pos;
+            continue;
+        }
+        const AccessRangeEncoding encoding(*GetEncoding(pos->second));
+        const AccessRange bounds = pos->first;
+        const AccessState state(pos->second);
+        pos = Erase(pos);
+        encoding.Visit(bounds, state, [&](const AccessRange& span, const AccessState* value) {
+            if (value) {
+                Insert(pos, span, *value);
+            }
+            return false;
+        });
+    }
 }
 
 AccessMap::iterator AccessMap::LowerBound(ResourceAddress range_begin) {
@@ -36,6 +150,7 @@ AccessMap::const_iterator AccessMap::LowerBound(ResourceAddress range_begin) con
 
 AccessMap::iterator AccessMap::Erase(const iterator& pos) {
     assert(pos != end());
+    ClearEncoding(pos->second);
     return impl_map_.erase(pos);
 }
 
@@ -43,7 +158,7 @@ void AccessMap::Erase(iterator first, iterator last) {
     auto current = first;
     while (current != last) {
         assert(current != end());
-        current = impl_map_.erase(current);
+        current = Erase(current);
     }
 }
 
@@ -60,7 +175,8 @@ AccessMap::iterator AccessMap::Merge(iterator first, iterator last) {
     return impl_map_.insert(last, std::move(node));
 }
 
-AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state) {
+AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& range, const AccessState& access_state,
+                                      const AccessRangeEncoding* encoding) {
     assert(range.non_empty());
     bool hint_open;
     const_iterator impl_next = hint;
@@ -80,15 +196,20 @@ AccessMap::iterator AccessMap::Insert(const_iterator hint, const AccessRange& ra
 
     if (!hint_open) {
         // Hint was unhelpful, fall back to the non-hinted version
-        auto plain_insert = Insert(range, access_state);
+        auto plain_insert = Insert(range, access_state, encoding);
         return plain_insert.first;
     }
 
     auto impl_insert = impl_map_.insert(impl_next, {range, access_state});
+    if (encoding) {
+        SetEncoding(impl_insert->second, *encoding);
+        Clip(impl_insert->second, range);
+    }
     return iterator(impl_insert);
 }
 
-std::pair<AccessMap::iterator, bool> AccessMap::Insert(const AccessRange& range, const AccessState& access_state) {
+std::pair<AccessMap::iterator, bool> AccessMap::Insert(const AccessRange& range, const AccessState& access_state,
+                                                       const AccessRangeEncoding* encoding) {
     assert(range.non_empty());
 
     // Look for range conflicts (and an insertion point, which makes the lower_bound *not* wasted work)
@@ -96,7 +217,12 @@ std::pair<AccessMap::iterator, bool> AccessMap::Insert(const AccessRange& range,
     auto lower = LowerBound(range.begin);
     if (lower == end() || !lower->first.intersects(range)) {
         // range is not even partially overlapped, and lower is strictly > than key
-        return {impl_map_.emplace_hint(lower, range, access_state), true};
+        auto inserted = impl_map_.emplace_hint(lower, range, access_state);
+        if (encoding) {
+            SetEncoding(inserted->second, *encoding);
+            Clip(inserted->second, range);
+        }
+        return {inserted, true};
     }
     // We don't replace
     return {lower, false};
@@ -118,7 +244,16 @@ void AccessMap::InfillGaps(const AccessRange& range, const AccessState& access_s
             Insert(pos, {begin, gap_end}, access_state);
             begin = gap_end;
         } else {
-            begin = std::min(range.end, pos->first.end);
+            const AccessRange part(begin, std::min(range.end, pos->first.end));
+            if (HasGaps(pos->second)) {
+                pos = syncval::Split(pos, *this, part);
+                if (AccessRangeEncoding* encoding = GetEncoding(pos->second)) {
+                    pos->second.Assign(access_state);
+                    encoding->outside_present = true;
+                    Clip(pos->second, part);
+                }
+            }
+            begin = part.end;
             ++pos;
         }
     }
@@ -139,8 +274,12 @@ AccessMap::iterator AccessMap::Split(const iterator split_it, const index_type& 
     }
 
     // Save the contents and erase
-    auto value = split_it->second;
-    auto next_it = impl_map_.erase(split_it);
+    AccessState value(split_it->second);
+    std::optional<AccessRangeEncoding> encoding;
+    if (const AccessRangeEncoding* current_encoding = GetEncoding(split_it->second)) {
+        encoding.emplace(*current_encoding);
+    }
+    auto next_it = Erase(split_it);
 
     AccessRange upper_range(index, range.end);
     assert(!upper_range.empty());  // Upper range cannot be empty
@@ -149,10 +288,18 @@ AccessMap::iterator AccessMap::Split(const iterator split_it, const index_type& 
     // NOTE: we insert from upper to lower because that's what emplace_hint can do in constant time
     assert(impl_map_.find(upper_range) == impl_map_.end());
     next_it = impl_map_.emplace_hint(next_it, std::make_pair(upper_range, value));
+    if (encoding) {
+        SetEncoding(next_it->second, *encoding);
+        Clip(next_it->second, upper_range);
+    }
 
     // Move value to the lower range (we can move since the upper range already got a copy of value)
     assert(impl_map_.find(lower_range) == impl_map_.end());
     next_it = impl_map_.emplace_hint(next_it, std::make_pair(lower_range, std::move(value)));
+    if (encoding) {
+        SetEncoding(next_it->second, *encoding);
+        Clip(next_it->second, lower_range);
+    }
 
     // Iterator to the beginning of the lower range
     return next_it;
@@ -185,7 +332,7 @@ void Consolidate(AccessMap& map) {
 
     // To be included in a merge range there must be no gap in the AccessRange space, and the mapped_type values must match
     auto can_merge = [](const It& last, const It& cur) {
-        return cur->first.begin == last->first.end && cur->second == last->second;
+        return cur->first.begin == last->first.end && CanMerge(cur->second, last->second);
     };
 
     while (current != map_end) {

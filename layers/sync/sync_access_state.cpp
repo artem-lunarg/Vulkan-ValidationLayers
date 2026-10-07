@@ -700,7 +700,8 @@ void AccessState::ApplySemaphore(const SemaphoreScope& signal, const SemaphoreSc
     if (last_write.has_value()) last_write->dependency_chain = read_execution_barriers;
 }
 
-// Copies everything except read states which need custom logic
+// Copies access history except read states, which need custom logic.
+// The map-owned encoding index is preserved
 void AccessState::CopySimpleMembers(const AccessState& other) {
     next_global_barrier_index = other.next_global_barrier_index;
 

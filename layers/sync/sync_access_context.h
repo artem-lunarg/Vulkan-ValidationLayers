@@ -237,6 +237,7 @@ class AccessContext {
     void Reset();
 
     void Trim();
+    void Materialize() { access_state_map_.Materialize(kFullRange); }
     void AddReferencedTags(ResourceUsageTagSet& referenced) const;
 
     const AccessMap& GetAccessMap() const { return access_state_map_; }
@@ -344,7 +345,7 @@ class AccessContext {
 
     // Resolve src_access into this context over range: gaps get a copy, existing entries
     // are split to the range and resolved
-    void ResolveAccessState(const AccessRange& range, const AccessState& src_access);
+    void ResolveAccessState(const AccessRange& range, const AccessState& src_access, const AccessRangeEncoding* encoding = nullptr);
 
     // Resolve the empty entries over the given range by importing previous contexts.
     // An optional infill operation is applied if the previous contexts do not have requested ranges.
@@ -360,6 +361,9 @@ class AccessContext {
     AccessMap::iterator DoUpdateAccessState(AccessMap::iterator pos, const AccessRange& range, SyncAccessIndex access_index,
                                             const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
                                             QueueId queue_id = kQueueIdInvalid);
+
+    bool UpdateStridedAccess(const StridedRange& strided, SyncAccessIndex access_index, const AttachmentAccess& attachment_access,
+                             ResourceUsageTagEx tag_ex, SyncFlags flags, QueueId queue_id);
 
     // A recursive range walkers for hazard detection, first for the current context
     // and then walks the DAG of the contexts for subpasses
@@ -436,11 +440,20 @@ struct ActionToOpsAdapter {
         // where as Action::Infill assumes the caller will apply the action() logic to the infill_range
         for (; infill != pos; ++infill) {
             assert(infill != accesses.end());
-            action(infill->second);
+            update(infill);
         }
     }
-    void update(const AccessMap::iterator& pos) const { action(pos->second); }
+    void update(const AccessMap::iterator& pos) const {
+        AccessState& state = pos->second;
+        if (action.layout_transition && accesses.HasGaps(state)) {
+            state.Assign(AccessState::DefaultAccessState());
+            accesses.GetEncoding(state)->outside_present = true;
+            accesses.Clip(state, pos->first);
+        }
+        accesses.VisitStates(state, [&](AccessState& access) { action(access); });
+    }
     const Action& action;
+    AccessMap& accesses;
 };
 
 template <typename Action>
@@ -451,14 +464,14 @@ void AccessContext::UpdateMemoryAccessState(Action& action, const AccessRange& r
         return;
     }
 
-    ActionToOpsAdapter<Action> ops{action};
+    ActionToOpsAdapter<Action> ops{action, access_state_map_};
     auto pos = access_state_map_.LowerBound(range.begin);
     InfillUpdateRange(access_state_map_, pos, range, ops);
 }
 
 template <typename Action, typename RangeGen>
 void AccessContext::UpdateMemoryAccessState(const Action& action, RangeGen& range_gen) {
-    ActionToOpsAdapter<Action> ops{action};
+    ActionToOpsAdapter<Action> ops{action, access_state_map_};
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
         pos = InfillUpdateRange(access_state_map_, pos, *range_gen, ops);
@@ -469,10 +482,28 @@ template <typename Predicate>
 void AccessContext::EraseIf(Predicate&& pred) {
     auto pos = access_state_map_.begin();
     while (pos != access_state_map_.end()) {
-        if (pred(pos->second)) {
+        AccessState& state = pos->second;
+        AccessRangeEncoding* encoding = access_state_map_.GetEncoding(state);
+        if (!encoding) {
+            pos = pred(state) ? access_state_map_.Erase(pos) : std::next(pos);
+            continue;
+        }
+        if (encoding->outside_present && pred(state)) {
+            encoding->outside_present = false;
+        }
+        if (!pred(encoding->inside)) {
+            ++pos;
+        } else if (!encoding->outside_present) {
             pos = access_state_map_.Erase(pos);
         } else {
-            ++pos;
+            // Only the outside history survives. Preserve the predicate's decision across expansion
+            const AccessRange bounds = pos->first;
+            const StridedRange shape = encoding->range;
+            access_state_map_.Materialize(bounds);
+            pos = access_state_map_.LowerBound(bounds.begin);
+            while (pos != access_state_map_.end() && pos->first.begin < bounds.end) {
+                pos = shape.Covers(pos->first) ? access_state_map_.Erase(pos) : std::next(pos);
+            }
         }
     }
 }

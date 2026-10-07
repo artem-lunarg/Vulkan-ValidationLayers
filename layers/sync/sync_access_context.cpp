@@ -100,8 +100,10 @@ void AccessContext::RegisterGlobalBarrier(const SyncBarrier& barrier, QueueId qu
         // Flush global barriers if all def slots are in use
         if (global_barrier_def_count_ == kMaxGlobalBarrierDefCount) {
             for (auto& [_, access] : access_state_map_) {
-                ApplyGlobalBarriers(access);
-                access.next_global_barrier_index = 0;  // to match state after reset
+                access_state_map_.VisitStates(access, [&](AccessState& state) {
+                    ApplyGlobalBarriers(state);
+                    state.next_global_barrier_index = 0;
+                });
             }
             ResetGlobalBarriers();
             def_index = 0;
@@ -182,14 +184,15 @@ void AccessContext::ResetGlobalBarriers() {
 
 void AccessContext::Trim() {
     for (auto& [range, access] : access_state_map_) {
-        access.Normalize();
+        access_state_map_.VisitStates(access, [](AccessState& state) { state.Normalize(); });
+        access_state_map_.Clip(access, range);
     }
     Consolidate(access_state_map_);
 }
 
 void AccessContext::AddReferencedTags(ResourceUsageTagSet& used) const {
     for (const auto& [range, access] : access_state_map_) {
-        access.GatherReferencedTags(used);
+        access_state_map_.VisitStates(access, [&](const AccessState& state) { state.GatherReferencedTags(used); });
     }
 }
 
@@ -198,6 +201,10 @@ void AccessContext::EraseContainedEntries(const AccessRange& range) {
     while (pos != access_state_map_.end() && pos->first.begin < range.end) {
         if (range.includes(pos->first)) {
             pos = access_state_map_.Erase(pos);
+        } else if (access_state_map_.GetEncoding(pos->second)) {
+            const AccessRange bounds = pos->first;
+            access_state_map_.Materialize(bounds);
+            pos = access_state_map_.LowerBound(bounds.begin);
         } else {
             ++pos;
         }
@@ -253,14 +260,23 @@ void AccessContext::ResolveAccessRange(const AccessRange& range, const AccessSta
     for (; pos != access_state_map_.end() && pos->first.begin < range.end; ++pos) {
         const AccessRange src_range = pos->first & range;
         AccessState src_access(pos->second);
-        ApplyGlobalBarriers(src_access);
-
-        // The src_access copy joins resolve_context.
-        // Ensure global barriers already registered in resolve_context are not applied
-        src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();
-
-        barrier_action(&src_access);
-        resolve_context.ResolveAccessState(src_range, src_access);
+        std::optional<AccessRangeEncoding> src_encoding;
+        if (const AccessRangeEncoding* encoding = access_state_map_.GetEncoding(pos->second)) {
+            src_encoding.emplace(*encoding);
+        }
+        const auto transform = [&](AccessState& state) {
+            ApplyGlobalBarriers(state);
+            // The copy joins resolve_context. Skip barriers already registered there
+            state.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();
+            barrier_action(&state);
+        };
+        if (!src_encoding || src_encoding->outside_present) {
+            transform(src_access);
+        }
+        if (src_encoding) {
+            transform(src_encoding->inside);
+        }
+        resolve_context.ResolveAccessState(src_range, src_access, src_encoding ? &*src_encoding : nullptr);
     }
 }
 
@@ -282,35 +298,89 @@ void AccessContext::ResolveAccessRangeRecursePrev(const AccessRange& range, cons
         }
         const AccessRange src_range(begin, std::min(range.end, pos->first.end));
         AccessState src_access(pos->second);
-        ApplyGlobalBarriers(src_access);
-
-        // The src_access copy joins resolve_context.
-        // Ensure global barriers already registered in resolve_context are not applied
-        src_access.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();
-
-        barrier_action(&src_access);
-        resolve_context.ResolveAccessState(src_range, src_access);
+        std::optional<AccessRangeEncoding> src_encoding;
+        if (const AccessRangeEncoding* encoding = access_state_map_.GetEncoding(pos->second)) {
+            src_encoding.emplace(*encoding);
+        }
+        const auto transform = [&](AccessState& state) {
+            ApplyGlobalBarriers(state);
+            // The copy joins resolve_context. Skip barriers already registered there
+            state.next_global_barrier_index = resolve_context.GetGlobalBarrierCount();
+            barrier_action(&state);
+        };
+        if (!src_encoding || src_encoding->outside_present) {
+            transform(src_access);
+        }
+        if (src_encoding) {
+            transform(src_encoding->inside);
+        }
+        resolve_context.ResolveAccessState(src_range, src_access, src_encoding ? &*src_encoding : nullptr);
+        if (access_state_map_.HasGaps(pos->second) && (infill || !subpass_barriers_.empty())) {
+            if (subpass_barriers_.empty()) {
+                // With no predecessors, fill the absent outside history without splitting the encoded rows
+                ResolveGapsRecursePrev(src_range, resolve_context, infill, barrier_action);
+            } else {
+                access_state_map_.Visit(src_range, pos->second, [&](const AccessRange& span, const AccessState* state) {
+                    if (!state) {
+                        ResolveGapsRecursePrev(span, resolve_context, infill, barrier_action);
+                    }
+                    return false;
+                });
+            }
+        }
         begin = src_range.end;
         ++pos;
     }
 }
 
-void AccessContext::ResolveAccessState(const AccessRange& range, const AccessState& src_access) {
+void AccessContext::ResolveAccessState(const AccessRange& range, const AccessState& src_access,
+                                       const AccessRangeEncoding* encoding) {
     auto pos = access_state_map_.LowerBound(range.begin);
     ResourceAddress begin = range.begin;
     while (begin < range.end) {
         const bool pos_at_end = (pos == access_state_map_.end());
         const bool gap = pos_at_end || begin < pos->first.begin;
-        ResourceAddress end;
+        const ResourceAddress end =
+            gap ? (pos_at_end ? range.end : std::min(range.end, pos->first.begin)) : std::min(range.end, pos->first.end);
+        const AccessRange part_range(begin, end);
+        const AccessState* part_state = &src_access;
+        const AccessRangeEncoding* part_encoding = encoding;
+        if (encoding) {
+            if (encoding->range.Covers(part_range)) {
+                part_state = &encoding->inside;
+                part_encoding = nullptr;
+            } else if (!encoding->range.Intersects(part_range)) {
+                if (!encoding->outside_present) {
+                    begin = end;
+                    if (!gap) {
+                        ++pos;
+                    }
+                    continue;
+                }
+                part_encoding = nullptr;
+            }
+        }
         if (gap) {
-            end = pos_at_end ? range.end : std::min(range.end, pos->first.begin);
-            pos = access_state_map_.Insert(pos, {begin, end}, src_access);
+            pos = access_state_map_.Insert(pos, part_range, *part_state, part_encoding);
         } else {
-            end = std::min(range.end, pos->first.end);
-            pos = Split(pos, access_state_map_, {begin, end});
-            AccessState& dst_access = pos->second;
-            ApplyGlobalBarriers(dst_access);
-            dst_access.Resolve(src_access);
+            pos = Split(pos, access_state_map_, part_range);
+            const AccessRangeEncoding* dst_encoding = access_state_map_.GetEncoding(pos->second);
+            if (part_encoding && dst_encoding && !(part_encoding->range == dst_encoding->range)) {
+                // Crossing patterns use ordinary ranges only over their intersection
+                access_state_map_.Materialize(part_range);
+                part_encoding->Visit(part_range, *part_state, [&](const AccessRange& span, const AccessState* state) {
+                    if (state) {
+                        ResolveAccessState(span, *state);
+                    }
+                    return false;
+                });
+                pos = access_state_map_.LowerBound(end);
+                begin = end;
+                continue;
+            }
+            access_state_map_.VisitStates(pos->second, [&](AccessState& state) { ApplyGlobalBarriers(state); });
+            access_state_map_.Resolve(pos->second, *part_state, part_encoding);
+            access_state_map_.Clip(pos->second, part_range);
         }
         begin = end;
         ++pos;
@@ -396,9 +466,7 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
         if (syncAccessReadMask[access_index]) {
             return;  // merge only during writes
         }
-        if (merge_first != end && merge_last->first.end == updated->first.begin &&
-            merge_last->second.next_global_barrier_index == updated->second.next_global_barrier_index &&
-            merge_last->second == updated->second) {
+        if (merge_first != end && merge_last->first.end == updated->first.begin && CanMerge(merge_last->second, updated->second)) {
             merge_last = updated;
         } else {
             finish_merge();
@@ -421,8 +489,29 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
         }
 
         AccessState& access_state = pos->second;
-        ApplyGlobalBarriers(access_state);
-        access_state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
+        if (!syncAccessReadMask[access_index]) {
+            // The write replaces both histories within this entry
+            access_state_map_.ClearEncoding(access_state);
+            access_state.next_global_barrier_index = GetGlobalBarrierCount();
+            access_state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
+        } else {
+            if (access_state_map_.HasGaps(access_state)) {
+                if (!subpass_barriers_.empty()) {
+                    // Import missing outside history through the ordinary gap path
+                    access_state_map_.Materialize(pos->first);
+                    pos = access_state_map_.LowerBound(current_begin);
+                    continue;
+                }
+                access_state.Assign(AccessState::DefaultAccessState());
+                access_state.next_global_barrier_index = GetGlobalBarrierCount();
+                access_state_map_.GetEncoding(access_state)->outside_present = true;
+                access_state_map_.Clip(access_state, pos->first);
+            }
+            access_state_map_.VisitStates(access_state, [&](AccessState& state) {
+                ApplyGlobalBarriers(state);
+                state.Update(access_info, attachment_access, tag_ex, flags, queue_id);
+            });
+        }
         track_updated_range(pos);
 
         current_begin = pos->first.end;
@@ -430,6 +519,83 @@ AccessMap::iterator AccessContext::DoUpdateAccessState(AccessMap::iterator pos, 
     }
     finish_merge();
     return pos;
+}
+
+bool AccessContext::UpdateStridedAccess(const StridedRange& strided, SyncAccessIndex access_index,
+                                        const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex, SyncFlags flags,
+                                        QueueId queue_id) {
+    if (strided.count < 4) {
+        return false;
+    }
+    const AccessRange bounds = strided.Bounds();
+    size_t entries = 0;
+    for (auto pos = access_state_map_.LowerBound(bounds.begin); pos != access_state_map_.end() && pos->first.begin < bounds.end;
+         ++pos) {
+        const AccessRangeEncoding* encoding = access_state_map_.GetEncoding(pos->second);
+        if (++entries >= strided.count || (encoding && !(encoding->range == strided))) {
+            return false;
+        }
+    }
+
+    const SyncAccessInfo& info = GetAccessInfo(access_index);
+    const auto update = [&](AccessState& state) {
+        if (syncAccessReadMask[access_index]) {
+            ApplyGlobalBarriers(state);
+        } else {
+            state.next_global_barrier_index = GetGlobalBarrierCount();
+        }
+        state.Update(info, attachment_access, tag_ex, flags, queue_id);
+    };
+    auto pos = access_state_map_.LowerBound(bounds.begin);
+    ResourceAddress begin = bounds.begin;
+    while (begin < bounds.end) {
+        if (pos == access_state_map_.end() || begin < pos->first.begin) {
+            const AccessRange gap(begin, pos == access_state_map_.end() ? bounds.end : std::min(bounds.end, pos->first.begin));
+            if (strided.Intersects(gap)) {
+                // Import row histories from predecessors. Leave outside history in those predecessors
+                pos = ResolveGapRecursePrev(gap, pos);
+                while (pos != access_state_map_.end() && pos->first.begin < gap.end) {
+                    const AccessRange imported = pos->first;
+                    const AccessRangeEncoding* encoding = access_state_map_.GetEncoding(pos->second);
+                    if (encoding && !(encoding->range == strided)) {
+                        access_state_map_.Materialize(imported);
+                        pos = access_state_map_.LowerBound(imported.begin);
+                        continue;
+                    }
+                    if (!strided.Intersects(imported)) {
+                        pos = access_state_map_.Erase(pos);
+                        continue;
+                    }
+                    AccessState inside(encoding ? encoding->inside : pos->second);
+                    update(inside);
+                    if (strided.Covers(imported)) {
+                        access_state_map_.SetUniform(pos->second, inside);
+                    } else {
+                        access_state_map_.SetEncoding(pos->second, AccessRangeEncoding(strided, inside, false));
+                    }
+                    ++pos;
+                }
+            }
+            begin = gap.end;
+        } else {
+            // Keep the entire key. The encoding limits the update to the rectangle within it
+            if (strided.Intersects(pos->first)) {
+                AccessState& state = pos->second;
+                if (AccessRangeEncoding* encoding = access_state_map_.GetEncoding(state)) {
+                    update(encoding->inside);
+                } else if (strided.Covers(pos->first)) {
+                    update(state);
+                } else {
+                    AccessState inside(state);
+                    update(inside);
+                    access_state_map_.SetEncoding(state, AccessRangeEncoding(strided, inside, true));
+                }
+            }
+            begin = std::min(bounds.end, pos->first.end);
+            ++pos;
+        }
+    }
+    return true;
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer& buffer, SyncAccessIndex current_usage, const AccessRange& range,
@@ -458,6 +624,11 @@ void AccessContext::UpdateAccessState(ImageRangeGen& range_gen, SyncAccessIndex 
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
         return;
     }
+    const auto strided = range_gen.GetStridedRange();
+    if (strided && UpdateStridedAccess(*strided, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id)) {
+        range_gen = ImageRangeGen();
+        return;
+    }
     auto pos = access_state_map_.LowerBound(range_gen->begin);
     for (; range_gen->non_empty(); ++range_gen) {
         pos = DoUpdateAccessState(pos, *range_gen, current_usage, AttachmentAccess::NonAttachment(), tag_ex, flags, queue_id);
@@ -468,6 +639,11 @@ void AccessContext::UpdateAttachmentAccessState(ImageRangeGen& range_gen, SyncAc
                                                 const AttachmentAccess& attachment_access, ResourceUsageTagEx tag_ex,
                                                 QueueId queue_id) {
     if (current_usage == SYNC_ACCESS_INDEX_NONE) {
+        return;
+    }
+    const auto strided = range_gen.GetStridedRange();
+    if (strided && UpdateStridedAccess(*strided, current_usage, attachment_access, tag_ex, 0, queue_id)) {
+        range_gen = ImageRangeGen();
         return;
     }
     auto pos = access_state_map_.LowerBound(range_gen->begin);

@@ -20,6 +20,8 @@
 
 #include "containers/small_vector.h"
 #include "state_tracker/subresource_encoding.h"
+#include <algorithm>
+#include <optional>
 #include <vector>
 
 namespace vvl {
@@ -88,6 +90,73 @@ class ImageRangeEncoder : public vvl::SubresourceEncoder {
     bool is_compressed_;
 };
 
+// A bounded sequence of equally sized, non-overlapping ranges
+struct StridedRange {
+    using IndexType = ImageRangeEncoder::IndexType;
+    using IndexRange = ImageRangeEncoder::IndexRange;
+
+    IndexType base = 0;
+    IndexType width = 0;
+    IndexType stride = 0;
+    uint32_t count = 0;
+
+    bool operator==(const StridedRange& other) const {
+        return base == other.base && width == other.width && stride == other.stride && count == other.count;
+    }
+
+    IndexRange Bounds() const { return count ? IndexRange(base, base + (count - 1) * stride + width) : IndexRange(); }
+
+    // Return the first maximal span with uniform membership, clipped to the supplied range
+    IndexRange NextSpan(const IndexRange& range, bool& inside) const {
+        inside = false;
+        if (!count || range.empty()) {
+            return range;
+        }
+        if (range.begin < base) {
+            return {range.begin, std::min(range.end, base)};
+        }
+        const IndexType end = Bounds().end;
+        if (range.begin >= end) {
+            return range;
+        }
+        if (width == stride) {
+            inside = true;
+            return {range.begin, std::min(range.end, end)};
+        }
+        const IndexType row = (range.begin - base) / stride;
+        const IndexType row_begin = base + row * stride;
+        const IndexType row_end = row_begin + width;
+        inside = range.begin < row_end;
+        const IndexType span_end = inside ? row_end : row_begin + stride;
+        return {range.begin, std::min(range.end, span_end)};
+    }
+
+    IndexRange FirstIntersection(const IndexRange& range) const {
+        const IndexRange clipped = range & Bounds();
+        if (clipped.empty()) {
+            return {};
+        }
+        bool inside;
+        const IndexRange span = NextSpan(clipped, inside);
+        if (inside) {
+            return span;
+        }
+        return NextSpan({span.end, clipped.end}, inside);
+    }
+
+    IndexRange FirstOutside(const IndexRange& range) const {
+        bool inside;
+        const IndexRange span = NextSpan(range, inside);
+        if (!inside) {
+            return span;
+        }
+        return NextSpan({span.end, range.end}, inside);
+    }
+
+    bool Intersects(const IndexRange& range) const { return !FirstIntersection(range).empty(); }
+    bool Covers(const IndexRange& range) const { return FirstOutside(range).empty(); }
+};
+
 class ImageRangeGenerator {
   public:
     using IndexType = ImageRangeEncoder::IndexType;
@@ -106,6 +175,12 @@ class ImageRangeGenerator {
     const IndexRange* operator->() const { return &pos_; }
     ImageRangeGenerator& operator++();
     ImageRangeGenerator& operator=(const ImageRangeGenerator&) = default;
+    std::optional<StridedRange> GetStridedRange() const {
+        if (set_initial_pos_fn_ != &ImageRangeGenerator::SetInitialPosFullOffset) {
+            return std::nullopt;
+        }
+        return GetStridedRangeImpl();
+    }
 
   private:
     bool Convert2DCompatibleTo3D();
@@ -113,6 +188,7 @@ class ImageRangeGenerator {
     void SetUpIncrementerDefaults();
     void SetUpSubresIncrementer();
     void SetUpIncrementer(bool all_width, bool all_height, bool all_depth);
+    std::optional<StridedRange> GetStridedRangeImpl() const;
 
     using SetInitialPosFn = void (ImageRangeGenerator::*)(uint32_t, uint32_t);
     void SetInitialPos(uint32_t layer, uint32_t aspect_index) { (this->*(set_initial_pos_fn_))(layer, aspect_index); }
