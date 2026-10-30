@@ -1941,7 +1941,7 @@ void CommandBuffer::End() {
     }
 }
 
-void CommandBuffer::Reset(VkCommandBufferResetFlags flags) { ASSERT_EQ(VK_SUCCESS, vk::ResetCommandBuffer(handle(), flags)); }
+void CommandBuffer::Reset(VkCommandBufferResetFlags flags) { vk::ResetCommandBuffer(handle(), flags); }
 
 VkCommandBufferAllocateInfo CommandBuffer::CreateInfo(VkCommandPool const& pool) {
     VkCommandBufferAllocateInfo info = vku::InitStructHelper();

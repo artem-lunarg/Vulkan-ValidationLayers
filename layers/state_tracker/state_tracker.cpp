@@ -4814,13 +4814,18 @@ void DeviceState::PostCallRecordAcquireNextImage2KHR(VkDevice device, const VkAc
 
 void DeviceState::RecordWaitForPresent(VkDevice device, VkSwapchainKHR swapchain, uint64_t present_id, const Location& location) {
     if (auto swapchain_state = Get<Swapchain>(swapchain)) {
+        std::unique_lock lock(swapchain_state->present_id_mutex);
         // Find the smallest registered present id >= the given present id,
-        // and ensure that the queue has progressed to the corresponding seq location
+        // and ensure that the queue has progressed processed all signalers
+        // (present wait ensures signaling batches are finished but not necessarily the following batches)
         const uint32_t present_id_info_count = swapchain_state->GetPresentIdInfoCount();
         for (uint32_t i = 0; i < present_id_info_count; i++) {
             const Swapchain::PresentIdInfo present_id_info = swapchain_state->GetPresentIdInfo(i);
             if (present_id_info.present_id >= present_id) {
-                present_id_info.present_submission_ref.queue->NotifyAndWait(location, present_id_info.present_submission_ref.seq);
+                lock.unlock();
+                for (const vvl::SubmissionReference& signal_ref : present_id_info.signal_submission_refs) {
+                    signal_ref.queue->NotifyAndWait(location, signal_ref.seq);
+                }
                 break;
             }
         }

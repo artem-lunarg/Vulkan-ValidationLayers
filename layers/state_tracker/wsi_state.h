@@ -25,6 +25,7 @@
 #include "containers/span.h"
 #include <vulkan/utility/vk_safe_struct.hpp>
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <deque>
 
@@ -128,9 +129,14 @@ class Swapchain : public RefcountedStateObject, public SubStateManager<Swapchain
     struct PresentIdInfo {
         uint64_t present_id;
         SubmissionReference present_submission_ref;
+
+        // Submissions that signal present wait semaphores
+        small_vector<SubmissionReference, 1> signal_submission_refs;
     };
+    std::mutex present_id_mutex;
     std::vector<PresentIdInfo> present_id_ring_buffer;
     uint32_t present_id_request_count = 0;
+    // Caller must hold present_id_mutex while accessing the history
     uint32_t GetPresentIdInfoCount() const;
     PresentIdInfo GetPresentIdInfo(uint32_t present_id_info_index);
 

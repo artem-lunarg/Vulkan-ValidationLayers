@@ -2765,6 +2765,8 @@ TEST_F(PositiveWsi, PresentIdWait2) {
 
         ++present_id_value;
     }
+
+    m_default_queue->Wait();
 }
 
 TEST_F(PositiveWsi, PresentWait2ConcurrentAcquireAndPresent) {
