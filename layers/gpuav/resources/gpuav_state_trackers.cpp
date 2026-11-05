@@ -16,6 +16,7 @@
  */
 
 #include <vulkan/vulkan_core.h>
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include "containers/container_utils.h"
@@ -313,8 +314,12 @@ bool CommandBufferSubState::PreSubmit(QueueSubState& queue, const Location& loc,
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &per_pre_submission_cb;
         const VkResult result = DispatchQueueSubmit(queue.base.VkHandle(), 1, &submit_info, fence);
-        if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            gpuav_.PublishDeviceLost(Location(vvl::Func::vkQueueSubmit));
+            return false;
+        } else if (result != VK_SUCCESS) {
             gpuav_.InternalError(queue.Handle(), loc, "Failed to submit per pre submission command buffer");
+            return false;
         }
     }
 
@@ -344,8 +349,12 @@ bool CommandBufferSubState::PostSubmit(QueueSubState& queue, const Location& loc
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &per_post_submission_cb;
         const VkResult result = DispatchQueueSubmit(queue.base.VkHandle(), 1, &submit_info, fence);
-        if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            gpuav_.PublishDeviceLost(Location(vvl::Func::vkQueueSubmit));
+            return false;
+        } else if (result != VK_SUCCESS) {
             gpuav_.InternalError(queue.Handle(), loc, "Failed to submit per post submission command buffer");
+            return false;
         }
 
         FenceWaiter& fence_waiter = queue.shared_resources_cache.GetOrCreate<FenceWaiter>();
@@ -356,6 +365,80 @@ bool CommandBufferSubState::PostSubmit(QueueSubState& queue, const Location& loc
     return true;
 }
 
+void CommandBufferSubState::ReportErrorsOnDeviceLost() {
+    const size_t buffer_words = size_t(error_output_buffer_range_.size / sizeof(uint32_t));
+    if (error_output_buffer_range_.buffer == VK_NULL_HANDLE || !error_output_buffer_range_.offset_mapped_ptr ||
+        buffer_words < glsl::error_buffer_data_member_offset) {
+        return;
+    }
+
+    auto* buffer = static_cast<uint32_t*>(error_output_buffer_range_.offset_mapped_ptr);
+    if (buffer[glsl::error_buffer_used_size_member_offset] == 0) {
+        return;
+    }
+    const size_t available_words = buffer_words - glsl::error_buffer_data_member_offset;
+    const size_t record_count =
+        std::min<size_t>(buffer[glsl::error_buffer_used_size_member_offset], available_words) / glsl::kErrorRecordDwordSize;
+    const Location unknown_loc(vvl::Func::Empty);
+    const LogObjectList unknown_objlist(VkHandle());
+
+    // Count undecoded records per logger. The final entry holds records without a valid logger
+    std::vector<uint32_t> undecoded_counts(command_error_loggers_.size() + 1, 0);
+
+    // General error loggers trust GPU-written data, so only BDA records are decoded here
+    for (size_t i = 0; i < record_count; ++i) {
+        const uint32_t* record = buffer + glsl::error_buffer_data_member_offset + i * glsl::kErrorRecordDwordSize;
+        const uint32_t logger_i = record[glsl::kHeader_ActionIdErrorLoggerIdOffset] & glsl::kErrorLoggerId_Mask;
+        const CommandErrorLogger* logger = logger_i < command_error_loggers_.size() ? &command_error_loggers_[logger_i] : nullptr;
+        const uint32_t sub_code = GetSubError(record);
+        const bool is_bda_record = record[glsl::kHeader_ErrorRecordSizeOffset] == glsl::kErrorRecordDwordSize &&
+                                   GetErrorGroup(record) == glsl::kErrorGroup_InstBufferDeviceAddress &&
+                                   (sub_code == glsl::kErrorSubCode_BufferDeviceAddress_UnallocRef ||
+                                    sub_code == glsl::kErrorSubCode_BufferDeviceAddress_Alignment);
+        if (!is_bda_record) {
+            undecoded_counts[logger ? logger_i : command_error_loggers_.size()]++;
+            continue;
+        }
+
+        const Location& loc = logger ? logger->loc.Get() : unknown_loc;
+        const LogObjectList& objlist = logger ? logger->objlist : unknown_objlist;
+        const uint64_t address = uint64_t(record[glsl::kInst_LogError_ParameterOffset_0]) |
+                                 (uint64_t(record[glsl::kInst_LogError_ParameterOffset_1]) << 32);
+        const uint32_t payload = record[glsl::kInst_LogError_ParameterOffset_2];
+        const bool is_write = (payload >> glsl::kInst_BuffAddrAccess_PayloadShiftIsWrite) != 0;
+        const uint32_t access_info = payload & glsl::kInst_BuffAddrAccess_PayloadMaskAccessInfo;
+        if (sub_code == glsl::kErrorSubCode_BufferDeviceAddress_UnallocRef) {
+            gpuav_.LogError("VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819", objlist, loc,
+                            "[WARNING] Device lost: GPU-AV error buffer contents may be incomplete or invalid.\n"
+                            "GPU-AV recorded an unallocated buffer device address %s of %" PRIu32 " bytes at 0x%" PRIx64
+                            " (raw payload 0x%" PRIx32 ").",
+                            is_write ? "write" : "read", access_info, address, payload);
+        } else {
+            gpuav_.LogError("VUID-RuntimeSpirv-PhysicalStorageBuffer64-06315", objlist, loc,
+                            "[WARNING] Device lost: GPU-AV error buffer contents may be incomplete or invalid.\n"
+                            "GPU-AV recorded an unaligned buffer device address %s at 0x%" PRIx64 " with alignment %" PRIu32
+                            " (raw payload 0x%" PRIx32 ").",
+                            is_write ? "write" : "read", address, access_info, payload);
+        }
+    }
+
+    for (size_t i = 0; i < undecoded_counts.size(); ++i) {
+        if (undecoded_counts[i] == 0) {
+            continue;
+        }
+        const bool has_logger = i < command_error_loggers_.size();
+        const std::string message = "Device lost: GPU-AV found " + std::to_string(undecoded_counts[i]) +
+                                    (has_logger ? " undecoded record(s) associated with this command."
+                                                : " undecoded record(s) without a valid command reference.") +
+                                    " Buffer contents and command attribution may be incomplete or invalid after device loss.";
+        gpuav_.InternalWarning(has_logger ? command_error_loggers_[i].objlist : unknown_objlist,
+                               has_logger ? command_error_loggers_[i].loc.Get() : unknown_loc, message.c_str());
+    }
+
+    buffer[glsl::error_buffer_used_size_member_offset] = 0;
+    memset(buffer + glsl::error_buffer_data_member_offset, 0, available_words * sizeof(uint32_t));
+}
+
 bool CommandBufferSubState::NeedsPostProcess() { return error_output_buffer_range_.buffer != VK_NULL_HANDLE; }
 
 // For the given command buffer, map its debug data buffers and read their contents for analysis.
@@ -363,6 +446,11 @@ void CommandBufferSubState::OnCompletion(VkQueue queue, gpuav::QueueSubmission& 
                                          gpuav::CommandBufferSubmitInfo& cb_submit_info,
                                          const vvl::CommandBufferSubmitInfo& cb_info, const Location& submission_loc) {
     VVL_ZoneScoped;
+
+    if (gpuav_.is_device_lost) {
+        ReportErrorsOnDeviceLost();
+        return;
+    }
 
     // CommandBuffer::Destroy can happen on an other thread,
     // so when getting here after acquiring command buffer's lock,
@@ -433,12 +521,15 @@ void CommandBufferSubState::OnCompletion(VkQueue queue, gpuav::QueueSubmission& 
     }
 
     cmd_errors_counts_buffer_.Clear();
-    if (gpuav_.aborted_) {
+    if (gpuav_.aborted_ || gpuav_.is_device_lost) {
         return;
     }
 
     bool success = true;
     for (auto& on_cb_completion_func : on_cb_completion_functions) {
+        if (gpuav_.is_device_lost) {
+            break;
+        }
         success = on_cb_completion_func(gpuav_, *this, queue_submission, cb_submit_info, cb_info, submission_loc);
         if (!success) {
             break;
@@ -470,6 +561,7 @@ void QueueSubState::Destroy() {
 // #ARNO_TODO do we still need that?
 // Submit a memory barrier on graphics queues.
 // Lazy-create and record the needed command buffer.
+// Called from PostSubmit, so with the queue lock held
 void QueueSubState::SubmitBarrier(const Location& loc, uint64_t seq) {
     if (barrier_command_pool_ == VK_NULL_HANDLE) {
         VkResult result = VK_SUCCESS;
@@ -540,11 +632,30 @@ void QueueSubState::SubmitBarrier(const Location& loc, uint64_t seq) {
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = &barrier_sem_;
 
-        DispatchQueueSubmit(VkHandle(), 1, &submit_info, VK_NULL_HANDLE);
+        if (DispatchQueueSubmit(VkHandle(), 1, &submit_info, VK_NULL_HANDLE) == VK_ERROR_DEVICE_LOST) {
+            gpuav_.PublishDeviceLost(Location(vvl::Func::vkQueueSubmit));
+        }
     }
 }
 
 void QueueSubState::PreSubmit(std::vector<vvl::QueueSubmission>& submissions) {
+    // The helper can remove this substate if GPU-AV aborts
+    auto& gpuav = gpuav_;
+    if (gpuav.is_device_lost) {
+        gpuav.ReportDeviceLostErrors();
+        return;
+    }
+    if (gpuav.aborted_) {
+        return;
+    }
+    PreSubmitCommandBuffers(submissions);
+    // The command buffer locks have been released, including on failure
+    if (gpuav.is_device_lost) {
+        gpuav.ReportDeviceLostErrors();
+    }
+}
+
+void QueueSubState::PreSubmitCommandBuffers(std::vector<vvl::QueueSubmission>& submissions) {
     bool success = true;
     for (auto& submission : submissions) {
         auto loc = submission.loc.Get();
@@ -575,6 +686,25 @@ void QueueSubState::PreSubmit(std::vector<vvl::QueueSubmission>& submissions) {
 }
 
 bool QueueSubState::PostSubmit(vvl::QueueSubmission& submission) {
+    // The helper can remove this substate if GPU-AV aborts
+    auto& gpuav = gpuav_;
+    if (gpuav.is_device_lost) {
+        gpuav.ReportDeviceLostErrors();
+        return false;
+    }
+    if (gpuav.aborted_) {
+        return false;
+    }
+    const bool success = PostSubmitCommandBuffers(submission);
+    // The command buffer locks have been released, including on failure
+    if (gpuav.is_device_lost) {
+        gpuav.ReportDeviceLostErrors();
+        return false;
+    }
+    return success;
+}
+
+bool QueueSubState::PostSubmitCommandBuffers(vvl::QueueSubmission& submission) {
     auto loc = submission.loc.Get();
     if (loc.function == vvl::Func::vkQueuePresentKHR) {
         // Present batches have no GPU-AV work and more importantly, they
@@ -609,6 +739,9 @@ bool QueueSubState::PostSubmit(vvl::QueueSubmission& submission) {
 
 void QueueSubState::Retire(vvl::QueueSubmission& submission) {
     VVL_ZoneScoped;
+    if (gpuav_.is_device_lost) {
+        return;
+    }
     if (submission.loc.Get().function == vvl::Func::vkQueuePresentKHR) {
         // Present batch does not have any GPU-AV work to post process, skip it.
         // This is also needed for correctness. QueuePresent does not have a PostSubmit call
@@ -624,23 +757,32 @@ void QueueSubState::Retire(vvl::QueueSubmission& submission) {
         wait_info.pSemaphores = &barrier_sem_;
         wait_info.pValues = &submission.seq;
 
-        if (timeline_khr_) {
-            DispatchWaitSemaphoresKHR(gpuav_.device, &wait_info, 1'000'000'000);
-        } else {
-            DispatchWaitSemaphores(gpuav_.device, &wait_info, 1'000'000'000);
+        if (!gpuav_.is_device_lost) {
+            if (timeline_khr_) {
+                if (DispatchWaitSemaphoresKHR(gpuav_.device, &wait_info, 1'000'000'000) == VK_ERROR_DEVICE_LOST) {
+                    gpuav_.PublishDeviceLost(Location(vvl::Func::vkWaitSemaphoresKHR));
+                }
+            } else {
+                if (DispatchWaitSemaphores(gpuav_.device, &wait_info, 1'000'000'000) == VK_ERROR_DEVICE_LOST) {
+                    gpuav_.PublishDeviceLost(Location(vvl::Func::vkWaitSemaphores));
+                }
+            }
         }
 
         if (FenceWaiter* fence_waiter = shared_resources_cache.TryGet<FenceWaiter>()) {
             std::vector<VkFence> fences;
             // Lock for a short time just to move the fences, so DispatchWaitForFences
-            // below does not block PostSubmit from adding new fences.
+            // below does not block PostSubmit from adding new fences
             {
                 std::lock_guard<std::mutex> fence_waiter_guard(fence_waiter->lock);
                 fences = std::move(fence_waiter->fences);
                 fence_waiter->fences.clear();
             }
-            if (!fences.empty()) {
-                DispatchWaitForFences(gpuav_.device, uint32_t(fences.size()), fences.data(), VK_TRUE, UINT64_MAX);
+            if (!fences.empty() && !gpuav_.is_device_lost) {
+                if (DispatchWaitForFences(gpuav_.device, uint32_t(fences.size()), fences.data(), VK_TRUE, UINT64_MAX) ==
+                    VK_ERROR_DEVICE_LOST) {
+                    gpuav_.PublishDeviceLost(Location(vvl::Func::vkWaitForFences));
+                }
             }
         }
 
