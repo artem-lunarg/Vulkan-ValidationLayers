@@ -91,6 +91,12 @@ class Validator : public GpuShaderInstrumentor {
     // gpuav_record.cpp
     // --------------
   public:
+    void OnDeviceLost() final;
+    // Marks the device as lost after an internal command returned VK_ERROR_DEVICE_LOST. Can be called from a queue thread
+    void PublishDeviceLost(const Location& loc);
+    // Reports the errors found in the error buffer of every command buffer.
+    // Must be called from an API call thread that holds the state tracker lock and no command buffer lock
+    void ReportErrorsOnDeviceLost();
     void PreCallRecordDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator, const RecordObject& record_obj) final;
     void PreCallRecordCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
                                    VkBuffer* pBuffer, const RecordObject& record_obj, chassis::CreateBuffer& chassis_state) final;

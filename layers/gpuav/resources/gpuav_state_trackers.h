@@ -128,6 +128,9 @@ class CommandBufferSubState : public vvl::CommandBufferSubState {
                                   gpuav::CommandBufferSubmitInfo& cb_submit_info);
     void OnCompletion(VkQueue queue, gpuav::QueueSubmission& queue_submission, gpuav::CommandBufferSubmitInfo& cb_submit_info,
                       const vvl::CommandBufferSubmitInfo& cb_info, const Location& submission_loc);
+    // Reports and clears the errors found in the error buffer after a device loss, without using the error loggers.
+    // The command buffer lock must be held
+    void ReportErrorsOnDeviceLost();
 
     const VkDescriptorSetLayout &GetInstrumentationDescriptorSetLayout() const {
         assert(instrumentation_desc_set_layout_ != VK_NULL_HANDLE);
@@ -281,6 +284,8 @@ class QueueSubState : public vvl::QueueSubState {
     vko::SharedResourcesCache<true> shared_resources_cache;
 
   protected:
+    void PreSubmitCommandBuffers(std::vector<vvl::QueueSubmission> &submissions);
+    bool PostSubmitCommandBuffers(vvl::QueueSubmission &submission);
     void SubmitBarrier(const Location &loc, uint64_t seq);
 
     Validator &gpuav_;

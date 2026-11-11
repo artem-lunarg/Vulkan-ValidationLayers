@@ -133,6 +133,7 @@ set(TEST_SOURCES
     unit/gpu_av.cpp
     unit/gpu_av_buffer_device_address.cpp
     unit/gpu_av_buffer_device_address_positive.cpp
+    unit/gpu_av_device_lost.cpp
     unit/gpu_av_cooperative_vector.cpp
     unit/gpu_av_cooperative_vector_positive.cpp
     unit/gpu_av_copies.cpp

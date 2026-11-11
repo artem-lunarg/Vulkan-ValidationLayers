@@ -40,6 +40,47 @@
 
 namespace gpuav {
 
+void Validator::OnDeviceLost() {
+    // Command buffer sub states are destroyed under the state tracker lock
+    auto guard = device_state->WriteLock();
+    ReportErrorsOnDeviceLost();
+}
+
+void Validator::PublishDeviceLost(const Location& loc) {
+    if (is_device_lost.exchange(true)) {
+        return;
+    }
+    for (auto& vo : dispatch_device_->object_dispatch) {
+        if (vo) {
+            vo->is_device_lost = true;
+        }
+    }
+    InternalWarning(device, loc, "VK_ERROR_DEVICE_LOST was returned to a command GPU-AV issued internally.");
+}
+
+void Validator::ReportErrorsOnDeviceLost() {
+    auto report_errors = [](vvl::CommandBuffer& cb) {
+        if (auto* sub_state = static_cast<CommandBufferSubState*>(cb.SubState(LayerObjectTypeGpuAssisted))) {
+            sub_state->ReportErrorsOnDeviceLost();
+        }
+    };
+
+    // A busy command buffer must not delay the report of the others, so it is read in a second pass
+    std::vector<std::shared_ptr<vvl::CommandBuffer>> busy_cbs;
+    device_state->ForEachShared<vvl::CommandBuffer>([&](const std::shared_ptr<vvl::CommandBuffer>& cb) {
+        WriteLockGuard guard(cb->lock, std::try_to_lock);
+        if (guard.owns_lock()) {
+            report_errors(*cb);
+        } else {
+            busy_cbs.emplace_back(cb);
+        }
+    });
+    for (const std::shared_ptr<vvl::CommandBuffer>& cb : busy_cbs) {
+        auto guard = cb->WriteLock();
+        report_errors(*cb);
+    }
+}
+
 void Validator::PreCallRecordCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo,
                                           const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer,
                                           const RecordObject& record_obj, chassis::CreateBuffer& chassis_state) {
